@@ -16,6 +16,8 @@
     "chatInboxPath": "${RUSTOPS_CHAT_INBOX_PATH}",
     "messageOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_PATH}",
     "sentOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_SENT_PATH}",
+    "deadLetterPath": "${RUSTOPS_STEAM_DEADLETTER_PATH}",
+    "outboxMaxRetries": 5,
     "outboxPollSeconds": 3
   }
 }

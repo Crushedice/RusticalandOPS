@@ -27,6 +27,8 @@ Console.WriteLine($"Decision inbox: {config.Agent.DecisionInboxPath}");
 Console.WriteLine($"Chat inbox: {config.Agent.ChatInboxPath}");
 Console.WriteLine($"Message outbox: {config.Agent.MessageOutboxPath}");
 Console.WriteLine($"Sent outbox: {config.Agent.SentOutboxPath}");
+Console.WriteLine($"Dead-letter outbox: {config.Agent.DeadLetterPath}");
+Console.WriteLine($"Outbox max retries: {config.Agent.OutboxMaxRetries}");
 Console.WriteLine($"Steam admins: {string.Join(", ", config.Steam.AdminSteamIds)}");
 using var api = new RustMgrApiClient(config.Api);
 var bot = new OpsSteamBot(config, api);
@@ -53,6 +55,7 @@ internal sealed class OpsSteamBot
     private readonly SteamUser _user;
     private readonly SteamFriends _friends;
     private readonly HashSet<ulong> _admins;
+    private readonly Dictionary<string, int> _outboxFailureCounts = new(StringComparer.OrdinalIgnoreCase);
     private string? _authCode;
     private bool _isRunning;
     private DateTime _lastOutboxPollUtc = DateTime.MinValue;
@@ -72,6 +75,7 @@ internal sealed class OpsSteamBot
         Directory.CreateDirectory(_config.Agent.ChatInboxPath);
         Directory.CreateDirectory(_config.Agent.MessageOutboxPath);
         Directory.CreateDirectory(_config.Agent.SentOutboxPath);
+        Directory.CreateDirectory(_config.Agent.DeadLetterPath);
 
         _manager.Subscribe<SteamClient.ConnectedCallback>(OnConnected);
         _manager.Subscribe<SteamClient.DisconnectedCallback>(OnDisconnected);
@@ -257,11 +261,11 @@ internal sealed class OpsSteamBot
                 }
 
                 ArchiveOutboxFile(path);
+                _outboxFailureCounts.Remove(path);
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"Failed to process outbox message '{path}': {ex.Message}");
-                SentrySdk.CaptureException(ex);
+                HandleOutboxFailure(path, ex);
             }
         }
     }
@@ -284,9 +288,49 @@ internal sealed class OpsSteamBot
     private void ArchiveOutboxFile(string path)
     {
         var target = Path.Combine(_config.Agent.SentOutboxPath, Path.GetFileName(path));
-        if (File.Exists(target))
-            File.Delete(target);
-        File.Move(path, target);
+        MoveFileWithOverwrite(path, target);
+    }
+
+    private void HandleOutboxFailure(string path, Exception ex)
+    {
+        Console.Error.WriteLine($"Failed to process outbox message '{path}': {ex.Message}");
+        SentrySdk.CaptureException(ex);
+
+        var currentCount = _outboxFailureCounts.TryGetValue(path, out var count) ? count : 0;
+        currentCount++;
+        _outboxFailureCounts[path] = currentCount;
+
+        if (currentCount < _config.Agent.OutboxMaxRetries)
+            return;
+
+        try
+        {
+            var fileName = Path.GetFileName(path);
+            var deadTarget = Path.Combine(_config.Agent.DeadLetterPath, fileName);
+            MoveFileWithOverwrite(path, deadTarget);
+            var reasonPath = deadTarget + ".error.txt";
+            File.WriteAllText(reasonPath, $"Moved to dead-letter after {currentCount} failures at {DateTime.UtcNow:O}\n{ex}");
+            _outboxFailureCounts.Remove(path);
+        }
+        catch (Exception moveEx)
+        {
+            Console.Error.WriteLine($"Failed to move outbox file '{path}' to dead-letter: {moveEx.Message}");
+            SentrySdk.CaptureException(moveEx);
+        }
+    }
+
+    private static void MoveFileWithOverwrite(string sourcePath, string targetPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+        try
+        {
+            File.Move(sourcePath, targetPath, true);
+        }
+        catch (IOException)
+        {
+            File.Copy(sourcePath, targetPath, true);
+            File.Delete(sourcePath);
+        }
     }
 
     private async Task<string> HandleIncomingMessageAsync(ulong senderId, string input)
@@ -625,7 +669,10 @@ internal sealed class AppConfig
             ?? config.Agent.MessageOutboxPath;
         config.Agent.SentOutboxPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MESSAGE_OUTBOX_SENT_PATH")
             ?? config.Agent.SentOutboxPath;
+        config.Agent.DeadLetterPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_STEAM_DEADLETTER_PATH")
+            ?? config.Agent.DeadLetterPath;
         config.Agent.OutboxPollSeconds = RustOpsEnv.GetInt32("RUSTOPS_STEAM_OUTBOX_POLL_SECONDS", config.Agent.OutboxPollSeconds);
+        config.Agent.OutboxMaxRetries = RustOpsEnv.GetInt32("RUSTOPS_STEAM_OUTBOX_MAX_RETRIES", config.Agent.OutboxMaxRetries);
     }
 
     private static void ValidateResolvedConfig(AppConfig config)
@@ -642,6 +689,7 @@ internal sealed class AppConfig
         Check("agent.chatInboxPath", config.Agent.ChatInboxPath);
         Check("agent.messageOutboxPath", config.Agent.MessageOutboxPath);
         Check("agent.sentOutboxPath", config.Agent.SentOutboxPath);
+        Check("agent.deadLetterPath", config.Agent.DeadLetterPath);
 
         if (unresolved.Count > 0)
         {
@@ -680,7 +728,9 @@ internal sealed class AgentPaths
     public string ChatInboxPath { get; set; } = "..\\..\\agent\\RustOpsAgent\\data\\chat-inbox";
     public string MessageOutboxPath { get; set; } = "..\\..\\agent\\RustOpsAgent\\data\\message-outbox";
     public string SentOutboxPath { get; set; } = "..\\..\\agent\\RustOpsAgent\\data\\message-outbox-sent";
+    public string DeadLetterPath { get; set; } = "..\\..\\agent\\RustOpsAgent\\data\\message-outbox-deadletter";
     public int OutboxPollSeconds { get; set; } = 3;
+    public int OutboxMaxRetries { get; set; } = 5;
 
     public void Normalize(string baseDir)
     {
@@ -690,6 +740,8 @@ internal sealed class AgentPaths
         ChatInboxPath = NormalizePath(baseDir, RustOpsEnv.ResolvePlaceholders(ChatInboxPath));
         MessageOutboxPath = NormalizePath(baseDir, RustOpsEnv.ResolvePlaceholders(MessageOutboxPath));
         SentOutboxPath = NormalizePath(baseDir, RustOpsEnv.ResolvePlaceholders(SentOutboxPath));
+        DeadLetterPath = NormalizePath(baseDir, RustOpsEnv.ResolvePlaceholders(DeadLetterPath));
+        OutboxMaxRetries = Math.Max(1, OutboxMaxRetries);
     }
 
     private static string NormalizePath(string baseDir, string path)

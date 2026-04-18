@@ -626,7 +626,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         if (plan is null || plan.Actions.Count == 0)
             return;
 
-        var run = ApplySelfRepairPlan(plan, utcNow);
+        var run = await ApplySelfRepairPlanAsync(plan, utcNow);
         _memory.RecordSelfRepairRun(run);
 
         if (run.AppliedActions > 0 && _config.SelfRepair.NotifyAdmins)
@@ -636,7 +636,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                 CreatedAtUtc = utcNow,
                 Kind = "self-repair",
                 Audience = "admins",
-                Message = $"Self-repair applied {run.AppliedActions} action(s): {run.Summary}"
+                Message = $"Capability evolution applied {run.AppliedActions} action(s): {run.Summary}"
             });
         }
     }
@@ -738,7 +738,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         }
     }
 
-    private SelfRepairRunRecord ApplySelfRepairPlan(SelfRepairPlan plan, DateTime utcNow)
+    private async Task<SelfRepairRunRecord> ApplySelfRepairPlanAsync(SelfRepairPlan plan, DateTime utcNow)
     {
         var applied = 0;
         var rejected = 0;
@@ -813,6 +813,87 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                     else
                     {
                         rejected++;
+                    }
+                    continue;
+                }
+
+                if (string.Equals(action.Type, "build_from_source", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_config.SelfRepair.AllowSourceBuilds)
+                    {
+                        var build = await BuildFromSourceAsync("Release", "linux-x64");
+                        if (build.Success)
+                        {
+                            applied++;
+                            notes.Add("build_from_source");
+                        }
+                        else
+                        {
+                            rejected++;
+                            notes.Add($"build_from_source_failed:{build.Summary}");
+                        }
+                    }
+                    else
+                    {
+                        rejected++;
+                    }
+                    continue;
+                }
+
+                if (string.Equals(action.Type, "restart_managed_services", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (_config.SelfRepair.AllowServiceRestarts)
+                    {
+                        var restart = await RestartManagedServicesAsync();
+                        if (restart.Success)
+                        {
+                            applied++;
+                            notes.Add("restart_managed_services");
+                        }
+                        else
+                        {
+                            rejected++;
+                            notes.Add($"restart_managed_services_failed:{restart.Summary}");
+                        }
+                    }
+                    else
+                    {
+                        rejected++;
+                    }
+                    continue;
+                }
+
+                if (string.Equals(action.Type, "git_push_branch", StringComparison.OrdinalIgnoreCase))
+                {
+                    var push = await ExecuteGitPushBranchAsync(action.Description);
+                    if (push.Success)
+                    {
+                        applied++;
+                        notes.Add($"git_push_branch:{push.BranchName}");
+                    }
+                    else
+                    {
+                        rejected++;
+                        notes.Add($"git_push_branch_failed:{push.Summary}");
+                    }
+                    continue;
+                }
+
+                if (string.Equals(action.Type, "git_pull_rebuild", StringComparison.OrdinalIgnoreCase))
+                {
+                    var restartServices = !string.IsNullOrWhiteSpace(action.Description) &&
+                        (action.Description.Contains("restart", StringComparison.OrdinalIgnoreCase) ||
+                         action.Description.Contains("service", StringComparison.OrdinalIgnoreCase));
+                    var sync = await ExecuteGitPullRebuildAsync(restartServices, automatic: false);
+                    if (sync.Success)
+                    {
+                        applied++;
+                        notes.Add(sync.Updated ? "git_pull_rebuild:updated" : "git_pull_rebuild:no_updates");
+                    }
+                    else
+                    {
+                        rejected++;
+                        notes.Add($"git_pull_rebuild_failed:{sync.Summary}");
                     }
                     continue;
                 }
@@ -1312,6 +1393,26 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     private async Task<string?> TryHandleDirectCommandMessageAsync(string adminId, string message, List<ServerSnapshot> servers, DateTime utcNow)
     {
         var text = message.Trim();
+        var lowered = text.ToLowerInvariant();
+
+        if ((lowered.Contains("plugin", StringComparison.Ordinal) || lowered.Contains("plugins", StringComparison.Ordinal)) &&
+            (lowered.Contains("update", StringComparison.Ordinal) || lowered.Contains("upgrade", StringComparison.Ordinal) || lowered.Contains("new version", StringComparison.Ordinal)))
+        {
+            var requestedServer = ResolveServerName(text, servers);
+            if (string.IsNullOrWhiteSpace(requestedServer))
+                return BuildClarificationQuestion("check-plugin-updates", servers);
+            return await BuildPluginUpdatesReplyAsync(requestedServer, servers);
+        }
+
+        if ((lowered.Contains("plugin", StringComparison.Ordinal) || lowered.Contains("plugins", StringComparison.Ordinal)) &&
+            (lowered.Contains("compile", StringComparison.Ordinal) || lowered.Contains("build", StringComparison.Ordinal)))
+        {
+            var requestedServer = ResolveServerName(text, servers);
+            if (string.IsNullOrWhiteSpace(requestedServer))
+                return BuildClarificationQuestion("validate-oxide", servers);
+            return await BuildOxideCompileIssuesReplyAsync(requestedServer, servers);
+        }
+
         var runMatch = Regex.Match(text, @"^(run|execute)\s+command\s+(?<command>.+?)\s+on\s+(?<server>[A-Za-z0-9_\-]+)$", RegexOptions.IgnoreCase);
         if (runMatch.Success)
         {
@@ -1430,7 +1531,12 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                 if (!string.IsNullOrWhiteSpace(modelInterpretation.ServerName))
                     modelInterpretation.ServerName = ResolveServerName(modelInterpretation.ServerName, servers);
 
-                return modelInterpretation;
+                var shouldFallbackToHeuristics =
+                    string.Equals(modelInterpretation.Intent, "unknown", StringComparison.OrdinalIgnoreCase) ||
+                    (modelInterpretation.Confidence.HasValue && modelInterpretation.Confidence.Value < 0.45);
+
+                if (!shouldFallbackToHeuristics)
+                    return modelInterpretation;
             }
         }
 
@@ -1581,6 +1687,12 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                     var content = response.Content?.Trim();
                     if (!string.IsNullOrWhiteSpace(content))
                     {
+                        if (LooksLikeCapabilityDenial(content))
+                        {
+                            _memory.RecordCapabilityGap("llm-chat-tools", $"LLM produced capability denial instead of tool usage: {TrimSingleLine(content, 220)}");
+                            return null;
+                        }
+
                         return new ToolDrivenChatReply
                         {
                             Reply = content,
@@ -1643,12 +1755,9 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
     private static string BuildChatToolSystemPrompt(ChatPlanningContext planningContext, AdminConversationState conversation, string replyStyleGuidance, LlmSettings llmSettings)
     {
-        if (!llmSettings.UseChatSystemPrompt)
-            return string.Empty;
-
-        var preamble = string.IsNullOrWhiteSpace(llmSettings.ChatSystemPrompt)
-            ? DefaultChatToolSystemPrompt
-            : llmSettings.ChatSystemPrompt.Trim();
+        var preamble = llmSettings.UseChatSystemPrompt && !string.IsNullOrWhiteSpace(llmSettings.ChatSystemPrompt)
+            ? llmSettings.ChatSystemPrompt.Trim()
+            : DefaultChatToolSystemPrompt;
         var lastServer = string.IsNullOrWhiteSpace(conversation.LastServerName) ? "none" : conversation.LastServerName;
         return $$"""
         {{preamble}}
@@ -3648,6 +3757,20 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             return new ChatInterpretation { Intent = "server-health", ServerName = serverName, Confidence = 0.8 };
         }
 
+        if ((lowered.Contains("plugin", StringComparison.Ordinal) || lowered.Contains("plugins", StringComparison.Ordinal)) &&
+            (lowered.Contains("update", StringComparison.Ordinal) || lowered.Contains("upgrade", StringComparison.Ordinal) || lowered.Contains("new version", StringComparison.Ordinal)))
+        {
+            return new ChatInterpretation { Intent = "check-plugin-updates", ServerName = serverName, Confidence = 0.9 };
+        }
+
+        if ((lowered.Contains("list plugin", StringComparison.Ordinal) ||
+             lowered.Contains("show plugin", StringComparison.Ordinal) ||
+             lowered.StartsWith("plugins", StringComparison.Ordinal) ||
+             lowered.Contains("plugin list", StringComparison.Ordinal)))
+        {
+            return new ChatInterpretation { Intent = "list-server-plugins", ServerName = serverName, Confidence = 0.9 };
+        }
+
         if ((lowered.Contains("validate", StringComparison.Ordinal) ||
              lowered.Contains("check", StringComparison.Ordinal) ||
              lowered.Contains("inspect", StringComparison.Ordinal)) &&
@@ -3694,7 +3817,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         {
             Intent = "unknown",
             Confidence = 0.0,
-            ReplyText = "I couldn't map that to a safe operation. Try asking things like 'status vanilla', 'health modded', 'restart onegrid', 'show pending actions', or 'what happened recently'."
+            ReplyText = "I couldn't map that to a safe operation. Try: 'status vanilla', 'health modded', 'check plugin updates modded', 'check plugin compile issues modded', 'restart onegrid', or 'what happened recently'."
         };
     }
 
@@ -3765,13 +3888,15 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             "recent-incidents" => BuildRecentIncidentsReply(),
             "server-status" => await BuildServerStatusReplyAsync(plan.ServerName, servers),
             "server-health" => await BuildServerHealthReplyAsync(plan.ServerName, servers),
+            "list-server-plugins" => await BuildServerPluginsReplyAsync(plan.ServerName, servers),
+            "check-plugin-updates" => await BuildPluginUpdatesReplyAsync(plan.ServerName, servers),
             "validate-oxide" => await ExecuteChatUtilityActionAsync(adminId, plan, utcNow, "validate-oxide", servers),
             "inspect-host-network" => await ExecuteChatUtilityActionAsync(adminId, plan, utcNow, "inspect-host-network", servers),
             "start-server" => await ExecuteChatLifecycleActionAsync(adminId, plan, utcNow, "start-server", servers),
             "stop-server" => await ExecuteChatLifecycleActionAsync(adminId, plan, utcNow, "stop-server", servers),
             "restart-server" => await ExecuteChatLifecycleActionAsync(adminId, plan, utcNow, "restart-server", servers),
             _ => string.IsNullOrWhiteSpace(plan.ReplyText)
-                ? "I couldn't infer a safe action from that yet. Try asking for server status, health, pending actions, recent actions, or restart/start/stop for a named server."
+                ? "I couldn't infer a safe action from that yet. Ask for server status, health, plugin updates, plugin compile checks, pending actions, recent actions, or restart/start/stop for a named server."
                 : plan.ReplyText!
         };
     }
@@ -3821,6 +3946,104 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         }
 
         return builder.ToString();
+    }
+
+    private async Task<string> BuildServerPluginsReplyAsync(string? requestedServer, List<ServerSnapshot> servers)
+    {
+        var server = ResolveServer(requestedServer, servers);
+        if (server is null)
+            return BuildServerNotFoundReply(servers);
+
+        List<ServerPluginInfo> plugins;
+        try
+        {
+            plugins = await ReadServerPluginsAsync(server.Name);
+        }
+        catch (Exception ex)
+        {
+            return $"{server.Name}: failed to list plugins: {TrimSingleLine(ex.Message, 180)}";
+        }
+
+        if (plugins.Count == 0)
+            return $"{server.Name}: no Oxide plugins detected.";
+
+        var lines = plugins
+            .Take(20)
+            .Select(plugin => $"{plugin.Name} {plugin.Version} ({plugin.Author})")
+            .ToList();
+
+        var suffix = plugins.Count > 20 ? $"\n...and {plugins.Count - 20} more." : string.Empty;
+        return $"{server.Name}: {plugins.Count} plugin(s)\n{string.Join('\n', lines)}{suffix}";
+    }
+
+    private async Task<string> BuildPluginUpdatesReplyAsync(string? requestedServer, List<ServerSnapshot> servers)
+    {
+        var server = ResolveServer(requestedServer, servers);
+        if (server is null)
+            return BuildServerNotFoundReply(servers);
+
+        List<PluginUpdateCandidate> updates;
+        try
+        {
+            updates = await GetPluginUpdatesAsync(server.Name);
+        }
+        catch (Exception ex)
+        {
+            return $"{server.Name}: failed to check plugin updates: {TrimSingleLine(ex.Message, 180)}";
+        }
+
+        if (updates.Count == 0)
+            return $"{server.Name}: no plugin updates found.";
+
+        var lines = updates
+            .Take(12)
+            .Select(update => $"{update.Name}: {update.LocalVersion} -> {update.RemoteVersion}")
+            .ToList();
+
+        var suffix = updates.Count > 12 ? $"\n...and {updates.Count - 12} more." : string.Empty;
+        return $"{server.Name}: {updates.Count} update(s) available\n{string.Join('\n', lines)}{suffix}";
+    }
+
+    private async Task<string> BuildOxideCompileIssuesReplyAsync(string? requestedServer, List<ServerSnapshot> servers)
+    {
+        var server = ResolveServer(requestedServer, servers);
+        if (server is null)
+            return BuildServerNotFoundReply(servers);
+
+        using var json = await _api.GetJsonAsync($"/servers/{Uri.EscapeDataString(server.Name)}/oxide/validate");
+        var pluginIssues = new List<string>();
+        if (json.RootElement.TryGetProperty("plugins", out var pluginsNode) && pluginsNode.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in pluginsNode.EnumerateArray())
+            {
+                var ok = entry.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
+                if (ok)
+                    continue;
+
+                var label =
+                    (entry.TryGetProperty("name", out var nameNode) && nameNode.ValueKind == JsonValueKind.String ? nameNode.GetString() : null) ??
+                    (entry.TryGetProperty("title", out var titleNode) && titleNode.ValueKind == JsonValueKind.String ? titleNode.GetString() : null) ??
+                    (entry.TryGetProperty("file", out var fileNode) && fileNode.ValueKind == JsonValueKind.String ? fileNode.GetString() : null) ??
+                    "plugin";
+
+                var detail = string.Empty;
+                if (entry.TryGetProperty("errors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array)
+                {
+                    detail = string.Join(" | ", errorsNode.EnumerateArray().Select(node => node.ToString()).Where(value => !string.IsNullOrWhiteSpace(value)).Take(2));
+                }
+                else if (entry.TryGetProperty("message", out var messageNode) && messageNode.ValueKind == JsonValueKind.String)
+                {
+                    detail = messageNode.GetString() ?? string.Empty;
+                }
+
+                pluginIssues.Add($"{label}: {TrimSingleLine(string.IsNullOrWhiteSpace(detail) ? "compile/validation issue" : detail, 180)}");
+            }
+        }
+
+        if (pluginIssues.Count == 0)
+            return $"{server.Name}: no plugin compile issues detected in Oxide validation.";
+
+        return $"{server.Name}: {pluginIssues.Count} plugin compile issue(s)\n{string.Join('\n', pluginIssues.Take(12))}";
     }
 
     private async Task<string> ExecuteChatLifecycleActionAsync(string adminId, ChatInterpretation interpretation, DateTime utcNow, string actionType, List<ServerSnapshot> servers)
@@ -3978,7 +4201,19 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
     private static bool IsServerScopedIntent(string? intent) =>
         intent is "server-status" or "server-health" or "validate-oxide" or
-            "start-server" or "stop-server" or "restart-server";
+            "start-server" or "stop-server" or "restart-server" or
+            "list-server-plugins" or "check-plugin-updates";
+
+    private static bool LooksLikeCapabilityDenial(string content)
+    {
+        var lowered = content.ToLowerInvariant();
+        return lowered.Contains("don't have the capability", StringComparison.Ordinal) ||
+               lowered.Contains("do not have the capability", StringComparison.Ordinal) ||
+               lowered.Contains("my available functions are limited", StringComparison.Ordinal) ||
+               lowered.Contains("i don’t have info on plugin updates", StringComparison.Ordinal) ||
+               lowered.Contains("i don't have info on plugin updates", StringComparison.Ordinal) ||
+               lowered.Contains("i cannot directly control", StringComparison.Ordinal);
+    }
 
     private static bool ShouldUseLastServer(string message)
     {
@@ -4011,6 +4246,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             "stop-server" => $"Which server should I stop? {knownServers}",
             "server-health" => $"Which server do you want health details for? {knownServers}",
             "validate-oxide" => $"Which server should I validate Oxide for? {knownServers}",
+            "list-server-plugins" => $"Which server should I list plugins for? {knownServers}",
+            "check-plugin-updates" => $"Which server should I check plugin updates for? {knownServers}",
             _ => $"Which server do you mean? {knownServers}"
         };
     }
@@ -4018,7 +4255,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     private static bool IsKnownChatIntent(string? intent) =>
         intent is "help" or "ping" or "list-servers" or "server-status" or "server-health" or
             "pending-actions" or "recent-actions" or "recent-incidents" or
-            "validate-oxide" or "inspect-host-network" or
+            "validate-oxide" or "inspect-host-network" or "list-server-plugins" or "check-plugin-updates" or
             "start-server" or "stop-server" or "restart-server" or "unknown";
 
     private static ServerSnapshot? ResolveServer(string? requestedServer, List<ServerSnapshot> servers)
@@ -5295,6 +5532,8 @@ Known servers:
         - pending-actions
         - recent-actions
         - recent-incidents
+        - list-server-plugins
+        - check-plugin-updates
         - validate-oxide
         - inspect-host-network
         - start-server
@@ -5307,7 +5546,7 @@ Admin message:
 
 Respond as strict JSON:
 {
-  "intent": "help|ping|list-servers|server-status|server-health|pending-actions|recent-actions|recent-incidents|validate-oxide|inspect-host-network|start-server|stop-server|restart-server|unknown",
+  "intent": "help|ping|list-servers|server-status|server-health|pending-actions|recent-actions|recent-incidents|list-server-plugins|check-plugin-updates|validate-oxide|inspect-host-network|start-server|stop-server|restart-server|unknown",
   "serverName": "exact known server name or empty",
   "replyText": "short optional admin-facing clarification",
   "confidence": 0.0
@@ -5398,6 +5637,8 @@ Respond as strict JSON:
         - pending-actions
         - recent-actions
         - recent-incidents
+        - list-server-plugins
+        - check-plugin-updates
         - validate-oxide
         - inspect-host-network
         - start-server
@@ -5461,14 +5702,19 @@ Respond as strict JSON:
             return null;
 
         var prompt = $$"""
-        You are an autonomous repair planner for a local Rust operations agent.
-        Create only bounded, low-risk repairs that stay inside the agent self-repair workspace.
-        Never suggest external commands, process control, or writes outside the allowed scope root.
+        You are a capability-evolution planner for a local Rust operations agent.
+        Treat self-repair as planned capability growth, not emergency-only mitigation.
+        Create only bounded, low-risk changes that stay inside the agent self-repair workspace/scope.
+        Never suggest writes outside the allowed scope root or dangerous host-level actions.
         Use only these action types:
         - write_file
         - write_scope_file
         - merge_log_rules
         - update_reply_style
+        - build_from_source
+        - restart_managed_services
+        - git_push_branch
+        - git_pull_rebuild
         - record_capability_gap
 
         Known chat tools:
@@ -5507,6 +5753,10 @@ Respond as strict JSON:
         - write_scope_file must use a relative path inside scope root and include full file content.
         - merge_log_rules should only add short contains patterns.
         - update_reply_style should produce practical wording guidance for natural admin chat replies.
+        - build_from_source should only be used when a scope-file change requires compile verification.
+        - restart_managed_services should only be used when build/deploy changes need service reload.
+        - git_push_branch should include a short commit summary in description.
+        - git_pull_rebuild may include "restart services" in description when needed.
         - If no useful repair is needed, return an empty actions list.
 
         Return JSON only. Use empty strings instead of nulls.
@@ -6139,7 +6389,8 @@ Respond as strict JSON:
                 @enum = new[]
                 {
                     "help", "ping", "list-servers", "server-status", "server-health", "pending-actions",
-                    "recent-actions", "recent-incidents", "validate-oxide", "inspect-host-network",
+                    "recent-actions", "recent-incidents", "list-server-plugins", "check-plugin-updates",
+                    "validate-oxide", "inspect-host-network",
                     "start-server", "stop-server", "restart-server", "unknown"
                 }
             },
@@ -6170,7 +6421,7 @@ Respond as strict JSON:
                     additionalProperties = false,
                     properties = new
                     {
-                        type = new { type = "string", @enum = new[] { "write_file", "write_scope_file", "merge_log_rules", "update_reply_style", "record_capability_gap" } },
+                        type = new { type = "string", @enum = new[] { "write_file", "write_scope_file", "merge_log_rules", "update_reply_style", "build_from_source", "restart_managed_services", "git_push_branch", "git_pull_rebuild", "record_capability_gap" } },
                         relativePath = new { type = "string" },
                         content = new { type = "string" },
                         description = new { type = "string" },
@@ -6178,7 +6429,7 @@ Respond as strict JSON:
                         startupIgnoreContains = new { type = "array", items = new { type = "string" } },
                         incidentContains = new { type = "array", items = new { type = "string" } }
                     },
-                    required = new[] { "type", "relativePath", "content", "description", "ignoreContains", "startupIgnoreContains", "incidentContains" }
+                    required = new[] { "type" }
                 }
             }
         },
@@ -6617,7 +6868,7 @@ internal sealed class LlmSettings
     public bool UseForRecommendations { get; set; } = true;
     public string RequestStrategy { get; set; } = "fallback";
     public SecondaryLlmSettings Secondary { get; set; } = new();
-    public bool UseChatSystemPrompt { get; set; } = false;
+    public bool UseChatSystemPrompt { get; set; } = true;
     public string ChatSystemPrompt { get; set; } = """
 You are a local Rust server operations agent talking to an admin.
 Use the provided tools to inspect state and perform bounded operations.

@@ -7,7 +7,10 @@
     "pollSeconds": 20,
     "controlPollSeconds": 2,
     "logLinesPerScan": 120,
-    "healthCooldownMinutes": 10
+    "healthCooldownMinutes": 10,
+    "startupIgnoreSeconds": 180,
+    "pluginUpdateCheckMinutes": 180,
+    "logRulesPath": "agent-log-rules.json"
   },
   "memory": {
     "statePath": "${RUSTOPS_AGENT_STATE_PATH}"
@@ -21,6 +24,16 @@
     "messageOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_PATH}"
   },
   "policy": {
+    "allowAnyServerCommand": false,
+    "allowedServerCommandPrefixes": [
+      "oxide.",
+      "o.",
+      "status",
+      "version",
+      "plugins",
+      "global.",
+      "serverinfo"
+    ],
     "autoAllowedActions": [
       "validate-oxide",
       "inspect-host-network"
@@ -36,12 +49,47 @@
       "create-task"
     ]
   },
+  "commandExecution": {
+    "enabled": true,
+    "freeMode": false,
+    "defaultWaitMs": 2500,
+    "maxWaitMs": 12000,
+    "maxOutputChars": 8000,
+    "allowList": [
+      "playerlist",
+      "serverinfo",
+      "bans",
+      "oxide.plugins",
+      "status",
+      "version"
+    ]
+  },
+  "pluginUpdates": {
+    "enabled": true,
+    "checkIntervalMinutes": 60,
+    "notifyAdmins": true,
+    "searchUrlTemplate": "https://umod.org/plugins/search.json?query={0}&page=1&sort=title&sortdir=asc&filter={1}",
+    "searchFilter": "rust"
+  },
   "llm": {
     "enabled": true,
     "provider": "${RUSTOPS_LLM_PROVIDER}",
     "baseUrl": "${RUSTOPS_LLM_BASE_URL}",
     "model": "${RUSTOPS_LLM_MODEL}",
     "apiKey": "${RUSTOPS_LLM_API_KEY}",
-    "useForRecommendations": true
+    "httpReferer": "${RUSTOPS_LLM_HTTP_REFERER}",
+    "appTitle": "${RUSTOPS_LLM_APP_TITLE}",
+    "useForRecommendations": true,
+    "requestStrategy": "fallback",
+    "secondary": {
+      "enabled": false,
+      "baseUrl": "${RUSTOPS_LLM_SECONDARY_BASE_URL}",
+      "model": "${RUSTOPS_LLM_SECONDARY_MODEL}",
+      "apiKey": "${RUSTOPS_LLM_SECONDARY_API_KEY}",
+      "httpReferer": "${RUSTOPS_LLM_SECONDARY_HTTP_REFERER}",
+      "appTitle": "${RUSTOPS_LLM_SECONDARY_APP_TITLE}"
+    },
+    "useChatSystemPrompt": true,
+    "chatSystemPrompt": "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\nIf an admin asks to push source changes to git, use git_push_branch.\nIf an admin asks to pull latest source updates, use git_pull_rebuild."
   }
 }
