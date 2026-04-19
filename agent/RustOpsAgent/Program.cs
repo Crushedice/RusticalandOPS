@@ -639,13 +639,13 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
         if (run.AppliedActions > 0 && _config.SelfRepair.NotifyAdmins)
         {
-            WriteOutboxMessage(new AdapterMessage
-            {
-                CreatedAtUtc = utcNow,
-                Kind = "self-repair",
-                Audience = "admins",
-                Message = $"Capability evolution applied {run.AppliedActions} action(s): {run.Summary}"
-            });
+           // WriteOutboxMessage(new AdapterMessage
+           // {
+           //     CreatedAtUtc = utcNow,
+           //     Kind = "self-repair",
+           //     Audience = "admins",
+           //     Message = $"Capability evolution applied {run.AppliedActions} action(s): {run.Summary}"
+           // });
         }
     }
 
