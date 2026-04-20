@@ -463,17 +463,22 @@ internal sealed class RustOpsAgent
         "update_reply_style"
     };
     private const string DefaultChatToolSystemPrompt = """
-You are a local Rust server operations agent talking to an admin.
+You are a local Rust server operations agent talking to an admin via Steam chat.
 Use the provided tools to inspect state and perform bounded operations.
 Prefer using tools over guessing.
 For start, stop, restart, and validate-oxide you must target a known server.
 If the server is unclear, ask a concise clarification question instead of guessing.
 Use recent memory, incidents, and action history to explain what is happening.
-Reply naturally, with concrete operational language.
-Start with the direct answer, then key evidence or next action.
-Do not invent facts.
-You may use self-diagnostics and workspace tools to improve your own behavior.
-Any file writes must stay inside the configured self-repair scope root.
+
+REPLY RULES — follow these without exception:
+- Reply in plain, direct admin language. No markdown. No bullet points unless listing 3+ items.
+- Start with the direct answer, then key evidence or next action.
+- Never describe what tools you used or are about to use. Do not say "I'll call", "I'm using", "According to the tool", "The tool returned", "Let me check", or any similar phrase.
+- Never include reasoning, planning, or meta-commentary about your process.
+- Never say what you cannot do. If a request is outside your scope, say so in one sentence.
+- Keep replies concise enough to read in a Steam chat window. Avoid wall-of-text.
+- Do not invent facts, server states, or action outcomes.
+
 If an admin asks to execute a server console command, use execute_server_command.
 If an admin asks what a command does, use get_server_command_memory.
 If an admin teaches command behavior, use teach_server_command.
@@ -1314,9 +1319,10 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     {
         foreach (var path in Directory.GetFiles(_config.Inbox.ChatInboxPath, "*.json").OrderBy(Path.GetFileName))
         {
+            ChatInboxItem? item = null;
             try
             {
-                var item = JsonSerializer.Deserialize<ChatInboxItem>(File.ReadAllText(path), JsonOptions.Default);
+                item = JsonSerializer.Deserialize<ChatInboxItem>(File.ReadAllText(path), JsonOptions.Default);
                 if (item is null || string.IsNullOrWhiteSpace(item.AdminId) || string.IsNullOrWhiteSpace(item.Message))
                 {
                     File.Delete(path);
@@ -1343,6 +1349,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             {
                 Console.Error.WriteLine($"Failed to process chat file '{path}': {ex.Message}");
                 _memory.RecordAgentError($"chat-inbox: {Path.GetFileName(path)} failed: {ex.Message}");
+                if (!string.IsNullOrWhiteSpace(item?.AdminId) && !string.IsNullOrWhiteSpace(item?.Message))
+                    RecordLearningIncident(item.AdminId!, item.Message!, "processing-error", ex.Message, null, "processing-error");
                 SentrySdk.CaptureException(ex);
                 _memory.Save(_config.Memory.StatePath);
             }
@@ -1455,7 +1463,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         SetConversationTrace(conversation, utcNow, "deterministic", plan.Intent, usedTools: null, note: "Fallback deterministic planning/execution path.");
         if (string.Equals(plan.Intent, "unknown", StringComparison.OrdinalIgnoreCase))
         {
-            RecordLearningIncident(adminId, message, plan.Intent, reply, conversation.LastTrace);
+            RecordLearningIncident(adminId, message, plan.Intent, reply, conversation.LastTrace, "unknown-intent");
         }
         RememberChatTurn(conversation, "assistant", reply, utcNow);
         adminPreference.LastUpdatedAtUtc = utcNow;
@@ -1763,12 +1771,13 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                         if (LooksLikeCapabilityDenial(content))
                         {
                             _memory.RecordCapabilityGap("llm-chat-tools", $"LLM produced capability denial instead of tool usage: {TrimSingleLine(content, 220)}");
+                            RecordLearningIncident(adminId, message, "capability-denial", content, conversation.LastTrace, "capability-denial");
                             return null;
                         }
 
                         return new ToolDrivenChatReply
                         {
-                            Reply = content,
+                            Reply = StripProcessNarration(content).Trim(),
                             LastServerName = lastServerName,
                             PendingClarificationIntent = pendingClarificationIntent,
                             UsedTools = usedTools.OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase).ToList()
@@ -1795,8 +1804,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             }
 
             var finalPrompt = string.IsNullOrWhiteSpace(toolPrompt)
-                ? "Use the tool results already present in the conversation. Reply directly to the admin. Do not call more tools."
-                : toolPrompt + "\nUse the tool results already present in the conversation. Reply directly to the admin. Do not call more tools.";
+                ? "Reply directly to the admin based on the tool results above. Do not call more tools. Do not describe what tools you used or your reasoning. Output only the final answer in plain admin language."
+                : toolPrompt + "\n\nAll tools have been called. Now write only the final reply to the admin. Do not call more tools. Do not mention tool names, tool calls, or your reasoning process. Give a direct, concise answer.";
             var finalReply = await _llm.RequestChatCompletionAsync(finalPrompt, messages);
 
             if (string.IsNullOrWhiteSpace(finalReply))
@@ -1804,7 +1813,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
             return new ToolDrivenChatReply
             {
-                Reply = finalReply.Trim(),
+                Reply = StripProcessNarration(finalReply).Trim(),
                 LastServerName = lastServerName,
                 PendingClarificationIntent = pendingClarificationIntent,
                 UsedTools = usedTools.OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase).ToList()
@@ -1813,6 +1822,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         catch (Exception ex)
         {
             _memory.RecordAgentError($"llm-chat-tools failed: {ex.Message}");
+            RecordLearningIncident(adminId, message, "tool-failure", ex.Message, conversation.LastTrace, "tool-failure");
             SentrySdk.CaptureException(ex);
             return null;
         }
@@ -4426,7 +4436,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             .ToList();
     }
 
-    private void RecordLearningIncident(string adminId, string message, string intent, string reply, ChatTurnTrace? trace)
+    private void RecordLearningIncident(string adminId, string message, string intent, string reply, ChatTurnTrace? trace, string category = "unknown")
     {
         try
         {
@@ -4438,6 +4448,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                 AdminId = adminId,
                 Message = message,
                 Intent = intent,
+                Category = string.IsNullOrWhiteSpace(category) ? "unknown" : category.Trim(),
                 Reply = TrimSingleLine(reply, 400),
                 TraceSource = trace?.Source,
                 TraceIntent = trace?.Intent,
@@ -5906,8 +5917,14 @@ Respond as strict JSON:
         Recent incidents:
         {{FormatContextList(context.RecentIncidents)}}
 
-        Learning backlog incidents:
+        Learning backlog incidents (treat each as a failure case to analyze and improve):
         {{FormatContextList(context.LearningIncidents)}}
+
+        For each learning incident above, reason through:
+        - What the admin intended (even if phrased ambiguously)
+        - Why the agent failed: wrong server resolution, missing tool capability, intent not mapped, LLM threw instead of using tools, or capability denial
+        - What one bounded change would prevent this exact failure: update_reply_style for wording/tone problems, record_capability_gap for missing capabilities, merge_log_rules for noise that caused false positives, write_file for a guidance note the agent can reference
+        If the learning backlog is non-empty it MUST drive at least one action. Prefer update_reply_style or record_capability_gap for chat failures. Do not produce an empty actions list when learning incidents exist.
 
         Existing workspace files:
         {{FormatContextList(context.WorkspaceFiles.Select(file => $"{file.RelativePath} ({file.SizeBytes} bytes) preview={TrimForPreview(file.Preview, 120)}"))}}
@@ -7698,6 +7715,12 @@ internal sealed class LearningIncidentRecord
     public string AdminId { get; set; } = string.Empty;
     public string Message { get; set; } = string.Empty;
     public string Intent { get; set; } = "unknown";
+    // Category tags what kind of failure this is:
+    // "unknown-intent" – agent couldn't map the message to a known action
+    // "tool-failure"   – LLM tool loop threw or exhausted retries
+    // "capability-denial" – LLM said it couldn't do something instead of using tools
+    // "processing-error" – exception while processing the chat inbox file
+    public string Category { get; set; } = "unknown";
     public string Reply { get; set; } = string.Empty;
     public string? TraceSource { get; set; }
     public string? TraceIntent { get; set; }

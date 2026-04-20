@@ -176,6 +176,8 @@ app.MapGet("/dashboard/summary", async () =>
             pendingActions = memory.PendingActions.Count,
             incidents = memory.RecentIncidents.Count,
             agentErrors = memory.AgentErrors.Count,
+            capabilityGaps = memory.CapabilityGaps.Count,
+            selfRepairRuns = memory.SelfRepairHistory.Count,
             feedbackInbox = CountJsonFiles(agentPaths.FeedbackInboxPath),
             decisionInbox = CountJsonFiles(agentPaths.DecisionInboxPath),
             chatInbox = CountJsonFiles(agentPaths.ChatInboxPath),
@@ -199,6 +201,8 @@ app.MapGet("/dashboard/summary", async () =>
         runtimeStatus = memory.RuntimeStatus,
         agentState = memory.StateFile,
         llmInteractions = memory.LlmInteractions,
+        capabilityGaps = memory.CapabilityGaps,
+        selfRepairHistory = memory.SelfRepairHistory,
         services
     });
 });
@@ -1570,6 +1574,8 @@ static AgentDashboardSnapshot LoadAgentMemorySnapshot(string path)
             RecentFeedback = ReadRecentFeedback(root),
             RuntimeStatus = ReadRuntimeStatus(root),
             LlmInteractions = ReadLlmInteractions(root),
+            CapabilityGaps = ReadCapabilityGaps(root),
+            SelfRepairHistory = ReadSelfRepairHistory(root),
             StateFile = new DashboardStateFileStatus
             {
                 Path = stateFile.Path,
@@ -2258,6 +2264,44 @@ static List<DashboardLlmInteraction> ReadLlmInteractions(JsonElement root)
         .ToList();
 }
 
+static List<DashboardCapabilityGap> ReadCapabilityGaps(JsonElement root)
+{
+    if (!root.TryGetProperty("capabilityGaps", out var gaps) || gaps.ValueKind != JsonValueKind.Array)
+        return new List<DashboardCapabilityGap>();
+
+    return gaps.EnumerateArray()
+        .Select(item => new DashboardCapabilityGap
+        {
+            Category = ReadString(item, "category"),
+            Description = ReadString(item, "description"),
+            Count = item.TryGetProperty("count", out var countNode) && countNode.ValueKind == JsonValueKind.Number ? countNode.GetInt32() : 1,
+            FirstObservedAtUtc = ReadDateTime(item, "firstObservedAtUtc"),
+            LastObservedAtUtc = ReadDateTime(item, "lastObservedAtUtc")
+        })
+        .OrderByDescending(item => item.LastObservedAtUtc)
+        .Take(20)
+        .ToList();
+}
+
+static List<DashboardSelfRepairRun> ReadSelfRepairHistory(JsonElement root)
+{
+    if (!root.TryGetProperty("selfRepairHistory", out var history) || history.ValueKind != JsonValueKind.Array)
+        return new List<DashboardSelfRepairRun>();
+
+    return history.EnumerateArray()
+        .Select(item => new DashboardSelfRepairRun
+        {
+            AtUtc = ReadDateTime(item, "atUtc"),
+            Summary = ReadString(item, "summary"),
+            AppliedActions = item.TryGetProperty("appliedActions", out var appliedNode) && appliedNode.ValueKind == JsonValueKind.Number ? appliedNode.GetInt32() : 0,
+            RejectedActions = item.TryGetProperty("rejectedActions", out var rejectedNode) && rejectedNode.ValueKind == JsonValueKind.Number ? rejectedNode.GetInt32() : 0,
+            RawModelReasoning = ReadString(item, "rawModelReasoning")
+        })
+        .OrderByDescending(item => item.AtUtc)
+        .Take(12)
+        .ToList();
+}
+
 static async Task<LlmSummaryView> ReadLmStudioSummaryAsync(AgentLlmConfigView config)
 {
     var summary = new LlmSummaryView
@@ -2669,6 +2713,8 @@ static string BuildDashboardHtml() => """
         <div class="card"><h2>Recent Actions</h2><div id="actions" class="list"></div></div>
         <div class="card"><h2>Mailboxes</h2><div id="mailboxes" class="mailbox-grid"></div></div>
         <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
+        <div class="card"><h2>Capability Gaps <span class="legend" data-tip="Patterns the agent recorded when it could not fulfill a request. Each entry feeds the self-repair evolution cycle to propose a concrete improvement.">?</span></h2><div id="capabilityGaps" class="list"></div></div>
+        <div class="card"><h2>Evolution History <span class="legend" data-tip="Each entry is one self-repair cycle: how many bounded actions were applied, what they changed, and the LLM reasoning behind the decision.">?</span></h2><div id="selfRepairHistory" class="list"></div></div>
         <div class="card"><h2>Agent Log Rules <span class="legend" data-tip="Edit JSON arrays here.\nignoreContains: always ignore these substrings.\nstartupIgnoreContains: ignore only during startup window.\nincidentContains: always elevate these substrings.\nExample:\n{\n  &quot;ignoreContains&quot;: [&quot;known noise&quot;],\n  &quot;startupIgnoreContains&quot;: [&quot;shader unsupported&quot;],\n  &quot;incidentContains&quot;: [&quot;Error while compiling&quot;]\n}">?</span></h2><div id="rulesMeta" class="muted">Not loaded.</div><textarea id="rulesEditor" spellcheck="false" style="margin-top:12px;"></textarea><div class="toolbar"><div id="rulesSaveStatus" class="muted">No changes saved yet.</div><button id="saveRules">Save Rules</button></div></div>
         <div class="card"><h2>Command Policy <span class="legend" data-tip="Controls whether the agent can execute raw server commands.\nIf Free mode is disabled, only allowlisted commands can be executed.\nChanges apply after restarting rustopsagent.service.">?</span></h2><div id="commandConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="commandEnabled" type="checkbox"> Command execution enabled</label><label class="check"><input id="commandFreeMode" type="checkbox"> Free mode (no allowlist restriction)</label></div><div class="row" style="margin-top:12px;"><div><label for="commandDefaultWaitMs" class="tiny muted">Default wait (ms)</label><input id="commandDefaultWaitMs" type="number" min="200" max="20000" step="100"></div><div><label for="commandMaxWaitMs" class="tiny muted">Max wait (ms)</label><input id="commandMaxWaitMs" type="number" min="500" max="30000" step="100"></div></div><div class="row" style="margin-top:12px;"><div><label for="commandMaxOutputChars" class="tiny muted">Max output chars</label><input id="commandMaxOutputChars" type="number" min="500" max="64000" step="100"></div></div><div style="margin-top:12px;"><label for="commandAllowList" class="tiny muted">Allowlist (comma/line separated)</label><textarea id="commandAllowList" spellcheck="false" style="min-height:140px;"></textarea></div><div class="toolbar"><div id="commandSaveStatus" class="muted">No changes saved yet.</div><button id="saveCommandConfig">Save Command Policy</button></div></div>
       </div>
@@ -2749,6 +2795,8 @@ static string BuildDashboardHtml() => """
       if (state.path) diagnostics.push(item('Agent state file', state.path, `${state.exists ? 'exists' : 'missing'}${state.parseError ? ` | ${esc(state.parseError)}` : ''}`));
       $('errors').innerHTML = diagnostics.concat((summary.agentErrors || []).map(text => item('Agent error', text || ''))).join('') || '<div class="muted">No recent agent errors.</div>';
       $('feedback').innerHTML = (summary.recentFeedback || []).map(entry => item(`${entry.verdict || 'note'} | ${entry.serverName || 'general'}`, entry.note || '', `${esc(fmt(entry.receivedAtUtc))} | ${esc(entry.adminId || 'unknown admin')}`)).join('') || '<div class="muted">No recent feedback.</div>';
+      $('capabilityGaps').innerHTML = (summary.capabilityGaps || []).map(entry => item(`${esc(entry.category || 'unknown')} | count=${entry.count ?? 1}`, entry.description || '', `first=${esc(fmt(entry.firstObservedAtUtc))} | last=${esc(fmt(entry.lastObservedAtUtc))}`)).join('') || '<div class="muted">No capability gaps recorded yet. The agent will populate this once it encounters unfulfillable requests.</div>';
+      $('selfRepairHistory').innerHTML = (summary.selfRepairHistory || []).map(entry => item(`${entry.appliedActions ?? 0} action(s) applied | ${entry.rejectedActions ?? 0} rejected`, entry.summary || '', `${esc(fmt(entry.atUtc))}${entry.rawModelReasoning ? ` | reasoning: ${esc(String(entry.rawModelReasoning).slice(0, 120))}` : ''}`)).join('') || '<div class="muted">No evolution cycles run yet. The agent runs self-repair when capability gaps or learning incidents exist.</div>';
     }
 
     function renderCommandConfig(commandConfig) {
@@ -2820,7 +2868,7 @@ static string BuildDashboardHtml() => """
       try {
         const [summary, _, llmSummary, llmConfig, commandConfig] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config')]);
         $('stamp').textContent = `Updated ${fmt(summary.generatedAtUtc)} | API ${summary.host.bindUrl}`;
-        $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'configured via rustmgr'), metric('Online', summary.counts?.onlineServers ?? 0, 'currently running'), metric('Pending Actions', summary.counts?.pendingActions ?? 0, 'agent approval queue'), metric('Incidents', summary.counts?.incidents ?? 0, 'recent tracked issues'), metric('Outbox', summary.counts?.messageOutbox ?? 0, 'messages waiting for Steam'), metric('LLM Calls', (summary.llmInteractions || []).length, 'recent recorded interactions')].join('');
+        $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'configured via rustmgr'), metric('Online', summary.counts?.onlineServers ?? 0, 'currently running'), metric('Pending Actions', summary.counts?.pendingActions ?? 0, 'agent approval queue'), metric('Incidents', summary.counts?.incidents ?? 0, 'recent tracked issues'), metric('Outbox', summary.counts?.messageOutbox ?? 0, 'messages waiting for Steam'), metric('LLM Calls', (summary.llmInteractions || []).length, 'recent recorded interactions'), metric('Capability Gaps', summary.counts?.capabilityGaps ?? 0, 'unfulfilled request patterns'), metric('Evolution Runs', summary.counts?.selfRepairRuns ?? 0, 'agent improvement cycles')].join('');
         renderServers(summary.servers || []);
         renderAgent(summary);
         renderLlm(summary, llmSummary, llmConfig);
@@ -3379,6 +3427,8 @@ public sealed class AgentDashboardSnapshot
     public DashboardRuntimeStatus RuntimeStatus { get; set; } = new();
     public DashboardStateFileStatus StateFile { get; set; } = new();
     public List<DashboardLlmInteraction> LlmInteractions { get; set; } = new();
+    public List<DashboardCapabilityGap> CapabilityGaps { get; set; } = new();
+    public List<DashboardSelfRepairRun> SelfRepairHistory { get; set; } = new();
     public List<DashboardServiceStatus> Services { get; set; } = new();
 }
 
@@ -3458,6 +3508,24 @@ public sealed class DashboardLlmInteraction
     public bool Success { get; set; }
     public string? Context { get; set; }
     public string? ResponsePreview { get; set; }
+}
+
+public sealed class DashboardCapabilityGap
+{
+    public string? Category { get; set; }
+    public string? Description { get; set; }
+    public int Count { get; set; } = 1;
+    public DateTime? FirstObservedAtUtc { get; set; }
+    public DateTime? LastObservedAtUtc { get; set; }
+}
+
+public sealed class DashboardSelfRepairRun
+{
+    public DateTime? AtUtc { get; set; }
+    public string? Summary { get; set; }
+    public int AppliedActions { get; set; }
+    public int RejectedActions { get; set; }
+    public string? RawModelReasoning { get; set; }
 }
 
 public sealed class DashboardServiceStatus
