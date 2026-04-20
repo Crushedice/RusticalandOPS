@@ -506,8 +506,13 @@ start_one() {
     while (( waited < START_WAIT_SECONDS )); do
         pid="$(server_pid "$server" || true)"
         if [[ -n "$pid" ]]; then
-            echo "started $server"
-            return 0
+            sleep 4
+            local final_pid
+            final_pid="$(server_pid "$server" || true)"
+            if [[ -n "$final_pid" ]]; then
+                echo "started $server"
+                return 0
+            fi
         fi
 
         if ! tmux_has_session "$server"; then
@@ -549,18 +554,24 @@ stop_one() {
         return 0
     fi
 
-    tmux send-keys -t "$(session_name "$server")" "quit" C-m
+    pid="$(server_pid "$server" || true)"
+    if [[ -n "$pid" ]]; then
+        kill -TERM "$pid" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$pid" 2>/dev/null; do
+            sleep 1
+            waited=$((waited + 1))
+            if (( waited >= STOP_TIMEOUT_SECONDS )); then
+                echo "graceful stop timed out for $server, killing process"
+                kill -9 "$pid" 2>/dev/null || true
+                break
+            fi
+        done
+    fi
 
-    local waited=0
-    while tmux_has_session "$server"; do
-        sleep 1
-        waited=$((waited + 1))
-        if (( waited >= STOP_TIMEOUT_SECONDS )); then
-            echo "graceful stop timed out for $server, killing tmux session"
-            tmux kill-session -t "$(session_name "$server")" 2>/dev/null || true
-            break
-        fi
-    done
+    if tmux_has_session "$server"; then
+        tmux kill-session -t "$(session_name "$server")" 2>/dev/null || true
+    fi
 
     echo "stopped $server"
 }
@@ -618,7 +629,7 @@ restart_one() {
     fi
 
     trace_server_command "$server" "restart requested"
-    tmux send-keys -t "$(session_name "$server")" "quit" C-m
+    kill -TERM "$old_pid" 2>/dev/null || true
 
     waited=0
     while (( waited < STOP_TIMEOUT_SECONDS + 30 )); do
@@ -713,6 +724,118 @@ console_one() {
     tail -n 120 -f "$lp"
 }
 
+rcon_send() {
+    local server="$1"
+    local command="$2"
+    local return_output="${3:-0}"
+
+    local cfg rcon_port rcon_password
+    cfg="$(server_config_path "$server")"
+    if [[ ! -f "$cfg" ]]; then
+        return 1
+    fi
+
+    rcon_port="$(json_get_or_empty "$cfg" '.["rcon.port"]')"
+    rcon_password="$(json_get_or_empty "$cfg" '.["rcon.password"]')"
+
+    if [[ -z "$rcon_port" || -z "$rcon_password" ]]; then
+        return 1
+    fi
+
+    python3 - "$rcon_port" "$rcon_password" "$command" "$return_output" <<'PY'
+import sys, socket, base64, json
+
+port = int(sys.argv[1])
+password = sys.argv[2]
+command = sys.argv[3]
+return_output = sys.argv[4] == "1"
+
+key = base64.b64encode(b"0123456789ABCDEF").decode('utf-8')
+req = (f"GET /{password} HTTP/1.1\r\n"
+       f"Host: 127.0.0.1:{port}\r\n"
+       f"Upgrade: websocket\r\n"
+       f"Connection: Upgrade\r\n"
+       f"Sec-WebSocket-Key: {key}\r\n"
+       f"Sec-WebSocket-Version: 13\r\n\r\n")
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(10.0)
+try:
+    s.connect(("127.0.0.1", port))
+    s.sendall(req.encode('utf-8'))
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = s.recv(4096)
+        if not chunk: sys.exit(1)
+        resp += chunk
+    
+    if b"101 Switching Protocols" not in resp:
+        sys.exit(1)
+
+    payload = json.dumps({"Identifier": 1, "Message": command, "Name": "WebRcon"}).encode('utf-8')
+    frame = bytearray([0x81])
+    if len(payload) <= 125:
+        frame.append(len(payload) | 0x80)
+    elif len(payload) <= 65535:
+        frame.append(126 | 0x80)
+        frame.extend(len(payload).to_bytes(2, 'big'))
+    else:
+        frame.append(127 | 0x80)
+        frame.extend(len(payload).to_bytes(8, 'big'))
+
+    mask = b'\x00\x00\x00\x00'
+    frame.extend(mask)
+    for i in range(len(payload)):
+        frame.append(payload[i] ^ mask[i % 4])
+
+    s.sendall(frame)
+
+    if not return_output:
+        sys.exit(0)
+
+    response_text = ""
+    while True:
+        header = s.recv(2)
+        if not header: break
+        op = header[0] & 0x0f
+        if op == 8: break
+        
+        plen = header[1] & 0x7f
+        if plen == 126:
+            ext = s.recv(2)
+            plen = int.from_bytes(ext, 'big')
+        elif plen == 127:
+            ext = s.recv(8)
+            plen = int.from_bytes(ext, 'big')
+            
+        data = b""
+        while len(data) < plen:
+            chunk = s.recv(min(4096, plen - len(data)))
+            if not chunk: break
+            data += chunk
+            
+        if op == 1:
+            try:
+                msg = json.loads(data.decode('utf-8'))
+                if msg.get("Identifier") == 1:
+                    response_text = msg.get("Message", "")
+                    break
+            except Exception:
+                pass
+    
+    if response_text:
+        print(response_text)
+        sys.exit(0)
+    else:
+        sys.exit(1)
+        
+except Exception as e:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+
 send_one() {
     local server="$1"
     shift || true
@@ -724,7 +847,7 @@ send_one() {
     pid="$(server_pid "$server" || true)"
     [[ -n "$pid" ]] || die "tmux session exists but RustDedicated pid is missing for $server"
 
-    tmux send-keys -t "$(session_name "$server")" "$cmd" C-m
+    rcon_send "$server" "$cmd" "0" || tmux send-keys -t "$(session_name "$server")" "$cmd" C-m
     trace_server_command "$server" "send: $cmd"
     echo "sent to $server: $cmd"
 }
@@ -781,39 +904,13 @@ query_one() {
 
     tmux_has_session "$server" || die "Server not running: $server"
 
-    local lp offset tmp waited json_found
-    lp="$(log_path "$server")"
-    touch "$lp"
-
-    offset="$(wc -c < "$lp" 2>/dev/null || echo 0)"
-    tmp="$(mktemp)"
-    json_found=0
-
-    tmux send-keys -t "$(session_name "$server")" "$query" C-m
-
-    waited=0
-    while (( waited < QUERY_TIMEOUT_SECONDS * 10 )); do
-        local current_size
-        current_size="$(wc -c < "$lp" 2>/dev/null || echo 0)"
-
-        if (( current_size > offset )); then
-            tail -c +"$((offset + 1))" "$lp" > "$tmp" || true
-            if out="$(query_extract_json_from_chunk "$tmp" 2>/dev/null)"; then
-                printf '%s\n' "$out"
-                json_found=1
-                break
-            fi
-        fi
-
-        sleep 0.1
-        waited=$((waited + 1))
-    done
-
-    rm -f "$tmp"
-
-    if [[ "$json_found" -ne 1 ]]; then
-        die "Timed out waiting for JSON response to '$query' on $server"
+    local out
+    if out="$(rcon_send "$server" "$query" "1")"; then
+        printf '%s\n' "$out"
+        return 0
     fi
+
+    die "Failed to query '$query' on $server via RCON"
 }
 
 config_show_one() {

@@ -2954,70 +2954,33 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             };
         }
 
-        var projects = new[]
-        {
-            new BuildTarget(
-                "agent",
-                Path.Combine(sourceRoot, "agent", "RustOpsAgent", "RustOpsAgent.csproj"),
-                Path.Combine(outputRoot, "agent", "RustOpsAgent")),
-            new BuildTarget(
-                "api",
-                Path.Combine(sourceRoot, "api", "rustmgrapi.csproj"),
-                Path.Combine(outputRoot, "api")),
-            new BuildTarget(
-                "steambot",
-                Path.Combine(sourceRoot, "SteamBot", "OpsSteamBot", "OpsSteamBot.csproj"),
-                Path.Combine(outputRoot, "SteamBot", "OpsSteamBot"))
-        };
+        var isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
+        var scriptName = isWindows ? "Agent-Build.bat" : "Agent-Build.sh";
+        var scriptPath = Path.Combine(sourceRoot, scriptName);
 
-        var targetResults = new List<BuildTargetResult>();
-        foreach (var project in projects)
+        if (!File.Exists(scriptPath))
         {
-            if (!File.Exists(project.ProjectPath))
+            return new BuildFromSourceResult
             {
-                targetResults.Add(new BuildTargetResult
-                {
-                    Name = project.Name,
-                    Success = false,
-                    ExitCode = -1,
-                    Message = $"Project not found: {project.ProjectPath}"
-                });
-                continue;
-            }
-
-            Directory.CreateDirectory(project.OutputPath);
-            var args = new[]
-            {
-                "publish",
-                project.ProjectPath,
-                "-c", normalizedConfiguration,
-                "-r", normalizedRuntime,
-                "-o", project.OutputPath,
-                "--nologo"
+                Success = false,
+                Configuration = normalizedConfiguration,
+                Runtime = normalizedRuntime,
+                Summary = $"Build script not found: {scriptPath}"
             };
-
-            var result = await ExecuteProcessAsync("dotnet", args, sourceRoot, TimeSpan.FromMinutes(20));
-            targetResults.Add(new BuildTargetResult
-            {
-                Name = project.Name,
-                Success = result.Ok,
-                ExitCode = result.ExitCode,
-                Message = BuildLifecycleMessage(result, "build result unavailable")
-            });
         }
 
-        var failedTargets = targetResults.Where(target => !target.Success).ToList();
-        var summary = failedTargets.Count == 0
-            ? $"Published {targetResults.Count} targets to {outputRoot}."
-            : $"Build failed for: {string.Join(", ", failedTargets.Select(target => target.Name))}.";
+        var fileName = isWindows ? "cmd.exe" : "bash";
+        var args = isWindows ? new[] { "/c", scriptPath } : new[] { scriptPath };
 
+        var result = await ExecuteProcessAsync(fileName, args, sourceRoot, TimeSpan.FromMinutes(20));
+        
         return new BuildFromSourceResult
         {
-            Success = failedTargets.Count == 0,
+            Success = result.Ok,
             Configuration = normalizedConfiguration,
             Runtime = normalizedRuntime,
-            Targets = targetResults,
-            Summary = summary
+            Targets = new List<BuildTargetResult>(), // Targets are no longer tracked individually
+            Summary = result.Ok ? "Build script executed successfully." : $"Build script failed: {BuildLifecycleMessage(result, "build failed")}"
         };
     }
 
@@ -4299,6 +4262,35 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                lowered.Contains("i don’t have info on plugin updates", StringComparison.Ordinal) ||
                lowered.Contains("i don't have info on plugin updates", StringComparison.Ordinal) ||
                lowered.Contains("i cannot directly control", StringComparison.Ordinal);
+    }
+
+    private static string StripProcessNarration(string reply)
+    {
+        if (string.IsNullOrWhiteSpace(reply)) return reply;
+        var lines = reply.Split('\n');
+        var cleaned = new List<string>(lines.Length);
+        foreach (var raw in lines)
+        {
+            var line = raw.TrimEnd();
+            var lower = line.TrimStart().ToLowerInvariant();
+            if (cleaned.Count == 0 && string.IsNullOrWhiteSpace(line)) continue;
+            if (lower.StartsWith("i'll use the ") || lower.StartsWith("i will use the ") ||
+                lower.StartsWith("let me use ") || lower.StartsWith("let me call ") ||
+                lower.StartsWith("let me check") || lower.StartsWith("let me look") ||
+                lower.StartsWith("i'll check") || lower.StartsWith("i'm calling") ||
+                lower.StartsWith("i'm checking") || lower.StartsWith("calling the ") ||
+                lower.StartsWith("according to the tool") || lower.StartsWith("based on the tool") ||
+                lower.StartsWith("the tool returned") || lower.StartsWith("tool result:") ||
+                (lower.StartsWith("using the ") && lower.Contains(" tool")) ||
+                lower.Contains("execute_server_command") || lower.Contains("list_servers(") ||
+                lower.Contains("get_server_status(") || lower.Contains("get_server_health(") ||
+                lower.Contains("diagnose_agent_runtime("))
+                continue;
+            cleaned.Add(line);
+        }
+        while (cleaned.Count > 0 && string.IsNullOrWhiteSpace(cleaned[^1]))
+            cleaned.RemoveAt(cleaned.Count - 1);
+        return cleaned.Count == 0 ? reply.Trim() : string.Join('\n', cleaned);
     }
 
     private static bool ShouldUseLastServer(string message)

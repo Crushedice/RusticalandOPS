@@ -1066,13 +1066,28 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-    var result  = await ExecRustMgrAsync("query", server, "serverinfo");
-    if (!result.Ok) return Results.BadRequest(result);
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
 
-    var payload = TryExtractJson(result.StdOut);
-    return payload is null
-        ? Results.BadRequest(new ApiError("parse_error", "Could not parse serverinfo response."))
-        : Results.Text(payload, "application/json");
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
+    try
+    {
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        var directReply = await rcon.SendAndReceiveAsync("serverinfo");
+        var payload = TryExtractJson(directReply);
+        return payload is null
+            ? Results.BadRequest(new ApiError("parse_error", "Could not parse serverinfo response."))
+            : Results.Text(payload, "application/json");
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+    }
 });
 
 // ── Player list (live RCON query) ─────────────────────────────────────────────
@@ -1081,13 +1096,28 @@ app.MapGet("/servers/{server}/players", async (string server) =>
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-    var result  = await ExecRustMgrAsync("query", server, "playerlist");
-    if (!result.Ok) return Results.BadRequest(result);
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
 
-    var payload = TryExtractJson(result.StdOut);
-    return payload is null
-        ? Results.BadRequest(new ApiError("parse_error", "Could not parse playerlist response."))
-        : Results.Text(payload, "application/json");
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
+    try
+    {
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        var directReply = await rcon.SendAndReceiveAsync("playerlist");
+        var payload = TryExtractJson(directReply);
+        return payload is null
+            ? Results.BadRequest(new ApiError("parse_error", "Could not parse playerlist response."))
+            : Results.Text(payload, "application/json");
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+    }
 });
 
 // ── Bans ──────────────────────────────────────────────────────────────────────
@@ -1096,13 +1126,28 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-    var result  = await ExecRustMgrAsync("query", server, "bans");
-    if (!result.Ok) return Results.BadRequest(result);
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
 
-    var payload = TryExtractJson(result.StdOut);
-    return payload is null
-        ? Results.BadRequest(new ApiError("parse_error", "Could not parse bans response."))
-        : Results.Text(payload, "application/json");
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
+    try
+    {
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        var directReply = await rcon.SendAndReceiveAsync("bans");
+        var payload = TryExtractJson(directReply);
+        return payload is null
+            ? Results.BadRequest(new ApiError("parse_error", "Could not parse bans response."))
+            : Results.Text(payload, "application/json");
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+    }
 });
 
 // ── Kick ──────────────────────────────────────────────────────────────────────
@@ -1114,9 +1159,34 @@ app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest re
     if (request is null || string.IsNullOrWhiteSpace(request.SteamId))
         return Results.BadRequest(new ApiError("invalid_request", "SteamId is required."));
 
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
     var reason = string.IsNullOrWhiteSpace(request.Reason) ? "Kicked by admin" : request.Reason.Trim();
-    var result = await ExecRustMgrAsync("send", server, $"kick {request.SteamId} \"{Escape(reason)}\"");
-    return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
+    var command = $"kick {request.SteamId} \"{Escape(reason)}\"";
+    
+    try
+    {
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        var reply = await rcon.SendAndReceiveAsync(command);
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            reply = string.IsNullOrWhiteSpace(reply) ? null : reply.Trim()
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+    }
 });
 
 // ── Ban ───────────────────────────────────────────────────────────────────────
@@ -1128,9 +1198,34 @@ app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest req
     if (request is null || string.IsNullOrWhiteSpace(request.SteamId))
         return Results.BadRequest(new ApiError("invalid_request", "SteamId is required."));
 
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
     var reason = string.IsNullOrWhiteSpace(request.Reason) ? "Banned by admin" : request.Reason.Trim();
-    var result = await ExecRustMgrAsync("send", server, $"ban {request.SteamId} \"{Escape(reason)}\"");
-    return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
+    var command = $"ban {request.SteamId} \"{Escape(reason)}\"";
+
+    try
+    {
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        var reply = await rcon.SendAndReceiveAsync(command);
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            reply = string.IsNullOrWhiteSpace(reply) ? null : reply.Trim()
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+    }
 });
 
 // ── Unban ─────────────────────────────────────────────────────────────────────
@@ -1142,8 +1237,33 @@ app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest r
     if (request is null || string.IsNullOrWhiteSpace(request.SteamId))
         return Results.BadRequest(new ApiError("invalid_request", "SteamId is required."));
 
-    var result = await ExecRustMgrAsync("send", server, $"unban {request.SteamId}");
-    return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
+    var command = $"unban {request.SteamId}";
+
+    try
+    {
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        var reply = await rcon.SendAndReceiveAsync(command);
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            reply = string.IsNullOrWhiteSpace(reply) ? null : reply.Trim()
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+    }
 });
 
 app.Run();
