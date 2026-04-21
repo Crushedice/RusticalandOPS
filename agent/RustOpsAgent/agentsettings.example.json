@@ -13,7 +13,8 @@
     "logRulesPath": "agent-log-rules.json"
   },
   "memory": {
-    "statePath": "data/agent-state.json"
+    "statePath": "data/agent-state.json",
+    "neoCortexRoot": "data/NeoCortex"
   },
   "inbox": {
     "feedbackInboxPath": "data/feedback-inbox",

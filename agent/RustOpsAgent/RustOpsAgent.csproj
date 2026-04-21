@@ -7,12 +7,13 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.49.0" />
+    <PackageReference Include="Microsoft.SemanticKernel.Connectors.OpenAI" Version="1.49.0" />
     <PackageReference Include="Sentry" Version="6.1.0" />
   </ItemGroup>
 
   <ItemGroup>
     <Compile Include="..\..\shared\RustOpsEnv.cs" Link="RustOpsEnv.cs" />
     <Compile Include="..\..\shared\RustOpsSentry.cs" Link="RustOpsSentry.cs" />
-    <Compile Include="..\..\shared\RustMgrExecutor.cs" Link="RustMgrExecutor.cs" />
   </ItemGroup>
 </Project>

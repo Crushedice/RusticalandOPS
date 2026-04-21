@@ -26,7 +26,7 @@ builder.Services.Configure<JsonOptions>(options =>
 var app = builder.Build();
 var rustMgr = new RustMgrExecutor();
 
-// ── Configuration ────────────────────────────────────────────────────────────
+// -- Configuration ------------------------------------------------------------
 // API key: set RUSTMGR_API_KEY env var. Falls back to "changeme" for dev only.
 var apiKey      = RustOpsEnv.FirstNonEmptyEnvironment("RUSTMGR_API_KEY", "RUSTOPS_API_KEY") ?? "changeme";
 var bindUrl     = Environment.GetEnvironmentVariable("RUSTMGR_BIND")    ?? "http://0.0.0.0:2077";
@@ -69,11 +69,12 @@ app.Use(async (ctx, next) =>
     }
 });
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
+// -- Auth middleware -----------------------------------------------------------
 app.Use(async (ctx, next) =>
 {
     if (ctx.Request.Path.StartsWithSegments("/health") ||
-        ctx.Request.Path.StartsWithSegments("/ui"))
+        ctx.Request.Path.StartsWithSegments("/ui") ||
+        ctx.Request.Path == "/")
     {
         await next();
         return;
@@ -88,7 +89,7 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// -- Health --------------------------------------------------------------------
 app.MapGet("/health", () => Results.Ok(new
 {
     ok        = true,
@@ -425,7 +426,7 @@ app.MapGet("/host/ollama/summary", async () =>
     return Results.Ok(summary);
 });
 
-// ── Host inspection ───────────────────────────────────────────────────────────
+// -- Host inspection -----------------------------------------------------------
 app.MapGet("/host/network/interfaces", async () =>
 {
     var result = await ExecProcessAsync("ip", "-json", "addr");
@@ -445,13 +446,13 @@ app.MapGet("/host/network/interfaces", async () =>
 
 app.MapGet("/host/network/summary", () => Results.Ok(BuildHostNetworkSummary()));
 
-// ── Server list ───────────────────────────────────────────────────────────────
+// -- Server list ---------------------------------------------------------------
 // Calls rustmgr list as the authoritative source, then cross-checks config dir.
 app.MapGet("/servers", async () =>
 {
     var result = await ExecRustMgrAsync("list");
 
-    // rustmgr list exits 1 with no output when no servers exist — that is fine.
+    // rustmgr list exits 1 with no output when no servers exist � that is fine.
     var names = (result.StdOut ?? string.Empty)
         .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
         .Where(n => !string.IsNullOrWhiteSpace(n))
@@ -464,7 +465,7 @@ app.MapGet("/servers", async () =>
     }));
 });
 
-// ── Agent convenience: all servers with status in one call ────────────────────
+// -- Agent convenience: all servers with status in one call --------------------
 app.MapGet("/servers/summary", async () =>
 {
     var listResult = await ExecRustMgrAsync("list");
@@ -483,7 +484,7 @@ app.MapGet("/servers/summary", async () =>
     return Results.Ok(statuses);
 });
 
-// ── Status ────────────────────────────────────────────────────────────────────
+// -- Status --------------------------------------------------------------------
 app.MapGet("/servers/{server}/status", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -496,7 +497,7 @@ app.MapGet("/servers/{server}/status", async (string server) =>
     return Results.Ok(ParseStatus(server, result.StdOut));
 });
 
-// ── Agent convenience: composite health check ─────────────────────────────────
+// -- Agent convenience: composite health check ---------------------------------
 // Combines: process status + recent log error scan + meta availability.
 // The agent calls this instead of assembling several calls itself.
 app.MapGet("/servers/{server}/health", async (string server) =>
@@ -540,7 +541,7 @@ app.MapGet("/servers/{server}/health", async (string server) =>
     });
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// -- Start ---------------------------------------------------------------------
 app.MapPost("/servers/{server}/start", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -553,7 +554,7 @@ app.MapPost("/servers/{server}/start", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── Stop ──────────────────────────────────────────────────────────────────────
+// -- Stop ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/stop", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -563,7 +564,7 @@ app.MapPost("/servers/{server}/stop", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── Restart ───────────────────────────────────────────────────────────────────
+// -- Restart -------------------------------------------------------------------
 app.MapPost("/servers/{server}/restart", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -576,7 +577,7 @@ app.MapPost("/servers/{server}/restart", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── Kill ──────────────────────────────────────────────────────────────────────
+// -- Kill ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/kill", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -586,7 +587,7 @@ app.MapPost("/servers/{server}/kill", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── Update (SteamCMD) ─────────────────────────────────────────────────────────
+// -- Update (SteamCMD) ---------------------------------------------------------
 app.MapPost("/servers/{server}/update", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -596,7 +597,7 @@ app.MapPost("/servers/{server}/update", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── uMod update ───────────────────────────────────────────────────────────────
+// -- uMod update ---------------------------------------------------------------
 app.MapPost("/servers/{server}/umod", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -606,7 +607,7 @@ app.MapPost("/servers/{server}/umod", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── Sync config ───────────────────────────────────────────────────────────────
+// -- Sync config ---------------------------------------------------------------
 app.MapPost("/servers/{server}/sync-config", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -616,8 +617,8 @@ app.MapPost("/servers/{server}/sync-config", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── Wipe (map + save data) ────────────────────────────────────────────────────
-// rustmgr refuses to wipe while server is running — that safety check stays in
+// -- Wipe (map + save data) ----------------------------------------------------
+// rustmgr refuses to wipe while server is running � that safety check stays in
 // the script; the API just proxies it.
 app.MapPost("/servers/{server}/wipe", async (string server) =>
 {
@@ -628,7 +629,7 @@ app.MapPost("/servers/{server}/wipe", async (string server) =>
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
-// ── Config read ───────────────────────────────────────────────────────────────
+// -- Config read ---------------------------------------------------------------
 app.MapGet("/servers/{server}/config", (string server) =>
 {
     var cfg = LoadServerConfig(server);
@@ -637,7 +638,7 @@ app.MapGet("/servers/{server}/config", (string server) =>
     return Results.Ok(cfg);
 });
 
-// ── Config write ──────────────────────────────────────────────────────────────
+// -- Config write --------------------------------------------------------------
 app.MapPut("/servers/{server}/config", (string server, ServerConfig config) =>
 {
     var normalized    = NormalizeConfig(server, config);
@@ -655,7 +656,7 @@ app.MapPut("/servers/{server}/config", (string server, ServerConfig config) =>
     });
 });
 
-// ── Config validation / provisioning ─────────────────────────────────────────
+// -- Config validation / provisioning -----------------------------------------
 app.MapPost("/servers/{server}/config/validate", (string server, ServerConfig config) =>
 {
     var normalized = NormalizeConfig(server, config);
@@ -720,7 +721,7 @@ app.MapPost("/servers/provision", (ProvisionServerRequest request) =>
     });
 });
 
-// ── Runtime meta (ports, identity, seed — for agent context) ──────────────────
+// -- Runtime meta (ports, identity, seed � for agent context) ------------------
 // Reads the .meta file rustmgr writes on sync-config. Gives the agent a fast
 // way to know what ports/identity a server is running without parsing JSON config.
 app.MapGet("/servers/{server}/meta", async (string server) =>
@@ -744,7 +745,7 @@ app.MapGet("/servers/{server}/meta", async (string server) =>
     return Results.Ok(meta);
 });
 
-// ── Oxide / plugin validation ────────────────────────────────────────────────
+// -- Oxide / plugin validation ------------------------------------------------
 app.MapGet("/servers/{server}/oxide/validate", (string server) =>
 {
     var cfg = LoadServerConfig(server);
@@ -794,7 +795,7 @@ app.MapGet("/servers/{server}/oxide/validate", (string server) =>
     });
 });
 
-// ── Managed tasks for agent-created cron jobs ────────────────────────────────
+// -- Managed tasks for agent-created cron jobs --------------------------------
 app.MapGet("/tasks", () =>
 {
     var files = Directory.GetFiles(tasksDir, "*.cron")
@@ -850,7 +851,7 @@ app.MapPost("/tasks", (ManagedTaskRequest request) =>
     });
 });
 
-// ── Send RCON command ─────────────────────────────────────────────────────────
+// -- Send RCON command ---------------------------------------------------------
 app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequest request) =>
 {
     if (!await IsValidServerAsync(server))
@@ -958,7 +959,7 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
     });
 });
 
-// ── Console log snapshot ──────────────────────────────────────────────────────
+// -- Console log snapshot ------------------------------------------------------
 app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
 {
     if (!await IsValidServerAsync(server))
@@ -971,7 +972,7 @@ app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
     return Results.Text(TailLines(result.StdOut ?? string.Empty, n), "text/plain; charset=utf-8");
 });
 
-// ── Agent convenience: structured recent log lines ────────────────────────────
+// -- Agent convenience: structured recent log lines ----------------------------
 // Returns parsed log entries as JSON. Optional `since` ISO8601 param lets the
 // agent ask "what happened in the last N minutes" without sending the full log.
 // Lines that don't start with a recognised timestamp are attached to the
@@ -1027,7 +1028,7 @@ app.MapGet("/servers/{server}/logs/read", async (string server, long? offset, in
     });
 });
 
-// ── Command trace (what was sent to the server) ───────────────────────────────
+// -- Command trace (what was sent to the server) -------------------------------
 app.MapGet("/servers/{server}/commands", async (string server, int? lines) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1040,7 +1041,7 @@ app.MapGet("/servers/{server}/commands", async (string server, int? lines) =>
     return Results.Text(result.StdOut ?? string.Empty, "text/plain; charset=utf-8");
 });
 
-// ── Agent convenience: command trace as structured JSON ───────────────────────
+// -- Agent convenience: command trace as structured JSON -----------------------
 app.MapGet("/servers/{server}/events", async (string server, int? lines) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1061,7 +1062,7 @@ app.MapGet("/servers/{server}/events", async (string server, int? lines) =>
     return Results.Ok(new { server, count = events.Count, events });
 });
 
-// ── Serverinfo (live RCON query) ──────────────────────────────────────────────
+// -- Serverinfo (live RCON query) ----------------------------------------------
 app.MapGet("/servers/{server}/serverinfo", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1091,7 +1092,7 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
     }
 });
 
-// ── Player list (live RCON query) ─────────────────────────────────────────────
+// -- Player list (live RCON query) ---------------------------------------------
 app.MapGet("/servers/{server}/players", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1121,7 +1122,7 @@ app.MapGet("/servers/{server}/players", async (string server) =>
     }
 });
 
-// ── Bans ──────────────────────────────────────────────────────────────────────
+// -- Bans ----------------------------------------------------------------------
 app.MapGet("/servers/{server}/bans", async (string server) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1151,7 +1152,7 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
     }
 });
 
-// ── Kick ──────────────────────────────────────────────────────────────────────
+// -- Kick ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest request) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1190,7 +1191,7 @@ app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest re
     }
 });
 
-// ── Ban ───────────────────────────────────────────────────────────────────────
+// -- Ban -----------------------------------------------------------------------
 app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest request) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1229,7 +1230,7 @@ app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest req
     }
 });
 
-// ── Unban ─────────────────────────────────────────────────────────────────────
+// -- Unban ---------------------------------------------------------------------
 app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest request) =>
 {
     if (!await IsValidServerAsync(server))
@@ -1279,9 +1280,9 @@ finally
     await RustOpsSentry.FlushAsync();
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 // Helpers
-// ═════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 
 static async Task<bool> IsValidServerAsync(string server)
 {
@@ -1296,7 +1297,7 @@ static async Task<bool> IsValidServerAsync(string server)
 //   state: running|offline|restarting|session-only
 //   session: yes|no
 //   autorestart: yes|no
-//   pid: <number>           ← only present when running
+//   pid: <number>           ? only present when running
 static ServerStatusResponse ParseStatus(string server, string? stdout)
 {
     var output = stdout ?? string.Empty;
@@ -2271,26 +2272,6 @@ static async Task<PlayerSnapshot?> TryReadPlayerSnapshotAsync(string server)
     };
 }
 	
-static string ResolveConfiguredPath(string? configuredPath, string baseDir, string fallback)
-{
-    var raw = RustOpsEnv.ResolvePlaceholders(configuredPath);
-    if (string.IsNullOrWhiteSpace(raw))
-        raw = fallback;
-    var normalized = RustOpsEnv.NormalizePath(raw);
-    return Path.IsPathRooted(normalized)
-        ? Path.GetFullPath(normalized)
-        : Path.GetFullPath(Path.Combine(baseDir, normalized));
-}
-static string? NormalizeBearerToken(string? value)
-{
-    if (string.IsNullOrWhiteSpace(value))
-        return null;
-    var token = value.Trim();
-    if (token.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
-        token = token["Bearer ".Length..].Trim();
-    return string.IsNullOrWhiteSpace(token) ? null : token;
-}
-
 static async Task<ServerInfoSnapshot?> TryReadServerInfoSnapshotAsync(string server)
 {
     var result = await ExecRustMgrAsync("query", server, "serverinfo");
@@ -3450,9 +3431,9 @@ static async Task<CommandExecutionResult> ExecProcessAsync(string fileName, para
     }
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 // Models
-// ═════════════════════════════════════════════════════════════════════════════
+// -----------------------------------------------------------------------------
 
 sealed class JsonDefaults
 {
@@ -4024,7 +4005,7 @@ public sealed class RustRcon : IAsyncDisposable
 
     /// <summary>
     /// Sends a command and returns the direct response string.
-    /// Note: RCON responses are best-effort — not all commands echo a reply.
+    /// Note: RCON responses are best-effort � not all commands echo a reply.
     /// </summary>
     public async Task<string> SendAndReceiveAsync(string command, CancellationToken ct = default)
     {

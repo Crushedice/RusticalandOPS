@@ -13,7 +13,8 @@
     "logRulesPath": "agent-log-rules.json"
   },
   "memory": {
-    "statePath": "${RUSTOPS_AGENT_STATE_PATH}"
+    "statePath": "${RUSTOPS_AGENT_STATE_PATH}",
+    "neoCortexRoot": "data/NeoCortex"
   },
   "inbox": {
     "feedbackInboxPath": "${RUSTOPS_FEEDBACK_INBOX_PATH}",
