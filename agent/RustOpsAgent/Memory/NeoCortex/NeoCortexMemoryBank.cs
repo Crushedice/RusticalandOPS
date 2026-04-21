@@ -88,7 +88,7 @@ internal sealed class NeoCortexMemoryBank
         }, JsonOptions.Default));
 
         Directory.CreateDirectory(Path.GetDirectoryName(legacyStatePath)!);
-        File.WriteAllText(legacyStatePath, JsonSerializer.Serialize(store, JsonOptions.Default));
+        File.WriteAllText(legacyStatePath, JsonSerializer.Serialize(store, AgentMemoryStore.StateFileOptions));
     }
 }
 

@@ -10,10 +10,20 @@ internal static class RconCredentialResolver
 
         using var doc = JsonDocument.Parse(File.ReadAllText(path));
         var root = doc.RootElement;
-        var host = root.TryGetProperty("rconHost", out var hostNode) ? hostNode.GetString() : "127.0.0.1";
-        var port = root.TryGetProperty("rconPort", out var portNode) ? portNode.GetInt32() : 28016;
-        var password = root.TryGetProperty("rconPassword", out var passwordNode) ? passwordNode.GetString() : null;
-        if (string.IsNullOrWhiteSpace(password))
+
+        var host = root.TryGetProperty("rconHost", out var hostNode) && hostNode.ValueKind == JsonValueKind.String
+            ? hostNode.GetString()
+            : "127.0.0.1";
+
+        var port = root.TryGetProperty("rconPort", out var portNode) && portNode.ValueKind == JsonValueKind.Number
+            ? portNode.GetInt32()
+            : 28016;
+
+        var password = root.TryGetProperty("rconPassword", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
+            ? passwordNode.GetString()
+            : null;
+
+        if (string.IsNullOrWhiteSpace(password) || string.IsNullOrWhiteSpace(host))
             return (null, null);
 
         return (new Uri($"ws://{host}:{port}/"), password);

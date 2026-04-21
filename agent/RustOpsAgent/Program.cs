@@ -594,12 +594,16 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     private volatile bool _stopRequested;
     private readonly AgentInteractionRouter _interactionRouter;
     private readonly FocusedNetworkInspector _networkInspector = new();
+    private readonly TmuxServerManager _tmuxServerManager;
+    private readonly RustLogManager _rustLogManager = new();
+    private readonly UmodModule _umodModule = new();
 
     public RustOpsAgent(AgentConfig config, RustMgrApiClient api, RustMgrExecutor executor, LlmClient llm, AgentLogRules logRules, AgentMemoryStore memory)
     {
         _config = config;
         _api = api;
         _executor = executor;
+        _tmuxServerManager = new TmuxServerManager();
         _llm = llm;
         _logRules = logRules;
         _logRulesPath = config.Monitor.LogRulesPath;
@@ -1626,6 +1630,53 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     {
         var text = message.Trim();
         var lowered = text.ToLowerInvariant();
+
+        if (string.Equals(lowered, "tmux sessions", StringComparison.Ordinal))
+        {
+            var result = await _tmuxServerManager.DiscoverSessionsAsync();
+            if (!result.Success)
+                return $"tmux session discovery failed: {BuildLifecycleMessage(result, "tmux failed")}";
+
+            var sessions = (result.StdOut ?? string.Empty)
+                .Split("\n", StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            return sessions.Length == 0 ? "No tmux sessions found." : $"tmux sessions: {string.Join(", ", sessions)}";
+        }
+
+        var logPathsMatch = Regex.Match(text, @"^log\s+paths\s+(?<server>[A-Za-z0-9_\-]+)$", RegexOptions.IgnoreCase);
+        if (logPathsMatch.Success)
+        {
+            var serverName = ResolveServerName(logPathsMatch.Groups["server"].Value.Trim(), servers);
+            if (string.IsNullOrWhiteSpace(serverName))
+                return BuildServerNotFoundReply(servers);
+
+            var paths = _rustLogManager.ResolveLogPaths(serverName).Take(20).ToList();
+            return paths.Count == 0 ? $"{serverName}: no Rust log paths discovered." : $"{serverName}: log paths -> {string.Join(" | ", paths)}";
+        }
+
+        var verifyConfigMatch = Regex.Match(text, @"^verify\s+json\s+config\s+(?<path>.+)$", RegexOptions.IgnoreCase);
+        if (verifyConfigMatch.Success)
+        {
+            var configPath = verifyConfigMatch.Groups["path"].Value.Trim();
+            var ok = _umodModule.TryValidateJsonConfig(configPath, out var configError);
+            return ok ? $"JSON config is valid: {configPath}" : $"JSON config invalid: {configPath} | {configError}";
+        }
+
+        var rconMatch = Regex.Match(text, @"^rcon\s+command\s+(?<command>.+?)\s+on\s+(?<server>[A-Za-z0-9_\-]+)$", RegexOptions.IgnoreCase);
+        if (rconMatch.Success)
+        {
+            var serverName = ResolveServerName(rconMatch.Groups["server"].Value.Trim(), servers);
+            if (string.IsNullOrWhiteSpace(serverName))
+                return BuildServerNotFoundReply(servers);
+
+            var (uri, password) = RconCredentialResolver.Resolve(serverName);
+            if (uri is null || string.IsNullOrWhiteSpace(password))
+                return $"{serverName}: RCON credentials were not found in /opt/rust-manager/config/{serverName}.json";
+
+            await using IRconClient client = new RustRconClient();
+            await client.ConnectAsync(uri, password);
+            var rconReply = await client.SendCommandAsync(rconMatch.Groups["command"].Value.Trim());
+            return $"{serverName}: RCON reply -> {TrimSingleLine(rconReply, 320)}";
+        }
 
         if ((lowered.Contains("plugin", StringComparison.Ordinal) || lowered.Contains("plugins", StringComparison.Ordinal)) &&
             (lowered.Contains("update", StringComparison.Ordinal) || lowered.Contains("upgrade", StringComparison.Ordinal) || lowered.Contains("new version", StringComparison.Ordinal)))
@@ -5300,6 +5351,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             topInterfaces.GetArrayLength() > 0)
         {
             var details = topInterfaces.EnumerateArray()
+                .Where(entry => _networkInspector.IsAllowedInterface(entry.TryGetProperty("name", out var nameNode) ? nameNode.GetString() : null))
                 .Take(3)
                 .Select(entry =>
                 {
@@ -5331,6 +5383,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             interesting.GetArrayLength() > 0)
         {
             var details = interesting.EnumerateArray()
+                .Where(entry => _networkInspector.IsAllowedInterface(entry.TryGetProperty("name", out var nameNode) ? nameNode.GetString() : null))
                 .Take(3)
                 .Select(entry =>
                 {
@@ -5345,9 +5398,14 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                     var spike = entry.TryGetProperty("spikeDetected", out var spikeNode) && spikeNode.ValueKind == JsonValueKind.True ? ", spike" : string.Empty;
                     return $"{name}: {(combined is null ? string.Empty : $"{combined}, ")}rxErr={rxErrors}, txErr={txErrors}, rxDrop={rxDrops}, txDrop={txDrops}{spike}";
                 });
-            summary = sampleSeconds.HasValue
-                ? $"Host network activity over the last {sampleSeconds.Value:0.##}s on {interesting.GetArrayLength()} interface(s). {string.Join(" | ", details)}"
-                : $"Host network activity detected on {interesting.GetArrayLength()} interface(s). {string.Join(" | ", details)}";
+            var detailList = details.ToList();
+            if (detailList.Count > 0)
+            {
+                var focusedCount = detailList.Count;
+                summary = sampleSeconds.HasValue
+                    ? $"Host network activity over the last {sampleSeconds.Value:0.##}s on {focusedCount} focused interface(s). {string.Join(" | ", detailList)}"
+                    : $"Host network activity detected on {focusedCount} focused interface(s). {string.Join(" | ", detailList)}";
+            }
         }
         else if (focusedInterfaces.Count > 0)
         {
@@ -7263,7 +7321,7 @@ internal sealed class AgentMemoryStore
     }
 
     // State file uses camelCase so the API dashboard can read it with TryGetProperty("camelKey").
-    private static readonly JsonSerializerOptions _stateFileOptions = new()
+    internal static readonly JsonSerializerOptions StateFileOptions = new()
     {
         WriteIndented = true,
         PropertyNameCaseInsensitive = true,

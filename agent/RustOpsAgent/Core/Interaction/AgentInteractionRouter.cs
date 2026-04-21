@@ -19,6 +19,9 @@ internal sealed class AgentInteractionRouter
         if (route.Intent == AdminIntentType.chat)
             return null;
 
+        if (!_executor.CanExecute(route))
+            return null;
+
         if (route.NeedsClarification)
         {
             var clarification = "Which server should I target?";

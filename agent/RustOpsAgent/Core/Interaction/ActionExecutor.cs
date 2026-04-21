@@ -11,6 +11,19 @@ internal sealed class ActionExecutor
         _tryDirectAsync = tryDirectAsync;
     }
 
+    public bool CanExecute(AdminIntentRoute route)
+    {
+        return route.Intent switch
+        {
+            AdminIntentType.server_control => true,
+            AdminIntentType.status_check => true,
+            AdminIntentType.troubleshooting => true,
+            AdminIntentType.rcon_command => !string.IsNullOrWhiteSpace(route.CommandText) &&
+                route.CommandText.StartsWith("run command ", StringComparison.OrdinalIgnoreCase),
+            _ => false
+        };
+    }
+
     public async Task<(string reply, string? serverName)> ExecuteAsync(string adminId, AdminIntentRoute route, List<ServerSnapshot> servers, DateTime utcNow)
     {
         var plan = new ChatInterpretation
@@ -18,10 +31,8 @@ internal sealed class ActionExecutor
             Intent = route.Intent switch
             {
                 AdminIntentType.server_control => InferLifecycleIntent(route.CommandText ?? string.Empty),
-                AdminIntentType.player_lookup => "players",
-                AdminIntentType.status_check => "status",
-                AdminIntentType.troubleshooting => "health",
-                AdminIntentType.rcon_command => "run-command",
+                AdminIntentType.status_check => "server-status",
+                AdminIntentType.troubleshooting => "server-health",
                 _ => "unknown"
             },
             ServerName = route.ServerName
@@ -32,6 +43,8 @@ internal sealed class ActionExecutor
             var handled = await _tryDirectAsync(adminId, route.CommandText, servers, utcNow);
             if (!string.IsNullOrWhiteSpace(handled))
                 return (handled, route.ServerName);
+
+            return ("Use: run command <command text> on <server>", route.ServerName);
         }
 
         var reply = await _executePlanAsync(adminId, plan, servers, utcNow);
@@ -44,8 +57,6 @@ internal sealed class ActionExecutor
         if (lowered.Contains("restart")) return "restart-server";
         if (lowered.Contains("stop")) return "stop-server";
         if (lowered.Contains("start")) return "start-server";
-        if (lowered.Contains("kill")) return "kill-server";
-        if (lowered.Contains("update")) return "update-server";
-        return "status";
+        return "server-status";
     }
 }
