@@ -1634,7 +1634,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         if (string.Equals(lowered, "tmux sessions", StringComparison.Ordinal))
         {
             var result = await _tmuxServerManager.DiscoverSessionsAsync();
-            if (!result.Success)
+            if (!result.Ok)
                 return $"tmux session discovery failed: {BuildLifecycleMessage(result, "tmux failed")}";
 
             var sessions = (result.StdOut ?? string.Empty)
