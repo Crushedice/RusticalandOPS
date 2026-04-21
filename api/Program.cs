@@ -1635,8 +1635,17 @@ static string? ReadArgValue(string additionalArgs, string key)
 static ServerConfig? LoadServerConfig(string server)
 {
     var path = GetConfigPath(server);
-    if (!File.Exists(path)) return null;
-    return JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(path), JsonDefaults.Options);
+    if (!File.Exists(path))
+        return null;
+
+    try
+    {
+        return JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(path), JsonDefaults.Options);
+    }
+    catch
+    {
+        return null;
+    }
 }
 
 static void SaveServerConfig(ServerConfig config)
@@ -4060,4 +4069,3 @@ public sealed class RustRcon : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 }
-
