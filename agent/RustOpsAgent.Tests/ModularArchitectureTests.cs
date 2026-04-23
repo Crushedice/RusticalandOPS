@@ -72,7 +72,7 @@ public class ModularArchitectureTests
         {
             new RustServerControlToolHandler(api),
             new RustStatusToolHandler(api),
-            new RustChatToolHandler()
+            new RustChatToolHandler(neo)
         };
 
         var registry = new ToolRegistry(handlers);
@@ -183,7 +183,9 @@ public class ModularArchitectureTests
     [Fact]
     public async Task ActionExecutor_Returns_Explicit_NotImplemented_For_FileEdit()
     {
-        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler() });
+        var tempRoot = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
+        var neo = new NeoCortexStore(Path.Combine(tempRoot, "NeoCortex"), Path.Combine(tempRoot, "legacy.json"));
+        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler(neo) });
         var executor = new ActionExecutor(registry);
         var route = new AdminIntentRoute(
             AdminIntentType.FileEdit,

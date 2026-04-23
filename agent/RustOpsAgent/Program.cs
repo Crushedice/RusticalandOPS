@@ -62,7 +62,19 @@ var legacyState = new LegacyAgentStateStore(config.Memory.StatePath);
 var kernel = BuildKernel(config.Llm);
 if (kernel is null)
 {
+    if (config.Llm.Enabled)
+    {
+        Console.WriteLine("[agent] WARNING: LLM kernel failed to initialize. Check RUSTOPS_LLM_BASE_URL and RUSTOPS_LLM_MODEL env vars. Running without LLM — responses will use heuristics only.");
+    }
+    else
+    {
+        Console.WriteLine("[agent] LLM disabled by config (llm.enabled=false).");
+    }
     config.Llm.Enabled = false;
+}
+else
+{
+    Console.WriteLine($"[agent] LLM kernel ready. provider={config.Llm.Provider} model={config.Llm.Model} recommendations={config.Llm.UseForRecommendations}");
 }
 var classifier = new AdminIntentClassifier(kernel, config.Llm);
 using var apiClient = new RustOpsApiClient(config.Api);
@@ -76,7 +88,7 @@ var handlers = new List<IToolHandler>
     new RustLogsToolHandler(apiClient, neoCortex),
     new RustPluginToolHandler(apiClient),
     new RustNetworkToolHandler(apiClient),
-    new RustChatToolHandler()
+    new RustChatToolHandler(neoCortex)
 };
 
 var registry = new ToolRegistry(handlers);

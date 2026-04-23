@@ -216,10 +216,12 @@ internal sealed class AgentRuntime
                 }
 
                 var route = await _classifier.ClassifyAsync(item.Message, state, cancellationToken);
+                Console.WriteLine($"[chat] {item.AdminId}: intent={route.Intent} target={route.TargetRef ?? "?"} llm={route.ClassifierSource}");
                 RecordIntentRoutingInteraction(item.Message, route);
                 var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);
                 var result = await _executor.ExecuteAsync(context, cancellationToken);
                 var composedReply = await _composer.ComposeAsync(context, result, cancellationToken);
+                Console.WriteLine($"[chat] compose source={composedReply.Source} llm_ok={composedReply.LlmSucceeded}");
                 RecordLlmInteraction(
                     composedReply.Type,
                     composedReply.LlmAttempted,
@@ -357,8 +359,11 @@ internal sealed class AgentRuntime
         catch (Exception ex)
         {
             _legacyState.RecordAgentError($"server observation failed: {ex.Message}");
+            Console.WriteLine($"[observe] Failed to list servers: {ex.Message}");
             return;
         }
+
+        Console.WriteLine($"[observe] Scanning {servers.Count} server(s)...");
 
         foreach (var server in servers)
         {
@@ -375,6 +380,7 @@ internal sealed class AgentRuntime
             catch (Exception ex)
             {
                 _legacyState.RecordAgentError($"observation failed for {server}: {ex.Message}");
+                Console.WriteLine($"[observe] Error observing {server}: {ex.Message}");
             }
         }
     }
@@ -390,9 +396,11 @@ internal sealed class AgentRuntime
 
         if (recentErrors.Count == 0)
         {
+            Console.WriteLine($"[observe] {server}: {state}, no recent errors.");
             return;
         }
 
+        Console.WriteLine($"[observe] {server}: {state}, {recentErrors.Count} error(s) — queuing LLM analysis.");
         var fingerprint = $"{state}|{string.Join("|", recentErrors)}";
         if (_observationFingerprints.TryGetValue($"{server}:health", out var previous) &&
             string.Equals(previous, fingerprint, StringComparison.Ordinal))
@@ -402,6 +410,7 @@ internal sealed class AgentRuntime
 
         _observationFingerprints[$"{server}:health"] = fingerprint;
         var analysis = await AnalyzeObservationWithLlmAsync(server, state, recentErrors, cancellationToken);
+        Console.WriteLine($"[observe] {server}: LLM analysis source={analysis.Source} summary={analysis.Summary}");
         RecordLlmInteraction(
             "observation-analysis",
             analysis.LlmAttempted,
@@ -469,6 +478,16 @@ internal sealed class AgentRuntime
         if (!changed)
         {
             return;
+        }
+
+        var newHighImportance = knowledge.RecentEntries
+            .Where(e => e.ServerName.Equals(server, StringComparison.OrdinalIgnoreCase) && e.Importance >= 3)
+            .TakeLast(3)
+            .Select(e => e.Line)
+            .ToList();
+        if (newHighImportance.Count > 0)
+        {
+            Console.WriteLine($"[observe] {server}: {newHighImportance.Count} high-importance log line(s): {string.Join(" | ", newHighImportance.Select(l => l.Length > 80 ? l[..80] + "..." : l))}");
         }
 
         knowledge.RecentEntries = knowledge.RecentEntries.TakeLast(400).ToList();
