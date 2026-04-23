@@ -4,8 +4,9 @@ using Sentry;
 using RustOpsAgent.Core;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
-using RustOpsAgent.Domains.Rust;
+using RustOpsAgent.Domains.Integrations;
 using RustOpsAgent.Infrastructure;
+using RustOpsAgent.Infrastructure.Connectors;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
 
@@ -39,6 +40,7 @@ RustOpsSentry.ConfigureScope(scope =>
     scope.SetTag("gitops.enabled", config.GitOps.Enabled ? "true" : "false");
     scope.SetExtra("neoCortexRoot", config.Memory.NeoCortexRoot);
     scope.SetExtra("chatInboxPath", config.Inbox.ChatInboxPath);
+    scope.SetExtra("logInboxPath", config.Inbox.LogInboxPath);
     scope.SetExtra("decisionInboxPath", config.Inbox.DecisionInboxPath);
     scope.SetExtra("feedbackInboxPath", config.Inbox.FeedbackInboxPath);
     scope.SetExtra("messageOutboxPath", config.Outbox.MessageOutboxPath);
@@ -46,6 +48,7 @@ RustOpsSentry.ConfigureScope(scope =>
 RustOpsSentry.AddBreadcrumb("Agent configuration loaded.", "startup");
 Directory.CreateDirectory(config.Memory.NeoCortexRoot);
 Directory.CreateDirectory(config.Inbox.ChatInboxPath);
+Directory.CreateDirectory(config.Inbox.LogInboxPath);
 Directory.CreateDirectory(config.Inbox.DecisionInboxPath);
 Directory.CreateDirectory(config.Inbox.FeedbackInboxPath);
 Directory.CreateDirectory(config.Outbox.MessageOutboxPath);
@@ -53,6 +56,7 @@ Directory.CreateDirectory(config.Outbox.MessageOutboxPath);
 Console.WriteLine($"[agent] Config loaded. API={config.Api.BaseUrl} LLM={config.Llm.Enabled}({config.Llm.Provider})");
 Console.WriteLine($"[agent] Paths: state={config.Memory.StatePath}");
 Console.WriteLine($"[agent] Paths: chat-inbox={config.Inbox.ChatInboxPath}");
+Console.WriteLine($"[agent] Paths: log-inbox={config.Inbox.LogInboxPath}");
 Console.WriteLine($"[agent] Paths: outbox={config.Outbox.MessageOutboxPath}");
 
 var neoCortex = new NeoCortexStore(config.Memory.NeoCortexRoot, config.Memory.StatePath);
@@ -65,18 +69,15 @@ if (kernel is null)
     config.Llm.Enabled = false;
 }
 var classifier = new AdminIntentClassifier(kernel, config.Llm);
-using var apiClient = new RustOpsApiClient(config.Api);
+using var autotask = new AutotaskConnector(config.Integrations.Autotask);
+using var dattoRmm = new DattoRmmConnector(config.Integrations.DattoRmm);
+var connectors = new IConnectorLogSource[] { autotask, dattoRmm };
 
 var handlers = new List<IToolHandler>
 {
-    new RustServerControlToolHandler(apiClient),
-    new RustStatusToolHandler(apiClient),
-    new RustPlayerLookupToolHandler(apiClient),
-    new RustRconToolHandler(apiClient),
-    new RustLogsToolHandler(apiClient, neoCortex),
-    new RustPluginToolHandler(apiClient),
-    new RustNetworkToolHandler(apiClient),
-    new RustChatToolHandler()
+    new ConnectorStatusToolHandler(connectors),
+    new ConnectorLogsToolHandler(connectors, neoCortex),
+    new AgentChatToolHandler()
 };
 
 var registry = new ToolRegistry(handlers);
@@ -90,7 +91,7 @@ if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.Or
 
 var gitOps = new GitOpsService(config.GitOps);
 
-var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, apiClient, kernel);
+var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, connectors, kernel);
 
 Console.CancelKeyPress += (_, e) =>
 {

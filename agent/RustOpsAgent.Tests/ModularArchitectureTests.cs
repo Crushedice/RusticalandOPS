@@ -1,7 +1,8 @@
 using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
-using RustOpsAgent.Domains.Rust;
+using RustOpsAgent.Domains.Integrations;
+using RustOpsAgent.Infrastructure.Connectors;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
@@ -63,21 +64,20 @@ public class ModularArchitectureTests
     [Fact]
     public void ToolRegistry_Filters_By_Intent()
     {
-        using var api = new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
         var tempRoot = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
         var neo = new NeoCortexStore(Path.Combine(tempRoot, "NeoCortex"), Path.Combine(tempRoot, "legacy.json"));
         neo.EnsureMigrated();
 
         var handlers = new IToolHandler[]
         {
-            new RustServerControlToolHandler(api),
-            new RustStatusToolHandler(api),
-            new RustChatToolHandler()
+            new ConnectorStatusToolHandler(Array.Empty<IConnectorLogSource>()),
+            new ConnectorLogsToolHandler(Array.Empty<IConnectorLogSource>(), neo),
+            new AgentChatToolHandler()
         };
 
         var registry = new ToolRegistry(handlers);
         var route = new AdminIntentRoute(
-            AdminIntentType.ServerControl,
+            AdminIntentType.StatusCheck,
             new AdminIntentSlots("alpha", null, null, null, null),
             0.9,
             false,
@@ -85,24 +85,22 @@ public class ModularArchitectureTests
             null);
 
         var eligible = registry.ResolveEligible(route);
-        Assert.Contains(eligible, h => h.Name == "rust.server.control");
-        Assert.DoesNotContain(eligible, h => h.Name == "rust.status.check");
+        Assert.Contains(eligible, h => h.Name == "integrations.connector.status");
+        Assert.DoesNotContain(eligible, h => h.Name == "agent.chat.reply");
     }
 
     [Fact]
     public void ToolRegistry_Uses_TargetRef_For_Diagnostics()
     {
-        using var api = new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
         var tempRoot = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
         var neo = new NeoCortexStore(Path.Combine(tempRoot, "NeoCortex"), Path.Combine(tempRoot, "legacy.json"));
         neo.EnsureMigrated();
 
         var handlers = new IToolHandler[]
         {
-            new RustStatusToolHandler(api),
-            new RustLogsToolHandler(api, neo),
-            new RustPluginToolHandler(api),
-            new RustNetworkToolHandler(api)
+            new ConnectorStatusToolHandler(Array.Empty<IConnectorLogSource>()),
+            new ConnectorLogsToolHandler(Array.Empty<IConnectorLogSource>(), neo),
+            new AgentChatToolHandler()
         };
 
         var registry = new ToolRegistry(handlers);
@@ -112,11 +110,11 @@ public class ModularArchitectureTests
             0.9,
             false,
             null,
-            "rust.network.inspect");
+            "integrations.logs.inspect");
 
         var selected = registry.ResolveSingle(new ToolExecutionContext("admin", "check alpha", route, new ConversationSelectionState(), DateTime.UtcNow));
         Assert.NotNull(selected);
-        Assert.Equal("rust.network.inspect", selected!.Name);
+        Assert.Equal("integrations.logs.inspect", selected!.Name);
     }
 
     [Fact]
@@ -183,7 +181,7 @@ public class ModularArchitectureTests
     [Fact]
     public async Task ActionExecutor_Returns_Explicit_NotImplemented_For_FileEdit()
     {
-        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler() });
+        var registry = new ToolRegistry(new IToolHandler[] { new AgentChatToolHandler() });
         var executor = new ActionExecutor(registry);
         var route = new AdminIntentRoute(
             AdminIntentType.FileEdit,
@@ -213,14 +211,14 @@ public class ModularArchitectureTests
     }
 
     [Fact]
-    public async Task Classifier_Extracts_Server_Hint_From_From_Phrasing()
+    public async Task Classifier_Extracts_Source_Hint_From_From_Phrasing()
     {
         var classifier = new AdminIntentClassifier(kernel: null);
         var state = new ConversationSelectionState { AdminId = "admin" };
 
-        var route = await classifier.ClassifyAsync("can you give me the current playerlist from monthly ?", state, CancellationToken.None);
+        var route = await classifier.ClassifyAsync("can you inspect logs from monthly for failures?", state, CancellationToken.None);
 
-        Assert.Equal(AdminIntentType.PlayerLookup, route.Intent);
+        Assert.Equal(AdminIntentType.Troubleshooting, route.Intent);
         Assert.Equal("monthly", route.Slots.ServerName);
         Assert.False(route.LlmAttempted);
     }

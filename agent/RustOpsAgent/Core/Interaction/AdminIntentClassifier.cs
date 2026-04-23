@@ -29,10 +29,10 @@ Return strict JSON only with keys:
 intent, confidence, needsClarification, clarificationQuestion, targetRef, slots
 
 intent enum:
-chat, server_control, player_lookup, rcon_command, file_edit, status_check, troubleshooting, clarification
+chat, status_check, troubleshooting, file_edit, clarification
 
 targetRef enum:
-rust.server.control, rust.player.lookup, rust.rcon.command, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply
+integrations.connector.status, integrations.logs.inspect, agent.chat.reply
 
 slots object keys:
 serverName, playerName, commandText, timeRange, severity
@@ -124,20 +124,20 @@ Admin message:
     {
         var lowered = message.ToLowerInvariant();
         AdminIntentType intent;
-        if (lowered.Contains("network") || lowered.Contains("throughput") || lowered.Contains("latency") || lowered.Contains("eth0") || lowered.Contains("wg1") || lowered.Contains("wt1"))
-            intent = AdminIntentType.StatusCheck;
-        else if (lowered.Contains("plugin") || lowered.Contains("umod") || lowered.Contains("oxide"))
+        if (lowered.Contains("log") ||
+            lowered.Contains("error") ||
+            lowered.Contains("exception") ||
+            lowered.Contains("alert") ||
+            lowered.Contains("incident") ||
+            lowered.Contains("failed"))
             intent = AdminIntentType.Troubleshooting;
-        else if (lowered.Contains("restart") || lowered.Contains("start") || lowered.Contains("stop") || lowered.Contains("kill") || lowered.Contains("update"))
-            intent = AdminIntentType.ServerControl;
-        else if (lowered.Contains("player") || lowered.Contains("ban"))
-            intent = AdminIntentType.PlayerLookup;
-        else if (lowered.Contains("rcon") || lowered.Contains("command") || lowered.Contains("say ") || lowered.Contains("global."))
-            intent = AdminIntentType.RconCommand;
-        else if (lowered.Contains("status") || lowered.Contains("health") || lowered.Contains("logs"))
+        else if (lowered.Contains("status") ||
+                 lowered.Contains("health") ||
+                 lowered.Contains("connector") ||
+                 lowered.Contains("autotask") ||
+                 lowered.Contains("datto") ||
+                 lowered.Contains("rmm"))
             intent = AdminIntentType.StatusCheck;
-        else if (lowered.Contains("fix") || lowered.Contains("error") || lowered.Contains("fail"))
-            intent = AdminIntentType.Troubleshooting;
         else
             intent = AdminIntentType.Chat;
 
@@ -159,49 +159,23 @@ Admin message:
     private static bool ShouldUseLastServer(string message)
     {
         var lowered = message.ToLowerInvariant();
-        // Only reuse the last server for explicit follow-up phrasing, not generic uses of "it" or "same".
+        // Only reuse the last context slot for explicit follow-up phrasing.
         return lowered.Contains("that one") ||
-               lowered.Contains("same server") ||
+               lowered.Contains("same source") ||
+               lowered.Contains("same connector") ||
                lowered.Contains("same one") ||
                lowered.Contains("again") ||
-               lowered.Contains("restart it") ||
-               lowered.Contains("stop it") ||
-               lowered.Contains("start it") ||
-               lowered.Contains("kill it") ||
-               lowered.Contains("update it") ||
                lowered.Contains("check it");
     }
 
     private static string? InferTargetRef(AdminIntentType intent, string loweredMessage) =>
         intent switch
         {
-            AdminIntentType.ServerControl => "rust.server.control",
-            AdminIntentType.PlayerLookup => "rust.player.lookup",
-            AdminIntentType.RconCommand => "rust.rcon.command",
-            AdminIntentType.Chat or AdminIntentType.Clarification => "rust.chat.reply",
-            AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting => InferDiagnosticsTarget(loweredMessage),
+            AdminIntentType.Chat or AdminIntentType.Clarification => "agent.chat.reply",
+            AdminIntentType.StatusCheck => "integrations.connector.status",
+            AdminIntentType.Troubleshooting => "integrations.logs.inspect",
             _ => null
         };
-
-    private static string InferDiagnosticsTarget(string loweredMessage)
-    {
-        if (loweredMessage.Contains("network") || loweredMessage.Contains("latency") || loweredMessage.Contains("throughput") || loweredMessage.Contains("eth0") || loweredMessage.Contains("wg1") || loweredMessage.Contains("wt1"))
-        {
-            return "rust.network.inspect";
-        }
-
-        if (loweredMessage.Contains("plugin") || loweredMessage.Contains("umod") || loweredMessage.Contains("oxide"))
-        {
-            return "rust.plugins.verify";
-        }
-
-        if (loweredMessage.Contains("log") || loweredMessage.Contains("error") || loweredMessage.Contains("exception") || loweredMessage.Contains("fail"))
-        {
-            return "rust.logs.inspect";
-        }
-
-        return "rust.status.check";
-    }
 
     private static string? NormalizeTargetRef(string? targetRef)
     {
@@ -212,14 +186,9 @@ Admin message:
 
         return targetRef.Trim().ToLowerInvariant() switch
         {
-            "network" or "network.inspect" => "rust.network.inspect",
-            "plugins" or "plugins.verify" or "plugin" => "rust.plugins.verify",
-            "logs" or "logs.inspect" => "rust.logs.inspect",
-            "status" or "status.check" => "rust.status.check",
-            "server_control" => "rust.server.control",
-            "player_lookup" => "rust.player.lookup",
-            "rcon_command" => "rust.rcon.command",
-            "chat" or "clarification" => "rust.chat.reply",
+            "connector" or "connectors" or "status" or "status.check" => "integrations.connector.status",
+            "log" or "logs" or "logs.inspect" => "integrations.logs.inspect",
+            "chat" or "clarification" => "agent.chat.reply",
             _ => targetRef
         };
     }
@@ -227,9 +196,6 @@ Admin message:
     private static AdminIntentType ParseIntent(string value) => value.ToLowerInvariant() switch
     {
         "chat" => AdminIntentType.Chat,
-        "server_control" => AdminIntentType.ServerControl,
-        "player_lookup" => AdminIntentType.PlayerLookup,
-        "rcon_command" => AdminIntentType.RconCommand,
         "file_edit" => AdminIntentType.FileEdit,
         "status_check" => AdminIntentType.StatusCheck,
         "troubleshooting" => AdminIntentType.Troubleshooting,

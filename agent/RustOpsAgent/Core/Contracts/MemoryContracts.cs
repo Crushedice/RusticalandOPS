@@ -50,6 +50,9 @@ internal sealed class LogKnowledgeState
 internal sealed class LogObservation
 {
     [JsonPropertyName("serverName")] public string ServerName { get; set; } = string.Empty;
+    [JsonPropertyName("source")] public string? Source { get; set; }
+    [JsonPropertyName("connector")] public string? Connector { get; set; }
+    [JsonPropertyName("level")] public string? Level { get; set; }
     [JsonPropertyName("line")] public string Line { get; set; } = string.Empty;
     [JsonPropertyName("importance")] public int Importance { get; set; }
     [JsonPropertyName("capturedAtUtc")] public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;

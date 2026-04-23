@@ -44,12 +44,9 @@ internal sealed class ToolRegistry
 
         return route.Intent switch
         {
-            AdminIntentType.ServerControl => eligible.FirstOrDefault(h => h.Name == "rust.server.control") ?? eligible[0],
-            AdminIntentType.RconCommand => eligible.FirstOrDefault(h => h.Name == "rust.rcon.command") ?? eligible[0],
-            AdminIntentType.PlayerLookup => eligible.FirstOrDefault(h => h.Name == "rust.player.lookup") ?? eligible[0],
-            AdminIntentType.Chat or AdminIntentType.Clarification => eligible.FirstOrDefault(h => h.Name == "rust.chat.reply") ?? eligible[0],
-            AdminIntentType.StatusCheck => eligible.FirstOrDefault(h => h.Name == "rust.status.check") ?? eligible[0],
-            AdminIntentType.Troubleshooting => eligible.FirstOrDefault(h => h.Name == "rust.logs.inspect") ?? eligible[0],
+            AdminIntentType.Chat or AdminIntentType.Clarification => eligible.FirstOrDefault(h => h.Name == "agent.chat.reply") ?? eligible[0],
+            AdminIntentType.StatusCheck => eligible.FirstOrDefault(h => h.Name == "integrations.connector.status") ?? eligible[0],
+            AdminIntentType.Troubleshooting => eligible.FirstOrDefault(h => h.Name == "integrations.logs.inspect") ?? eligible[0],
             _ => eligible[0]
         };
     }

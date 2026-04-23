@@ -206,6 +206,7 @@ app.MapGet("/dashboard/summary", async () =>
             feedbackInbox = CountJsonFiles(agentPaths.FeedbackInboxPath),
             decisionInbox = CountJsonFiles(agentPaths.DecisionInboxPath),
             chatInbox = CountJsonFiles(agentPaths.ChatInboxPath),
+            logInbox = CountJsonFiles(agentPaths.LogInboxPath),
             messageOutbox = CountJsonFiles(agentPaths.MessageOutboxPath),
             sentOutbox = CountJsonFiles(agentPaths.SentOutboxPath)
         },
@@ -215,6 +216,7 @@ app.MapGet("/dashboard/summary", async () =>
             DescribeMailbox("feedback-inbox", agentPaths.FeedbackInboxPath),
             DescribeMailbox("decision-inbox", agentPaths.DecisionInboxPath),
             DescribeMailbox("chat-inbox", agentPaths.ChatInboxPath),
+            DescribeMailbox("log-inbox", agentPaths.LogInboxPath),
             DescribeMailbox("message-outbox", agentPaths.MessageOutboxPath),
             DescribeMailbox("message-outbox-sent", agentPaths.SentOutboxPath)
         },
@@ -272,6 +274,150 @@ app.MapPut("/agent/log-rules", async (HttpRequest request) =>
     {
         path = agentPaths.LogRulesPath,
         savedAtUtc = DateTime.UtcNow
+    });
+});
+
+app.MapPost("/agent/chat/web", async (WebChatRequest request) =>
+{
+    if (request is null || string.IsNullOrWhiteSpace(request.Message))
+    {
+        return Results.BadRequest(new ApiError("invalid_request", "message is required."));
+    }
+
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var requestId = QueueChatInboxItem(
+        agentPaths.ChatInboxPath,
+        request.AdminId ?? "web-admin",
+        request.Message.Trim(),
+        request.RequestId,
+        "web-ui");
+
+    return Results.Ok(new
+    {
+        ok = true,
+        requestId,
+        queuedAtUtc = DateTime.UtcNow
+    });
+});
+
+app.MapGet("/agent/chat/replies", (string? adminId, int? limit) =>
+{
+    var effectiveAdminId = string.IsNullOrWhiteSpace(adminId) ? "web-admin" : adminId.Trim();
+    var max = Math.Clamp(limit.GetValueOrDefault(30), 1, 200);
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+
+    var messages = ReadAgentOutboxMessages(agentPaths.MessageOutboxPath, "message-outbox")
+        .Concat(ReadAgentOutboxMessages(agentPaths.SentOutboxPath, "message-outbox-sent"))
+        .Where(message =>
+            string.IsNullOrWhiteSpace(effectiveAdminId) ||
+            string.Equals(message.TargetAdminId, effectiveAdminId, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(message.AdminId, effectiveAdminId, StringComparison.OrdinalIgnoreCase))
+        .OrderByDescending(message => message.CreatedAtUtc)
+        .Take(max)
+        .ToList();
+
+    return Results.Ok(new
+    {
+        adminId = effectiveAdminId,
+        count = messages.Count,
+        messages
+    });
+});
+
+app.MapPost("/agent/log-ingest", (ManualLogIngestRequest request) =>
+{
+    if (request is null || string.IsNullOrWhiteSpace(request.Content))
+    {
+        return Results.BadRequest(new ApiError("invalid_request", "content is required."));
+    }
+
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var requestId = QueueLogIngestItem(
+        agentPaths.LogInboxPath,
+        request.AdminId ?? "web-admin",
+        request.Source ?? "manual",
+        request.Connector,
+        request.Content,
+        request.RequestId,
+        "web-ui");
+
+    return Results.Ok(new
+    {
+        ok = true,
+        requestId,
+        queuedAtUtc = DateTime.UtcNow
+    });
+});
+
+app.MapPost("/agent/log-ingest/upload", async (HttpRequest request) =>
+{
+    var form = await request.ReadFormAsync();
+    var file = form.Files.FirstOrDefault();
+    if (file is null)
+    {
+        return Results.BadRequest(new ApiError("invalid_request", "A log file is required."));
+    }
+
+    if (file.Length <= 0)
+    {
+        return Results.BadRequest(new ApiError("invalid_request", "Uploaded file is empty."));
+    }
+
+    if (file.Length > 2 * 1024 * 1024)
+    {
+        return Results.BadRequest(new ApiError("invalid_request", "Uploaded file exceeds 2MB limit."));
+    }
+
+    var source = form["source"].FirstOrDefault();
+    var connector = form["connector"].FirstOrDefault();
+    var adminId = form["adminId"].FirstOrDefault();
+    var requestId = form["requestId"].FirstOrDefault();
+
+    string content;
+    await using (var stream = file.OpenReadStream())
+    using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+    {
+        content = await reader.ReadToEndAsync();
+    }
+
+    if (string.IsNullOrWhiteSpace(content))
+    {
+        return Results.BadRequest(new ApiError("invalid_request", "Uploaded file had no readable content."));
+    }
+
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var queuedRequestId = QueueLogIngestItem(
+        agentPaths.LogInboxPath,
+        string.IsNullOrWhiteSpace(adminId) ? "web-admin" : adminId!,
+        string.IsNullOrWhiteSpace(source) ? "manual-upload" : source!,
+        connector,
+        content,
+        requestId,
+        "web-ui-upload");
+
+    return Results.Ok(new
+    {
+        ok = true,
+        requestId = queuedRequestId,
+        fileName = file.FileName,
+        queuedAtUtc = DateTime.UtcNow
+    });
+});
+
+app.MapGet("/agent/connectors/status", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var settings = TryLoadAgentSettingsFile(agentPaths.AgentSettingsPath);
+    var integrations = settings?.Integrations ?? new AgentSettingsIntegrationsView();
+
+    return Results.Ok(new
+    {
+        generatedAtUtc = DateTime.UtcNow,
+        connectors = new[]
+        {
+            BuildConnectorView("autotask", integrations.Autotask),
+            BuildConnectorView("datto-rmm", integrations.DattoRmm)
+        }
     });
 });
 
@@ -1792,6 +1938,104 @@ static object DescribeMailbox(string name, string path)
     };
 }
 
+static string QueueChatInboxItem(string inboxPath, string adminId, string message, string? requestId, string channel)
+{
+    Directory.CreateDirectory(inboxPath);
+    var effectiveRequestId = string.IsNullOrWhiteSpace(requestId) ? Guid.NewGuid().ToString("N") : requestId.Trim();
+    var payload = new
+    {
+        id = Guid.NewGuid().ToString("N"),
+        requestId = effectiveRequestId,
+        adminId,
+        message,
+        channel
+    };
+
+    var fileName = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}-chat-{payload.id}.json";
+    var path = Path.Combine(inboxPath, fileName);
+    File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonDefaults.Options));
+    return effectiveRequestId;
+}
+
+static string QueueLogIngestItem(
+    string logInboxPath,
+    string adminId,
+    string source,
+    string? connector,
+    string content,
+    string? requestId,
+    string channel)
+{
+    Directory.CreateDirectory(logInboxPath);
+    var effectiveRequestId = string.IsNullOrWhiteSpace(requestId) ? Guid.NewGuid().ToString("N") : requestId.Trim();
+    var payload = new
+    {
+        id = Guid.NewGuid().ToString("N"),
+        requestId = effectiveRequestId,
+        adminId,
+        source,
+        connector,
+        content,
+        channel
+    };
+
+    var fileName = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}-log-ingest-{payload.id}.json";
+    var path = Path.Combine(logInboxPath, fileName);
+    File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonDefaults.Options));
+    return effectiveRequestId;
+}
+
+static IEnumerable<AgentOutboxMessageView> ReadAgentOutboxMessages(string path, string mailbox)
+{
+    if (!Directory.Exists(path))
+    {
+        return Enumerable.Empty<AgentOutboxMessageView>();
+    }
+
+    var results = new List<AgentOutboxMessageView>();
+    foreach (var file in Directory.GetFiles(path, "*.json"))
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(file));
+            var root = doc.RootElement;
+            var createdAt = ReadDateTime(root, "createdAtUtc") ?? File.GetLastWriteTimeUtc(file);
+            results.Add(new AgentOutboxMessageView
+            {
+                Id = ReadStringAny(root, "id") ?? Path.GetFileNameWithoutExtension(file),
+                AdminId = ReadStringAny(root, "adminId"),
+                TargetAdminId = ReadStringAny(root, "targetAdminId"),
+                ActionId = ReadStringAny(root, "actionId"),
+                ServerName = ReadStringAny(root, "serverName"),
+                Message = ReadStringAny(root, "message") ?? string.Empty,
+                Kind = ReadStringAny(root, "kind") ?? "chat-reply",
+                CreatedAtUtc = createdAt,
+                Mailbox = mailbox
+            });
+        }
+        catch (Exception ex)
+        {
+            CaptureHandledApiException(ex, "Failed to parse outbox message file.", path: file);
+        }
+    }
+
+    return results;
+}
+
+static object BuildConnectorView(string name, AgentSettingsConnectorView? connector)
+{
+    var baseUrl = connector?.BaseUrl?.Trim();
+    return new
+    {
+        name,
+        enabled = connector?.Enabled ?? false,
+        baseUrl = string.IsNullOrWhiteSpace(baseUrl) ? string.Empty : baseUrl,
+        logsEndpointPath = connector?.LogsEndpointPath ?? string.Empty,
+        statusEndpointPath = connector?.StatusEndpointPath ?? string.Empty,
+        configured = !string.IsNullOrWhiteSpace(baseUrl)
+    };
+}
+
 static AgentDashboardSnapshot LoadAgentMemorySnapshot(AgentRuntimePaths paths)
 {
     var snapshot = LoadLegacyAgentMemorySnapshot(paths.StatePath);
@@ -1897,6 +2141,10 @@ static AgentRuntimePaths ResolveAgentRuntimePaths(string agentSettingsPath, stri
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_CHAT_INBOX_PATH") ?? agentSettings?.Inbox?.ChatInboxPath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "chat-inbox")),
+        LogInboxPath = RustOpsEnv.ResolveConfiguredPath(
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LOG_INBOX_PATH") ?? agentSettings?.Inbox?.LogInboxPath,
+            agentBaseDir,
+            Path.Combine(defaultAgentRootDir, "data", "log-inbox")),
         MessageOutboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MESSAGE_OUTBOX_PATH") ?? agentSettings?.Outbox?.MessageOutboxPath,
             agentBaseDir,
@@ -3036,298 +3284,125 @@ static string BuildDashboardHtml() => """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RustOps Dashboard</title>
+  <title>Ops Agent Console</title>
   <style>
-    :root { --bg:#09111a; --panel:#0f1b28; --panel2:#152434; --line:#274057; --text:#e7f1f8; --muted:#8fa8bc; --good:#55d38a; --warn:#f4b95c; --bad:#ff6f61; --accent:#66c8ff; }
+    :root { --bg:#081116; --line:#2a3b45; --text:#e7f0f5; --muted:#92a5b2; }
     * { box-sizing:border-box; }
-    body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; background:radial-gradient(circle at top left, rgba(102,200,255,.12), transparent 32%),linear-gradient(180deg,#081019,#0a1420 55%,#09111a); color:var(--text); }
-    .wrap { max-width:1440px; margin:0 auto; padding:24px; }
-    .topbar { display:grid; grid-template-columns:1.2fr .8fr auto; gap:14px; align-items:end; margin-bottom:18px; }
-    .hero,.auth,.card { background:rgba(15,27,40,.92); border:1px solid var(--line); border-radius:18px; padding:18px; backdrop-filter:blur(10px); }
-    .hero h1 { margin:0 0 8px; font-size:28px; }
-    .muted { color:var(--muted); }
-    .auth label { display:block; font-size:12px; color:var(--muted); margin-bottom:8px; }
-    input,textarea { width:100%; border-radius:12px; border:1px solid var(--line); background:#09131d; color:var(--text); padding:11px 12px; }
-    textarea { min-height:280px; font-family:Consolas, monospace; resize:vertical; }
-    button { border:0; background:linear-gradient(135deg,#66c8ff,#2f8cff); color:#03121f; font-weight:700; border-radius:12px; padding:12px 16px; cursor:pointer; }
-    button.ghost { background:#0b1723; color:var(--text); border:1px solid var(--line); }
-    .tabs { display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap; }
-    .tab { border:1px solid var(--line); background:#0b1723; color:var(--text); }
-    .tab.active { background:linear-gradient(135deg,#66c8ff,#2f8cff); color:#03121f; border-color:transparent; }
-    .section-group { display:none; }
-    .section-group.active { display:block; }
-    .stats,.grid,.micro-grid { display:grid; gap:14px; }
-    .stats { grid-template-columns:repeat(6,minmax(0,1fr)); margin-bottom:18px; }
-    .grid { grid-template-columns:1.1fr .9fr; }
-    .micro-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
-    .card h2,.card h3 { margin:0 0 12px; display:flex; align-items:center; gap:8px; }
-    .pill { display:inline-flex; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
-    .running,.active,.ok { background:rgba(85,211,138,.16); color:var(--good); }
-    .offline,.failed,.inactive { background:rgba(255,111,97,.14); color:var(--bad); }
-    .unknown,.pending,.degraded,.starting { background:rgba(244,185,92,.14); color:var(--warn); }
-    table { width:100%; border-collapse:collapse; }
-    th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(39,64,87,.7); vertical-align:top; font-size:14px; }
-    .list { display:grid; gap:10px; }
-    .item { padding:12px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:rgba(21,36,52,.55); }
-    .mailbox-grid,.kv { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
-    pre { white-space:pre-wrap; font-size:12px; color:var(--muted); margin:0; }
-    .legend { display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:999px; background:rgba(102,200,255,.16); color:var(--accent); font-size:12px; font-weight:700; position:relative; cursor:help; }
-    .legend[data-tip]:hover::after { content:attr(data-tip); position:absolute; top:22px; left:0; width:300px; white-space:pre-wrap; padding:10px 12px; border-radius:12px; background:#08131d; border:1px solid var(--line); color:var(--text); z-index:10; box-shadow:0 10px 30px rgba(0,0,0,.35); }
-    .row { display:flex; gap:12px; align-items:center; }
-    .row > * { flex:1; }
-    .check { display:flex; gap:10px; align-items:center; }
-    .check input { width:auto; }
-    .wide { grid-column:1 / -1; }
-    .tiny { font-size:12px; }
-    .chip-list { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
-    .chip { display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; background:rgba(102,200,255,.10); border:1px solid rgba(102,200,255,.22); color:var(--text); font-size:12px; }
-    .codebox { padding:14px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:#08131d; min-height:200px; }
-    .toolbar { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-top:12px; flex-wrap:wrap; }
-    @media (max-width:1080px) { .stats { grid-template-columns:repeat(2,minmax(0,1fr)); } .grid,.topbar,.mailbox-grid,.kv,.row,.micro-grid { grid-template-columns:1fr; display:grid; } }
+    body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; color:var(--text); background:var(--bg); }
+    .wrap { max-width:1100px; margin:0 auto; padding:20px; display:grid; gap:14px; }
+    .card { border:1px solid var(--line); border-radius:14px; padding:14px; background:#0d171e; }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .tabs { display:flex; gap:8px; }
+    .pane { display:none; }
+    .pane.active { display:block; }
+    .tab { background:#0b141a; color:var(--text); border:1px solid var(--line); border-radius:10px; padding:8px 12px; cursor:pointer; }
+    .tab.active { background:#1d3c4e; }
+    input,textarea,select { width:100%; border:1px solid var(--line); border-radius:10px; background:#0a1218; color:var(--text); padding:10px; }
+    textarea { min-height:130px; resize:vertical; }
+    button { border:0; border-radius:10px; padding:10px 12px; font-weight:700; cursor:pointer; background:#5ec8ff; color:#02121d; }
+    button.ghost { background:#0b141a; border:1px solid var(--line); color:var(--text); }
+    .thread { min-height:220px; max-height:420px; overflow:auto; border:1px solid var(--line); border-radius:10px; padding:10px; display:grid; gap:8px; background:#0a1218; }
+    .msg { border:1px solid var(--line); border-radius:10px; padding:8px; }
+    .small { color:var(--muted); font-size:12px; }
+    .stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; }
+    .metric { border:1px solid var(--line); border-radius:10px; padding:10px; background:#0a1218; }
+    @media (max-width:900px) { .row { grid-template-columns:1fr; } .stats { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="topbar">
-      <div class="hero"><h1>RustOps Dashboard</h1><div class="muted">Control-room view for server state, agent behavior, and LM Studio runtime.</div><div id="stamp" class="muted" style="margin-top:10px;">Not loaded yet.</div></div>
-      <div class="auth"><label for="apiKey">API key</label><input id="apiKey" type="password" placeholder="X-Api-Key"></div>
-      <div><button id="refresh">Refresh</button></div>
+    <div class="card">
+      <h1 style="margin:0 0 8px;">Ops Agent Console</h1>
+      <div class="small">Chat with the agent, ingest logs manually, and prep Autotask/Datto RMM connectors.</div>
+      <div id="stamp" class="small" style="margin-top:8px;">Not loaded.</div>
     </div>
-    <div class="stats" id="stats"></div>
+    <div class="row">
+      <div class="card"><label class="small" for="apiKey">API key</label><input id="apiKey" type="password" placeholder="X-Api-Key"></div>
+      <div class="card" style="display:flex;align-items:end;justify-content:end;"><button id="refreshAll">Refresh</button></div>
+    </div>
     <div class="tabs">
-      <button class="tab active" data-target="serversGroup">Servers</button>
-      <button class="tab" data-target="agentGroup">Agent</button>
-      <button class="tab" data-target="llmGroup">LLM</button>
+      <button class="tab active" data-pane="overviewPane">Overview</button>
+      <button class="tab" data-pane="chatPane">Chat</button>
+      <button class="tab" data-pane="logsPane">Log Ingest</button>
     </div>
-
-    <section id="serversGroup" class="section-group active">
-      <div class="grid">
-        <div class="card wide"><h2>Server Status <span class="legend" data-tip="This pane merges rustmgr status with live server query data. Players, uptime, memory, queue, and FPS only populate while the server answers queries.">?</span></h2><table><thead><tr><th>Name</th><th>State</th><th>Players</th><th>Uptime</th><th>Memory</th><th>Autorestart</th><th>Warnings</th></tr></thead><tbody id="servers"></tbody></table></div>
-        <div class="card wide"><h2>Live Query Snapshot <span class="legend" data-tip="Shows parsed details from recent server queries. Player preview comes from playerlist. Hostname, map, queue, and FPS come from serverinfo when available.">?</span></h2><div id="serverCards" class="micro-grid"></div></div>
+    <section id="overviewPane" class="pane active">
+      <div class="card"><div id="overviewStats" class="stats"></div></div>
+      <div class="row">
+        <div class="card"><h2 style="margin:0 0 10px;">Connectors</h2><div id="connectorList"></div></div>
+        <div class="card"><h2 style="margin:0 0 10px;">Mailboxes</h2><div id="mailboxList"></div></div>
       </div>
     </section>
-
-    <section id="agentGroup" class="section-group">
-      <div class="grid">
-        <div class="card wide"><h2>Service Status <span class="legend" data-tip="All three core services should normally stay active: API, Agent, and Steam Adapter. If one is inactive or failed, the stack is only partially working.">?</span></h2><div id="services" class="micro-grid"></div></div>
-        <div class="card"><h2>Agent Runtime</h2><div id="agentRuntime" class="kv"></div></div>
-        <div class="card"><h2>Pending Actions</h2><div id="pending" class="list"></div></div>
-        <div class="card"><h2>Recent Incidents</h2><div id="incidents" class="list"></div></div>
-        <div class="card"><h2>Recent Actions</h2><div id="actions" class="list"></div></div>
-        <div class="card"><h2>Mailboxes</h2><div id="mailboxes" class="mailbox-grid"></div></div>
-        <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
-        <div class="card"><h2>Capability Gaps <span class="legend" data-tip="Patterns the agent recorded when it could not fulfill a request. Each entry feeds the self-repair evolution cycle to propose a concrete improvement.">?</span></h2><div id="capabilityGaps" class="list"></div></div>
-        <div class="card"><h2>Evolution History <span class="legend" data-tip="Each entry is one self-repair cycle: how many bounded actions were applied, what they changed, and the LLM reasoning behind the decision.">?</span></h2><div id="selfRepairHistory" class="list"></div></div>
-        <div class="card"><h2>Agent Log Rules <span class="legend" data-tip="Edit JSON arrays here.\nignoreContains: always ignore these substrings.\nstartupIgnoreContains: ignore only during startup window.\nincidentContains: always elevate these substrings.\nExample:\n{\n  &quot;ignoreContains&quot;: [&quot;known noise&quot;],\n  &quot;startupIgnoreContains&quot;: [&quot;shader unsupported&quot;],\n  &quot;incidentContains&quot;: [&quot;Error while compiling&quot;]\n}">?</span></h2><div id="rulesMeta" class="muted">Not loaded.</div><textarea id="rulesEditor" spellcheck="false" style="margin-top:12px;"></textarea><div class="toolbar"><div id="rulesSaveStatus" class="muted">No changes saved yet.</div><button id="saveRules">Save Rules</button></div></div>
-        <div class="card"><h2>Command Policy <span class="legend" data-tip="Controls whether the agent can execute raw server commands.\nIf Free mode is disabled, only allowlisted commands can be executed.\nChanges apply after restarting rustopsagent.service.">?</span></h2><div id="commandConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="commandEnabled" type="checkbox"> Command execution enabled</label><label class="check"><input id="commandFreeMode" type="checkbox"> Free mode (no allowlist restriction)</label></div><div class="row" style="margin-top:12px;"><div><label for="commandDefaultWaitMs" class="tiny muted">Default wait (ms)</label><input id="commandDefaultWaitMs" type="number" min="200" max="20000" step="100"></div><div><label for="commandMaxWaitMs" class="tiny muted">Max wait (ms)</label><input id="commandMaxWaitMs" type="number" min="500" max="30000" step="100"></div></div><div class="row" style="margin-top:12px;"><div><label for="commandMaxOutputChars" class="tiny muted">Max output chars</label><input id="commandMaxOutputChars" type="number" min="500" max="64000" step="100"></div></div><div style="margin-top:12px;"><label for="commandAllowList" class="tiny muted">Allowlist (comma/line separated)</label><textarea id="commandAllowList" spellcheck="false" style="min-height:140px;"></textarea></div><div class="toolbar"><div id="commandSaveStatus" class="muted">No changes saved yet.</div><button id="saveCommandConfig">Save Command Policy</button></div></div>
+    <section id="chatPane" class="pane">
+      <div class="card">
+        <div class="row">
+          <div><label class="small" for="chatAdminId">Admin ID</label><input id="chatAdminId" type="text" value="web-admin"></div>
+          <div style="display:flex;align-items:end;justify-content:end;"><button id="refreshChat" class="ghost" type="button">Refresh Replies</button></div>
+        </div>
+        <div id="chatThread" class="thread" style="margin-top:10px;"></div>
+        <label class="small" for="chatMessage" style="margin-top:10px;display:block;">Message</label>
+        <textarea id="chatMessage" placeholder="Ask for connector status, log analysis, or guidance."></textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:10px;"><button id="sendChat" type="button">Send to Agent</button></div>
       </div>
     </section>
-
-    <section id="llmGroup" class="section-group">
-      <div class="grid">
-        <div class="card"><h2>LLM Runtime</h2><div id="ollamaRuntime" class="kv"></div><div id="llmRuntimeDetails" class="list" style="margin-top:12px;"></div></div>
-        <div class="card"><h2>LM Studio Control <span class="legend" data-tip="This writes LLM settings to the shared env plus agentsettings.json. Restart rustopsagent.service after saving. You can disable system prompt injection and also configure secondary endpoint fallback/race behavior.">?</span></h2><div id="ollamaConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="ollamaEnabled" type="checkbox"> LLM enabled</label><label class="check"><input id="ollamaUseRecommendations" type="checkbox"> Use for recommendations</label></div><div class="row" style="margin-top:12px;"><label class="check"><input id="llmUseChatSystemPrompt" type="checkbox"> Send system prompt</label></div><div style="margin-top:12px;"><label for="llmChatSystemPrompt" class="tiny muted">System prompt text (used only when enabled)</label><textarea id="llmChatSystemPrompt" spellcheck="false" style="margin-top:8px; min-height:180px;"></textarea></div><div class="row" style="margin-top:12px;"><div><label for="ollamaBaseUrl" class="tiny muted">Primary Base URL</label><input id="ollamaBaseUrl" type="text" placeholder="http://127.0.0.1:1234"></div><div><label for="ollamaModel" class="tiny muted">Primary Model</label><input id="ollamaModel" type="text" placeholder="llmster"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmProvider" class="tiny muted">Provider</label><input id="llmProvider" type="text" placeholder="lmstudio"></div><div><label for="llmApiKey" class="tiny muted">Primary API token (optional)</label><input id="llmApiKey" type="password" placeholder="LM Studio API token"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmHttpReferer" class="tiny muted">Primary HTTP-Referer (optional)</label><input id="llmHttpReferer" type="text" placeholder="http://localhost"></div><div><label for="llmAppTitle" class="tiny muted">Primary App Title (optional)</label><input id="llmAppTitle" type="text" placeholder="RustOpsAgent"></div></div><div class="row" style="margin-top:12px;"><label class="check"><input id="llmSecondaryEnabled" type="checkbox"> Secondary endpoint enabled</label><div><label for="llmRequestStrategy" class="tiny muted">Request strategy</label><select id="llmRequestStrategy"><option value="fallback">fallback</option><option value="race">race</option></select></div></div><div class="row" style="margin-top:12px;"><div><label for="llmSecondaryBaseUrl" class="tiny muted">Secondary Base URL</label><input id="llmSecondaryBaseUrl" type="text" placeholder="http://127.0.0.1:8000"></div><div><label for="llmSecondaryModel" class="tiny muted">Secondary Model</label><input id="llmSecondaryModel" type="text" placeholder="model-fallback"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmSecondaryApiKey" class="tiny muted">Secondary API token (optional)</label><input id="llmSecondaryApiKey" type="password" placeholder="Bearer token"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmSecondaryHttpReferer" class="tiny muted">Secondary HTTP-Referer (optional)</label><input id="llmSecondaryHttpReferer" type="text" placeholder="http://localhost"></div><div><label for="llmSecondaryAppTitle" class="tiny muted">Secondary App Title (optional)</label><input id="llmSecondaryAppTitle" type="text" placeholder="RustOpsAgent"></div></div><div class="toolbar"><div id="ollamaSaveStatus" class="muted">No changes saved yet.</div><button id="saveOllamaConfig">Save LLM Settings</button></div></div>
-        <div class="card"><h2>Installed Models</h2><div id="ollamaModels" class="list"></div></div>
-        <div class="card"><h2>Loaded Models</h2><div id="ollamaRunning" class="list"></div></div>
-        <div class="card wide"><h2>Current Model Details</h2><div class="codebox"><pre id="currentModelDetails">No model details loaded.</pre></div></div>
-        <div class="card wide"><h2>Recent LLM Interactions <span class="legend" data-tip="Each record shows when the agent called the model, what kind of request it made, whether it succeeded, and a short response preview if one was recorded.">?</span></h2><div id="llmInteractions" class="list"></div></div>
+    <section id="logsPane" class="pane">
+      <div class="card">
+        <div class="row">
+          <div><label class="small" for="logSource">Source</label><select id="logSource"><option value="manual">Manual</option><option value="autotask">Autotask</option><option value="datto-rmm">Datto RMM</option></select></div>
+          <div><label class="small" for="logConnector">Connector (optional)</label><input id="logConnector" type="text" placeholder="autotask or datto-rmm"></div>
+        </div>
+        <label class="small" for="logContent" style="margin-top:10px;display:block;">Raw log text</label>
+        <textarea id="logContent" placeholder="Paste log lines here."></textarea>
+        <div style="display:flex;justify-content:flex-end;margin-top:10px;"><button id="ingestText" type="button">Ingest Text</button></div>
+        <hr style="border:0;border-top:1px solid var(--line);margin:14px 0;">
+        <label class="small" for="logFile">Upload log file (max 2MB)</label>
+        <input id="logFile" type="file" accept=".log,.txt,.json,.csv,.tsv,*/*">
+        <div style="display:flex;justify-content:flex-end;margin-top:10px;"><button id="uploadLogFile" type="button">Upload and Ingest</button></div>
+        <div id="ingestStatus" class="small" style="margin-top:8px;">No ingest requests sent yet.</div>
       </div>
     </section>
   </div>
   <script>
     const $ = id => document.getElementById(id);
-    const keyInput = $('apiKey');
-    const rulesEditor = $('rulesEditor');
-    const tabs = Array.from(document.querySelectorAll('.tab'));
-    const panes = Array.from(document.querySelectorAll('.section-group'));
-    const fromStorage = localStorage.getItem('rustops.apiKey');
-    if (fromStorage) keyInput.value = fromStorage;
-
-    const esc = value => String(value ?? '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
-    const fmt = value => { if (!value) return 'n/a'; const date = new Date(value); return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString(); };
-    const dur = value => { const seconds = Number(value); if (!Number.isFinite(seconds)) return 'n/a'; const d = Math.floor(seconds / 86400); const h = Math.floor((seconds % 86400) / 3600); const m = Math.floor((seconds % 3600) / 60); return d > 0 ? `${d}d ${h}h ${m}m` : (h > 0 ? `${h}h ${m}m` : `${m}m`); };
-    const bytes = value => { const n = Number(value); if (!Number.isFinite(n) || n <= 0) return 'n/a'; if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} GB`; if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MB`; return `${Math.round(n / 1024)} KB`; };
-    const metric = (label, value, hint = '') => `<div class="card"><div class="muted">${esc(label)}</div><div style="font-size:30px;font-weight:800;margin-top:6px;">${esc(value)}</div>${hint ? `<div class="tiny muted" style="margin-top:8px;">${esc(hint)}</div>` : ''}</div>`;
-    const pill = state => { const s = (state || 'unknown').toLowerCase(); const cls = ['running','offline','failed','pending','active','inactive','degraded','ok','starting'].includes(s) ? s : 'unknown'; return `<span class="pill ${cls}">${esc(state || 'unknown')}</span>`; };
-    const item = (title, body, meta = '') => `<div class="item"><div style="font-weight:700;">${esc(title)}</div><div class="muted" style="margin-top:6px;">${esc(body || '')}</div>${meta ? `<div style="margin-top:8px;font-size:12px;color:var(--muted);">${meta}</div>` : ''}</div>`;
-    const kv = (label, value) => `<div class="item"><div class="muted tiny">${esc(label)}</div><div style="margin-top:6px;font-weight:700;">${esc(value ?? 'n/a')}</div></div>`;
-
+    const esc = value => String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+    const fmt = value => { if (!value) return "n/a"; const d = new Date(value); return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString(); };
+    const keyInput = $("apiKey");
+    const saved = localStorage.getItem("rustops.apiKey");
+    if (saved) keyInput.value = saved;
+    function setPane(id) { document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.pane === id)); document.querySelectorAll(".pane").forEach(p => p.classList.toggle("active", p.id === id)); }
     async function fetchJson(path, options = {}) {
-      const response = await fetch(path, { ...options, headers: { 'X-Api-Key': keyInput.value.trim(), ...(options.headers || {}) } });
-      if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
-      return response.json();
+      const headers = Object.assign({}, options.headers || {}, { "X-Api-Key": keyInput.value.trim() });
+      const res = await fetch(path, Object.assign({}, options, { headers }));
+      if (!res.ok) throw new Error(String(res.status) + " " + await res.text());
+      return res.json();
     }
-
-
-    function activateTab(target) {
-      tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.target === target));
-      panes.forEach(pane => pane.classList.toggle('active', pane.id === target));
+    function renderOverview(summary, connectors) {
+      $("stamp").textContent = "Updated " + fmt(summary.generatedAtUtc) + " | API " + (summary.host?.bindUrl || "n/a");
+      const metrics = [{label:"Chat Inbox",value:summary.counts?.chatInbox ?? 0},{label:"Log Inbox",value:summary.counts?.logInbox ?? 0},{label:"Outbox",value:summary.counts?.messageOutbox ?? 0},{label:"Incidents",value:summary.counts?.incidents ?? 0}];
+      $("overviewStats").innerHTML = metrics.map(m => "<div class=\"metric\"><div class=\"small\">" + esc(m.label) + "</div><div style=\"font-size:28px;font-weight:800;\">" + esc(m.value) + "</div></div>").join("");
+      $("connectorList").innerHTML = (connectors.connectors || []).map(c => "<div class=\"item\"><strong>" + esc(c.name) + "</strong><div class=\"small\" style=\"margin-top:6px;\">enabled=" + esc(c.enabled) + " | configured=" + esc(c.configured) + "</div><div class=\"small\" style=\"margin-top:4px;\">" + esc(c.baseUrl || "base URL not set") + "</div></div>").join("") || "<div class=\"small\">No connector data.</div>";
+      $("mailboxList").innerHTML = (summary.mailboxes || []).map(m => "<div class=\"item\"><strong>" + esc(m.name) + "</strong><div class=\"small\" style=\"margin-top:6px;\">" + esc(m.count) + " file(s)</div><div class=\"small\" style=\"margin-top:4px;\">" + esc(m.path) + "</div></div>").join("") || "<div class=\"small\">No mailbox data.</div>";
     }
-
-    async function loadRules() {
-      const data = await fetchJson('/agent/log-rules');
-      rulesEditor.value = data.content || '';
-      $('rulesMeta').textContent = `${data.path} ${data.exists ? '' : '(new file on first save)'}`;
-      return data;
+    function renderChat(messages) {
+      $("chatThread").innerHTML = (messages || []).map(m => "<div class=\"msg\"><div class=\"small\">" + esc(fmt(m.createdAtUtc)) + " | " + esc(m.mailbox || "outbox") + "</div><div style=\"margin-top:6px;\">" + esc(m.message || "") + "</div></div>").join("") || "<div class=\"small\">No replies for this admin ID.</div>";
     }
-
-    function renderServers(servers) {
-      $('servers').innerHTML = (servers || []).map(server => `<tr><td><strong>${esc(server.name)}</strong><div class="tiny muted">${esc(server.hostname || 'hostname unavailable')}</div></td><td>${pill(server.state)}</td><td>${esc(server.currentPlayers ?? (server.online ? '?' : '-'))}/${esc(server.maxPlayers ?? '?')}</td><td>${esc(dur(server.uptimeSeconds))}</td><td>${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : '-'}</td><td>${server.autoRestart ? 'on' : 'off'}</td><td>${esc(server.recentWarningCount ?? 0)}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No servers returned.</td></tr>';
-      $('serverCards').innerHTML = (servers || []).map(server => `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(server.name)}</strong>${pill(server.state)}</div><div class="muted" style="margin-top:6px;">${esc(server.hostname || 'hostname unavailable')}</div><div class="tiny muted" style="margin-top:8px;">Map ${esc(server.map || 'n/a')} | Queue ${esc(server.queuedPlayers ?? 0)} | FPS ${esc(server.framerate ?? 'n/a')}</div><div class="tiny muted" style="margin-top:8px;">PID ${esc(server.pid ?? '-')} | Uptime ${esc(dur(server.uptimeSeconds))} | Mem ${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : 'n/a'} | ${server.queryOk ? 'query-ok' : (server.online ? 'query-missed' : 'offline')}</div><div class="chip-list">${(server.playerPreview || []).slice(0, 5).map(name => `<span class="chip">${esc(name)}</span>`).join('') || '<span class="muted tiny">No player names sampled.</span>'}</div></div>`).join('') || '<div class="muted">No live query data available.</div>';
-    }
-
-    function renderAgent(summary) {
-      $('services').innerHTML = (summary.services || []).map(service => item(service.name, `${service.unit}${service.subState ? ` | ${service.subState}` : ''}`, `${pill(service.activeState || 'unknown')} ${service.mainPid ? `| PID ${esc(service.mainPid)}` : ''}${service.since ? ` | ${esc(service.since)}` : ''}`)).join('') || '<div class="muted">No service status available.</div>';
-      const runtime = summary.runtimeStatus || {};
-      const state = summary.agentState || {};
-      const stateStatus = !state.exists ? 'missing' : (state.parseOk === false ? 'parse-failed' : 'ok');
-      $('agentRuntime').innerHTML = [
-        kv('Pending actions', summary.counts?.pendingActions ?? 0),
-        kv('Incidents tracked', summary.counts?.incidents ?? 0),
-        kv('Feedback inbox', summary.counts?.feedbackInbox ?? 0),
-        kv('Chat inbox', summary.counts?.chatInbox ?? 0),
-        kv('Last LLM use', fmt(runtime.lastLlmInteractionAtUtc)),
-        kv('State file', `${stateStatus}${state.sizeBytes ? ` | ${bytes(state.sizeBytes)}` : ''}`),
-        kv('State save', fmt(state.lastSavedAtUtc || state.lastWriteAtUtc)),
-        kv('Rules path', runtime.logRulesPath || summary.host?.agentLogRulesPath || 'n/a')
-      ].join('');
-      $('pending').innerHTML = (summary.pendingActions || []).map(entry => item(`${entry.serverName} | ${entry.actionType}`, entry.summary || '', `${esc(fmt(entry.createdAtUtc))} | ${esc(entry.id)}`)).join('') || '<div class="muted">No pending actions.</div>';
-      $('incidents').innerHTML = (summary.recentIncidents || []).map(entry => item(`${entry.serverName} | ${entry.title || entry.category || 'incident'}`, entry.summary || '', esc(fmt(entry.createdAtUtc)))).join('') || '<div class="muted">No incidents recorded.</div>';
-      $('actions').innerHTML = (summary.recentActions || []).map(entry => item(`${entry.serverName} | ${entry.actionType}`, entry.summary || '', `${esc(fmt(entry.executedAtUtc))} | ${entry.success ? 'success' : 'failed'} | ${esc(entry.trigger)}`)).join('') || '<div class="muted">No recent actions.</div>';
-      $('mailboxes').innerHTML = (summary.mailboxes || []).map(box => `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;"><strong>${esc(box.name)}</strong><span class="muted">${esc(box.count)} files</span></div><pre style="margin-top:8px;">${esc(box.path)}</pre><div class="muted" style="margin-top:8px;">${(box.files || []).slice(0, 4).map(file => `${esc(file.name)} (${fmt(file.modifiedAtUtc)})`).join('\n') || 'empty'}</div></div>`).join('') || '<div class="muted">No mailbox data available.</div>';
-      const diagnostics = [];
-      if (state.path) diagnostics.push(item('Agent state file', state.path, `${state.exists ? 'exists' : 'missing'}${state.parseError ? ` | ${esc(state.parseError)}` : ''}`));
-      $('errors').innerHTML = diagnostics.concat((summary.agentErrors || []).map(text => item('Agent error', text || ''))).join('') || '<div class="muted">No recent agent errors.</div>';
-      $('feedback').innerHTML = (summary.recentFeedback || []).map(entry => item(`${entry.verdict || 'note'} | ${entry.serverName || 'general'}`, entry.note || '', `${esc(fmt(entry.receivedAtUtc))} | ${esc(entry.adminId || 'unknown admin')}`)).join('') || '<div class="muted">No recent feedback.</div>';
-      $('capabilityGaps').innerHTML = (summary.capabilityGaps || []).map(entry => item(`${esc(entry.category || 'unknown')} | count=${entry.count ?? 1}`, entry.description || '', `first=${esc(fmt(entry.firstObservedAtUtc))} | last=${esc(fmt(entry.lastObservedAtUtc))}`)).join('') || '<div class="muted">No capability gaps recorded yet. The agent will populate this once it encounters unfulfillable requests.</div>';
-      $('selfRepairHistory').innerHTML = (summary.selfRepairHistory || []).map(entry => item(`${entry.appliedActions ?? 0} action(s) applied | ${entry.rejectedActions ?? 0} rejected`, entry.summary || '', `${esc(fmt(entry.atUtc))}${entry.rawModelReasoning ? ` | reasoning: ${esc(String(entry.rawModelReasoning).slice(0, 120))}` : ''}`)).join('') || '<div class="muted">No evolution cycles run yet. The agent runs self-repair when capability gaps or learning incidents exist.</div>';
-    }
-
-    function renderCommandConfig(commandConfig) {
-      const values = commandConfig?.values || {};
-      const allowList = Array.isArray(values.allowList) ? values.allowList : [];
-      $('commandConfigMeta').textContent = `${commandConfig?.path || 'n/a'} | restart rustopsagent.service after save`;
-      $('commandEnabled').checked = values.enabled !== false;
-      $('commandFreeMode').checked = !!values.freeMode;
-      $('commandDefaultWaitMs').value = Number(values.defaultWaitMs || 2500);
-      $('commandMaxWaitMs').value = Number(values.maxWaitMs || 12000);
-      $('commandMaxOutputChars').value = Number(values.maxOutputChars || 8000);
-      $('commandAllowList').value = allowList.join('\n');
-      $('commandAllowList').disabled = !!values.freeMode;
-    }
-
-    function renderLlm(summary, llmSummary, llmConfig) {
-      const runtime = summary.runtimeStatus || {};
-      const values = llmConfig?.values || {};
-      const secondary = values.secondary || {};
-      const configuredModel = runtime.llmModel || values.model || llmSummary?.currentModel || 'n/a';
-      const configuredBaseUrl = runtime.llmBaseUrl || values.baseUrl || llmSummary?.baseUrl || 'n/a';
-      const provider = runtime.llmProvider || values.provider || llmSummary?.provider || 'lmstudio';
-      const reachable = !!llmSummary?.reachable;
-      const loadedModels = llmSummary?.loadedModels || [];
-      const installedModels = llmSummary?.models || [];
-
-      $('ollamaRuntime').innerHTML = [
-        kv('Provider', provider),
-        kv('Enabled', runtime.llmEnabled ? 'yes' : 'no'),
-        kv('Model', configuredModel),
-        kv('Base URL', configuredBaseUrl),
-        kv('System prompt', values.useChatSystemPrompt ? 'enabled' : 'disabled'),
-        kv('Last interaction', fmt(runtime.lastLlmInteractionAtUtc))
-      ].join('');
-
-      $('llmRuntimeDetails').innerHTML = [
-        item('LM Studio reachability', reachable ? 'Reachable from API host.' : 'Not reachable from API host.', `${pill(reachable ? 'active' : 'offline')}${llmSummary?.error ? ` | ${esc(llmSummary.error)}` : ''}`),
-        item('Configured model', configuredModel, `Loaded ${esc(loadedModels.length)} | Installed ${esc(installedModels.length)}`),
-        item('Routing', values.requestStrategy === 'race' ? 'race' : 'fallback', secondary.enabled ? 'secondary enabled' : 'secondary disabled')
-      ].join('');
-
-      $('ollamaConfigMeta').textContent = `${llmConfig?.path || 'n/a'} | restart rustopsagent.service after save`;
-      $('ollamaEnabled').checked = !!values.enabled;
-      $('ollamaUseRecommendations').checked = !!values.useForRecommendations;
-      $('llmUseChatSystemPrompt').checked = !!values.useChatSystemPrompt;
-      $('llmChatSystemPrompt').value = values.chatSystemPrompt || 'You are a local Rust server operations agent talking to an admin.\\nUse the provided tools to inspect state and perform bounded operations.\\nPrefer using tools over guessing.\\nFor start, stop, restart, and validate-oxide you must target a known server.\\nIf the server is unclear, ask a concise clarification question instead of guessing.\\nUse recent memory, incidents, and action history to explain what is happening.\\nReply naturally, with concrete operational language.\\nStart with the direct answer, then key evidence or next action.\\nDo not invent facts.\\nYou may use self-diagnostics and workspace tools to improve your own behavior.\\nAny file writes must stay inside the configured self-repair scope root.\\nIf an admin asks to execute a server console command, use execute_server_command.\\nIf an admin asks what a command does, use get_server_command_memory.\\nIf an admin teaches command behavior, use teach_server_command.\\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\\nIf an admin asks to push source changes to git, use git_push_branch.\\nIf an admin asks to pull latest source updates, use git_pull_rebuild.';
-      $('ollamaBaseUrl').value = values.baseUrl || 'http://127.0.0.1:1234';
-      $('ollamaModel').value = values.model || '';
-      $('llmProvider').value = values.provider || 'lmstudio';
-      $('llmApiKey').value = values.apiKey || '';
-      $('llmHttpReferer').value = values.httpReferer || '';
-      $('llmAppTitle').value = values.appTitle || '';
-      $('llmRequestStrategy').value = values.requestStrategy === 'race' ? 'race' : 'fallback';
-      $('llmSecondaryEnabled').checked = !!secondary.enabled;
-      $('llmSecondaryBaseUrl').value = secondary.baseUrl || '';
-      $('llmSecondaryModel').value = secondary.model || '';
-      $('llmSecondaryApiKey').value = secondary.apiKey || '';
-      $('llmSecondaryHttpReferer').value = secondary.httpReferer || '';
-      $('llmSecondaryAppTitle').value = secondary.appTitle || '';
-
-      $('ollamaModels').innerHTML = installedModels.map(model => `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(model.name || model.id || 'unnamed model')}</strong><button type="button" class="ghost use-model" data-model="${esc(model.id || model.name || '')}">Use</button></div><div class="muted" style="margin-top:6px;">${esc(model.publisher || 'publisher n/a')} | ${esc(model.architecture || 'architecture n/a')} | ${esc(model.parameterSize || 'params n/a')} | ${esc(model.quantization || 'quant n/a')}</div><div class="tiny muted" style="margin-top:8px;">${esc(bytes(model.sizeBytes))}${model.maxContextLength ? ` | context ${esc(model.maxContextLength)}` : ''}${model.loaded ? ' | loaded' : ''}</div></div>`).join('') || '<div class="muted">No installed models reported.</div>';
-      $('ollamaRunning').innerHTML = loadedModels.map(model => item(model.name || 'unnamed model', `${model.state || 'state n/a'}${model.contextLength ? ` | ctx ${esc(model.contextLength)}` : ''}`, model.preset || 'no preset reported')).join('') || '<div class="muted">No models currently loaded.</div>';
-      $('currentModelDetails').textContent = llmSummary?.currentModelDetails || 'No model details loaded.';
-      $('llmInteractions').innerHTML = (summary.llmInteractions || []).map(entry => item(`${entry.type || 'llm'} | ${entry.success ? 'success' : 'failed'}`, entry.responsePreview || entry.context || '', `${esc(fmt(entry.atUtc))} | ${esc(entry.model || 'unknown model')}${entry.context ? ` | ${esc(entry.context)}` : ''}`)).join('') || '<div class="muted">No recorded LLM interactions yet.</div>';
-    }
-
-    async function load() {
-      localStorage.setItem('rustops.apiKey', keyInput.value.trim());
-      try {
-        const [summary, _, llmSummary, llmConfig, commandConfig] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config')]);
-        $('stamp').textContent = `Updated ${fmt(summary.generatedAtUtc)} | API ${summary.host.bindUrl}`;
-        $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'configured via rustmgr'), metric('Online', summary.counts?.onlineServers ?? 0, 'currently running'), metric('Pending Actions', summary.counts?.pendingActions ?? 0, 'agent approval queue'), metric('Incidents', summary.counts?.incidents ?? 0, 'recent tracked issues'), metric('Outbox', summary.counts?.messageOutbox ?? 0, 'messages waiting for Steam'), metric('LLM Calls', (summary.llmInteractions || []).length, 'recent recorded interactions'), metric('Capability Gaps', summary.counts?.capabilityGaps ?? 0, 'unfulfilled request patterns'), metric('Evolution Runs', summary.counts?.selfRepairRuns ?? 0, 'agent improvement cycles')].join('');
-        renderServers(summary.servers || []);
-        renderAgent(summary);
-        renderLlm(summary, llmSummary, llmConfig);
-        renderCommandConfig(commandConfig);
-      } catch (error) { alert(`Dashboard request failed: ${error.message}`); }
-    }
-
-    async function saveRules() {
-      try { await fetchJson('/agent/log-rules', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: rulesEditor.value }); $('rulesSaveStatus').textContent = `Saved ${new Date().toLocaleString()}`; }
-      catch (error) { alert(`Failed to save rules: ${error.message}`); }
-    }
-
-    async function saveOllamaConfig() {
-      try {
-        await fetchJson('/agent/llm/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: $('llmProvider').value.trim() || 'lmstudio', enabled: $('ollamaEnabled').checked, baseUrl: $('ollamaBaseUrl').value.trim(), model: $('ollamaModel').value.trim(), apiKey: $('llmApiKey').value.trim(), httpReferer: $('llmHttpReferer').value.trim(), appTitle: $('llmAppTitle').value.trim(), useForRecommendations: $('ollamaUseRecommendations').checked, requestStrategy: $('llmRequestStrategy').value, secondary: { enabled: $('llmSecondaryEnabled').checked, baseUrl: $('llmSecondaryBaseUrl').value.trim(), model: $('llmSecondaryModel').value.trim(), apiKey: $('llmSecondaryApiKey').value.trim(), httpReferer: $('llmSecondaryHttpReferer').value.trim(), appTitle: $('llmSecondaryAppTitle').value.trim() }, useChatSystemPrompt: $('llmUseChatSystemPrompt').checked, chatSystemPrompt: $('llmChatSystemPrompt').value }) });
-        $('ollamaSaveStatus').textContent = `Saved ${new Date().toLocaleString()} | restart rustopsagent.service`;
-        await load();
-      } catch (error) { alert(`Failed to save LLM settings: ${error.message}`); }
-    }
-
-    async function saveCommandConfig() {
-      try {
-        await fetchJson('/agent/commands/config', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            enabled: $('commandEnabled').checked,
-            freeMode: $('commandFreeMode').checked,
-            defaultWaitMs: Number($('commandDefaultWaitMs').value || 2500),
-            maxWaitMs: Number($('commandMaxWaitMs').value || 12000),
-            maxOutputChars: Number($('commandMaxOutputChars').value || 8000),
-            allowList: $('commandAllowList').value
-              .split(/\r?\n|,/)
-              .map(v => v.trim())
-              .filter(v => v.length > 0)
-          })
-        });
-        $('commandSaveStatus').textContent = `Saved ${new Date().toLocaleString()} | restart rustopsagent.service`;
-        await load();
-      } catch (error) { alert(`Failed to save command policy: ${error.message}`); }
-    }
-
-    tabs.forEach(tab => tab.addEventListener('click', () => activateTab(tab.dataset.target)));
-    $('refresh').addEventListener('click', load);
-    $('saveRules').addEventListener('click', saveRules);
-    $('saveOllamaConfig').addEventListener('click', saveOllamaConfig);
-    $('saveCommandConfig').addEventListener('click', saveCommandConfig);
-    $('commandFreeMode').addEventListener('change', () => { $('commandAllowList').disabled = $('commandFreeMode').checked; });
-    document.addEventListener('click', event => { const target = event.target; if (target instanceof HTMLElement && target.classList.contains('use-model')) $('ollamaModel').value = target.dataset.model || ''; });
-    if (keyInput.value) load();
+    async function loadOverview() { const [summary, connectors] = await Promise.all([fetchJson("/dashboard/summary"), fetchJson("/agent/connectors/status")]); renderOverview(summary, connectors); }
+    async function loadChat() { const adminId = $("chatAdminId").value.trim() || "web-admin"; const data = await fetchJson("/agent/chat/replies?adminId=" + encodeURIComponent(adminId) + "&limit=40"); renderChat(data.messages || []); }
+    async function sendChat() { const msg = $("chatMessage").value.trim(); if (!msg) return; const adminId = $("chatAdminId").value.trim() || "web-admin"; await fetchJson("/agent/chat/web", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ adminId: adminId, message: msg }) }); $("chatMessage").value = ""; await loadChat(); }
+    async function ingestTextLogs() { const content = $("logContent").value.trim(); if (!content) { $("ingestStatus").textContent = "Paste log content first."; return; } const adminId = $("chatAdminId").value.trim() || "web-admin"; const source = $("logSource").value; const connector = $("logConnector").value.trim(); const data = await fetchJson("/agent/log-ingest", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ adminId: adminId, source: source, connector: connector || null, content: content }) }); $("ingestStatus").textContent = "Queued text ingest " + data.requestId + " at " + new Date().toLocaleString(); $("logContent").value = ""; await loadOverview(); }
+    async function uploadLogFile() { const fileInput = $("logFile"); if (!fileInput.files || fileInput.files.length === 0) { $("ingestStatus").textContent = "Choose a file first."; return; } const form = new FormData(); form.append("file", fileInput.files[0]); form.append("adminId", $("chatAdminId").value.trim() || "web-admin"); form.append("source", $("logSource").value); const connector = $("logConnector").value.trim(); if (connector) form.append("connector", connector); const res = await fetch("/agent/log-ingest/upload", { method:"POST", headers:{"X-Api-Key": keyInput.value.trim()}, body: form }); if (!res.ok) throw new Error(String(res.status) + " " + await res.text()); const data = await res.json(); $("ingestStatus").textContent = "Queued file ingest " + data.requestId + " (" + data.fileName + ") at " + new Date().toLocaleString(); fileInput.value = ""; await loadOverview(); }
+    async function refreshAll() { localStorage.setItem("rustops.apiKey", keyInput.value.trim()); await Promise.all([loadOverview(), loadChat()]); }
+    document.querySelectorAll(".tab").forEach(tab => tab.addEventListener("click", () => setPane(tab.dataset.pane)));
+    $("refreshAll").addEventListener("click", () => refreshAll().catch(e => alert(e.message)));
+    $("refreshChat").addEventListener("click", () => loadChat().catch(e => alert(e.message)));
+    $("sendChat").addEventListener("click", () => sendChat().catch(e => alert(e.message)));
+    $("ingestText").addEventListener("click", () => ingestTextLogs().catch(e => alert(e.message)));
+    $("uploadLogFile").addEventListener("click", () => uploadLogFile().catch(e => alert(e.message)));
+    if (keyInput.value.trim()) refreshAll().catch(e => alert(e.message));
+    setInterval(() => { if (!keyInput.value.trim()) return; loadChat().catch(() => {}); }, 5000);
   </script>
 </body>
 </html>
 """;
-
 static object BuildHostNetworkSummary()
 {
     var capturedAtUtc = DateTime.UtcNow;
@@ -3964,6 +4039,7 @@ public sealed class AgentRuntimePaths
     public string FeedbackInboxPath { get; set; } = string.Empty;
     public string DecisionInboxPath { get; set; } = string.Empty;
     public string ChatInboxPath { get; set; } = string.Empty;
+    public string LogInboxPath { get; set; } = string.Empty;
     public string MessageOutboxPath { get; set; } = string.Empty;
     public string SentOutboxPath { get; set; } = string.Empty;
     public string LogRulesPath { get; set; } = string.Empty;
@@ -4080,6 +4156,7 @@ public sealed class AgentSettingsFileView
     [JsonPropertyName("inbox")] public AgentSettingsInboxView? Inbox { get; set; }
     [JsonPropertyName("outbox")] public AgentSettingsOutboxView? Outbox { get; set; }
     [JsonPropertyName("monitor")] public AgentSettingsMonitorView? Monitor { get; set; }
+    [JsonPropertyName("integrations")] public AgentSettingsIntegrationsView? Integrations { get; set; }
     [JsonPropertyName("commandExecution")] public AgentSettingsCommandExecutionView? CommandExecution { get; set; }
     [JsonPropertyName("llm")] public AgentSettingsLlmView? Llm { get; set; }
     [JsonPropertyName("ollama")] public AgentSettingsLlmView? LegacyOllama { get; set; }
@@ -4096,6 +4173,7 @@ public sealed class AgentSettingsInboxView
     [JsonPropertyName("feedbackInboxPath")] public string? FeedbackInboxPath { get; set; }
     [JsonPropertyName("decisionInboxPath")] public string? DecisionInboxPath { get; set; }
     [JsonPropertyName("chatInboxPath")] public string? ChatInboxPath { get; set; }
+    [JsonPropertyName("logInboxPath")] public string? LogInboxPath { get; set; }
 }
 
 public sealed class AgentSettingsOutboxView
@@ -4106,6 +4184,20 @@ public sealed class AgentSettingsOutboxView
 public sealed class AgentSettingsMonitorView
 {
     [JsonPropertyName("logRulesPath")] public string? LogRulesPath { get; set; }
+}
+
+public sealed class AgentSettingsIntegrationsView
+{
+    [JsonPropertyName("autotask")] public AgentSettingsConnectorView? Autotask { get; set; }
+    [JsonPropertyName("dattoRmm")] public AgentSettingsConnectorView? DattoRmm { get; set; }
+}
+
+public sealed class AgentSettingsConnectorView
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    [JsonPropertyName("baseUrl")] public string? BaseUrl { get; set; }
+    [JsonPropertyName("logsEndpointPath")] public string? LogsEndpointPath { get; set; }
+    [JsonPropertyName("statusEndpointPath")] public string? StatusEndpointPath { get; set; }
 }
 
 public sealed class AgentSettingsCommandExecutionView
@@ -4152,6 +4244,35 @@ public sealed class BotSettingsFileView
 public sealed class BotAgentPathsView
 {
     [JsonPropertyName("sentOutboxPath")] public string? SentOutboxPath { get; set; }
+}
+
+public sealed class WebChatRequest
+{
+    public string? AdminId { get; set; }
+    public string Message { get; set; } = string.Empty;
+    public string? RequestId { get; set; }
+}
+
+public sealed class ManualLogIngestRequest
+{
+    public string? AdminId { get; set; }
+    public string? Source { get; set; }
+    public string? Connector { get; set; }
+    public string Content { get; set; } = string.Empty;
+    public string? RequestId { get; set; }
+}
+
+public sealed class AgentOutboxMessageView
+{
+    public string Id { get; set; } = string.Empty;
+    public string? AdminId { get; set; }
+    public string? TargetAdminId { get; set; }
+    public string? ActionId { get; set; }
+    public string? ServerName { get; set; }
+    public string Kind { get; set; } = string.Empty;
+    public string Mailbox { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
+    public DateTime CreatedAtUtc { get; set; }
 }
 
 public sealed class ProcessSnapshot
@@ -4348,3 +4469,4 @@ public sealed class RustRcon : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 }
+

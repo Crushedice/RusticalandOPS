@@ -2,8 +2,8 @@ using Microsoft.SemanticKernel;
 using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
-using RustOpsAgent.Domains.Rust;
 using RustOpsAgent.Infrastructure;
+using RustOpsAgent.Infrastructure.Connectors;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
 
@@ -18,11 +18,10 @@ internal sealed class AgentRuntime
     private readonly NeoCortexStore _neoCortex;
     private readonly LegacyAgentStateStore _legacyState;
     private readonly IGitOpsService _gitOps;
-    private readonly RustOpsApiClient _api;
+    private readonly IReadOnlyList<IConnectorLogSource> _connectors;
     private readonly Kernel? _kernel;
-    private readonly Dictionary<string, long> _logOffsets = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _observationFingerprints = new(StringComparer.OrdinalIgnoreCase);
-    private DateTime _lastObservationAtUtc = DateTime.MinValue;
+    private DateTime _lastConnectorObservationAtUtc = DateTime.MinValue;
     private volatile bool _stop;
 
     public AgentRuntime(
@@ -33,7 +32,7 @@ internal sealed class AgentRuntime
         NeoCortexStore neoCortex,
         LegacyAgentStateStore legacyState,
         IGitOpsService gitOps,
-        RustOpsApiClient api,
+        IReadOnlyList<IConnectorLogSource> connectors,
         Kernel? kernel)
     {
         _config = config;
@@ -43,7 +42,7 @@ internal sealed class AgentRuntime
         _neoCortex = neoCortex;
         _legacyState = legacyState;
         _gitOps = gitOps;
-        _api = api;
+        _connectors = connectors;
         _kernel = kernel;
     }
 
@@ -58,19 +57,28 @@ internal sealed class AgentRuntime
             _legacyState.UpdateRuntimeStatus(_config.Llm);
             await ProcessFeedbackInboxAsync(cancellationToken);
             await ProcessDecisionInboxAsync(cancellationToken);
+            await ProcessLogInboxAsync(cancellationToken);
 
             var chatFiles = Directory.Exists(_config.Inbox.ChatInboxPath)
                 ? Directory.GetFiles(_config.Inbox.ChatInboxPath, "*.json").Length
                 : 0;
-            if (chatFiles > 0 || tick % 5 == 0)
-                Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s)");
+            var logFiles = Directory.Exists(_config.Inbox.LogInboxPath)
+                ? Directory.GetFiles(_config.Inbox.LogInboxPath, "*.json").Length
+                : 0;
+
+            if (chatFiles > 0 || logFiles > 0 || tick % 5 == 0)
+            {
+                Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s), log-inbox={logFiles} file(s)");
+            }
 
             await ProcessChatInboxAsync(cancellationToken);
-            await ObserveServersAsync(cancellationToken);
+            await ObserveConnectorLogsAsync(cancellationToken);
             _legacyState.Save();
+
             tick++;
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
         }
+
         Console.WriteLine("[agent] Runtime stopped.");
     }
 
@@ -84,10 +92,15 @@ internal sealed class AgentRuntime
         foreach (var file in EnumerateInboxFiles(_config.Inbox.FeedbackInboxPath))
         {
             if (_stop || cancellationToken.IsCancellationRequested)
+            {
                 return;
+            }
+
             try
             {
-                var payload = JsonSerializer.Deserialize<FeedbackInboxItem>(await File.ReadAllTextAsync(file, cancellationToken), JsonDefaults.Default);
+                var payload = JsonSerializer.Deserialize<FeedbackInboxItem>(
+                    await File.ReadAllTextAsync(file, cancellationToken),
+                    JsonDefaults.Default);
                 if (payload is null)
                 {
                     continue;
@@ -95,7 +108,6 @@ internal sealed class AgentRuntime
 
                 _legacyState.RecordFeedback(payload.AdminId, payload.ActionId, payload.Verdict, payload.Note, payload.ServerName);
 
-                // Allow admins to teach the log filter using partial-match directives.
                 var note = payload.Note ?? payload.Preference;
                 if (!string.IsNullOrWhiteSpace(note) && note.StartsWith("ignore ", StringComparison.OrdinalIgnoreCase))
                 {
@@ -150,10 +162,15 @@ internal sealed class AgentRuntime
         foreach (var file in EnumerateInboxFiles(_config.Inbox.DecisionInboxPath))
         {
             if (_stop || cancellationToken.IsCancellationRequested)
+            {
                 return;
+            }
+
             try
             {
-                var payload = JsonSerializer.Deserialize<DecisionInboxItem>(await File.ReadAllTextAsync(file, cancellationToken), JsonDefaults.Default);
+                var payload = JsonSerializer.Deserialize<DecisionInboxItem>(
+                    await File.ReadAllTextAsync(file, cancellationToken),
+                    JsonDefaults.Default);
                 if (payload is null)
                 {
                     continue;
@@ -184,6 +201,150 @@ internal sealed class AgentRuntime
         }
     }
 
+    private async Task ProcessLogInboxAsync(CancellationToken cancellationToken)
+    {
+        if (!Directory.Exists(_config.Inbox.LogInboxPath))
+        {
+            return;
+        }
+
+        foreach (var file in EnumerateInboxFiles(_config.Inbox.LogInboxPath))
+        {
+            if (_stop || cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            LogIngestInboxItem? payload = null;
+            try
+            {
+                payload = JsonSerializer.Deserialize<LogIngestInboxItem>(
+                    await File.ReadAllTextAsync(file, cancellationToken),
+                    JsonDefaults.Default);
+                if (payload is null)
+                {
+                    continue;
+                }
+
+                var source = string.IsNullOrWhiteSpace(payload.Source) ? "manual" : payload.Source.Trim();
+                var connector = string.IsNullOrWhiteSpace(payload.Connector) ? source : payload.Connector.Trim();
+                var logs = _neoCortex.LoadLogs();
+                var added = 0;
+
+                if (payload.Lines.Count > 0)
+                {
+                    foreach (var line in payload.Lines.Where(line => !string.IsNullOrWhiteSpace(line.Message)))
+                    {
+                        if (!TryRegisterObservationFingerprint(connector, line.Message))
+                        {
+                            continue;
+                        }
+
+                        var importance = ScoreImportance(line.Message, line.Level, logs.ImportanceRules);
+                        logs.RecentEntries.Add(new LogObservation
+                        {
+                            ServerName = connector,
+                            Source = source,
+                            Connector = connector,
+                            Level = line.Level,
+                            Line = line.Message,
+                            Importance = importance,
+                            CapturedAtUtc = line.TimestampUtc ?? DateTime.UtcNow
+                        });
+                        added++;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(payload.Content))
+                {
+                    foreach (var line in payload.Content.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        if (!TryRegisterObservationFingerprint(connector, line))
+                        {
+                            continue;
+                        }
+
+                        var importance = ScoreImportance(line, null, logs.ImportanceRules);
+                        logs.RecentEntries.Add(new LogObservation
+                        {
+                            ServerName = connector,
+                            Source = source,
+                            Connector = connector,
+                            Line = line,
+                            Importance = importance,
+                            CapturedAtUtc = DateTime.UtcNow
+                        });
+                        added++;
+                    }
+                }
+
+                if (added == 0)
+                {
+                    continue;
+                }
+
+                logs.RecentEntries = logs.RecentEntries
+                    .OrderBy(entry => entry.CapturedAtUtc)
+                    .TakeLast(1200)
+                    .ToList();
+                _neoCortex.SaveLogs(logs);
+
+                var latest = logs.RecentEntries
+                    .Where(entry => string.Equals(entry.Connector, connector, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(entry => entry.CapturedAtUtc)
+                    .Take(25)
+                    .ToList();
+
+                var highSignal = latest
+                    .Where(entry => entry.Importance >= 2)
+                    .Take(6)
+                    .Select(entry => $"[{entry.Level ?? "info"}] {entry.Line}")
+                    .ToList();
+
+                var summary = highSignal.Count > 0
+                    ? $"Ingested {added} log lines from {source}. High-signal lines: {string.Join(" | ", highSignal)}"
+                    : $"Ingested {added} log lines from {source}. No high-signal patterns were detected.";
+
+                var analysis = await AnalyzeObservationWithLlmAsync(source, latest.Select(entry => entry.Line).Take(12).ToList(), cancellationToken);
+                RecordLlmInteraction(
+                    "log-ingest-analysis",
+                    analysis.LlmAttempted,
+                    analysis.LlmSucceeded,
+                    $"log ingest {source}",
+                    analysis.Summary,
+                    analysis.Source);
+
+                _legacyState.RecordAction(
+                    payload.RequestId ?? payload.Id,
+                    "log_ingest",
+                    true,
+                    summary,
+                    connector,
+                    payload.Channel ?? "web");
+
+                if (!string.IsNullOrWhiteSpace(payload.AdminId))
+                {
+                    WriteOutbox(payload.AdminId, $"{summary} {analysis.Summary}", payload.RequestId ?? payload.Id, connector);
+                }
+            }
+            catch (Exception ex)
+            {
+                _legacyState.RecordAgentError($"log inbox processing failed: {ex.Message}");
+                _legacyState.RecordIncident(payload?.Connector ?? payload?.Source, "log_ingest_error", ex.Message);
+                RustOpsSentry.CaptureException(
+                    ex,
+                    "Log inbox processing failed.",
+                    "agent.inbox",
+                    tags: new Dictionary<string, string?> { ["inbox.kind"] = "log" },
+                    extras: new Dictionary<string, object?> { ["file"] = file });
+            }
+            finally
+            {
+                TryDelete(file);
+            }
+        }
+    }
+
     private async Task ProcessChatInboxAsync(CancellationToken cancellationToken)
     {
         if (!Directory.Exists(_config.Inbox.ChatInboxPath))
@@ -194,7 +355,9 @@ internal sealed class AgentRuntime
         foreach (var file in EnumerateInboxFiles(_config.Inbox.ChatInboxPath))
         {
             if (_stop || cancellationToken.IsCancellationRequested)
+            {
                 return;
+            }
 
             ChatInboxItem? item = null;
             try
@@ -206,9 +369,9 @@ internal sealed class AgentRuntime
                 }
 
                 var actionId = string.IsNullOrWhiteSpace(item.RequestId) ? item.Id : item.RequestId!;
-
                 var selection = _neoCortex.LoadSelection();
-                var state = selection.Conversations.FirstOrDefault(c => string.Equals(c.AdminId, item.AdminId, StringComparison.OrdinalIgnoreCase));
+                var state = selection.Conversations.FirstOrDefault(conversation =>
+                    string.Equals(conversation.AdminId, item.AdminId, StringComparison.OrdinalIgnoreCase));
                 if (state is null)
                 {
                     state = new ConversationSelectionState { AdminId = item.AdminId };
@@ -217,6 +380,7 @@ internal sealed class AgentRuntime
 
                 var route = await _classifier.ClassifyAsync(item.Message, state, cancellationToken);
                 RecordIntentRoutingInteraction(item.Message, route);
+
                 var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);
                 var result = await _executor.ExecuteAsync(context, cancellationToken);
                 var composedReply = await _composer.ComposeAsync(context, result, cancellationToken);
@@ -227,7 +391,6 @@ internal sealed class AgentRuntime
                     item.Message,
                     composedReply.ResponsePreview ?? composedReply.Message,
                     composedReply.Source);
-                var reply = composedReply.Message;
 
                 UpdateSelectionState(state, route, result);
                 _neoCortex.SaveSelection(selection);
@@ -272,7 +435,10 @@ internal sealed class AgentRuntime
                         Resolved = false
                     };
                     await _neoCortex.RecordIncidentAsync(incident, cancellationToken);
-                    _legacyState.RecordIncident(result.SelectedServer ?? route.Slots.ServerName, result.ErrorCode ?? "execution_failure", result.Message);
+                    _legacyState.RecordIncident(
+                        result.SelectedServer ?? route.Slots.ServerName,
+                        result.ErrorCode ?? "execution_failure",
+                        result.Message);
 
                     if (_config.GitOps.Enabled && _config.GitOps.AllowPush)
                     {
@@ -280,7 +446,7 @@ internal sealed class AgentRuntime
                     }
                 }
 
-                WriteOutbox(item.AdminId, reply, actionId, result.SelectedServer ?? route.Slots.ServerName);
+                WriteOutbox(item.AdminId, composedReply.Message, actionId, result.SelectedServer ?? route.Slots.ServerName);
             }
             catch (Exception ex)
             {
@@ -310,11 +476,132 @@ internal sealed class AgentRuntime
                         ["requestId"] = item?.RequestId,
                         ["message"] = item?.Message
                     });
+
                 WriteOutbox(item?.AdminId ?? "admin", $"Failed to process request: {ex.Message}", item?.RequestId ?? item?.Id, null);
             }
             finally
             {
                 TryDelete(file);
+            }
+        }
+    }
+
+    private async Task ObserveConnectorLogsAsync(CancellationToken cancellationToken)
+    {
+        var intervalSeconds = Math.Max(10, _config.Integrations.PollSeconds);
+        if (DateTime.UtcNow - _lastConnectorObservationAtUtc < TimeSpan.FromSeconds(intervalSeconds))
+        {
+            return;
+        }
+
+        _lastConnectorObservationAtUtc = DateTime.UtcNow;
+        var activeConnectors = _connectors.Where(connector => connector.Enabled).ToList();
+        if (activeConnectors.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var connector in activeConnectors)
+        {
+            if (_stop || cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            try
+            {
+                var fetched = await connector.FetchRecentLogsAsync(cancellationToken);
+                if (!fetched.Success)
+                {
+                    _legacyState.RecordAgentError($"{connector.Name} sync failed: {fetched.Summary}");
+                    continue;
+                }
+
+                if (fetched.Records.Count == 0)
+                {
+                    continue;
+                }
+
+                var logs = _neoCortex.LoadLogs();
+                var added = 0;
+                foreach (var record in fetched.Records.Take(Math.Max(10, _config.Integrations.MaxLogsPerPoll)))
+                {
+                    if (!TryRegisterObservationFingerprint(record.Connector, record.Message))
+                    {
+                        continue;
+                    }
+
+                    var importance = ScoreImportance(record.Message, record.Level, logs.ImportanceRules);
+                    logs.RecentEntries.Add(new LogObservation
+                    {
+                        ServerName = record.Connector,
+                        Source = record.Source,
+                        Connector = record.Connector,
+                        Level = record.Level,
+                        Line = record.Message,
+                        Importance = importance,
+                        CapturedAtUtc = record.TimestampUtc
+                    });
+                    added++;
+                }
+
+                if (added == 0)
+                {
+                    continue;
+                }
+
+                logs.RecentEntries = logs.RecentEntries
+                    .OrderBy(entry => entry.CapturedAtUtc)
+                    .TakeLast(1200)
+                    .ToList();
+                _neoCortex.SaveLogs(logs);
+
+                _legacyState.RecordAction(
+                    Guid.NewGuid().ToString("N"),
+                    "connector_log_poll",
+                    true,
+                    $"{connector.Name}: {added} log entries ingested.",
+                    connector.Name,
+                    "polling");
+
+                var important = logs.RecentEntries
+                    .Where(entry =>
+                        string.Equals(entry.Connector, connector.Name, StringComparison.OrdinalIgnoreCase) &&
+                        entry.Importance >= 2)
+                    .OrderByDescending(entry => entry.CapturedAtUtc)
+                    .Take(6)
+                    .Select(entry => entry.Line)
+                    .ToList();
+                if (important.Count == 0)
+                {
+                    continue;
+                }
+
+                var analysis = await AnalyzeObservationWithLlmAsync(connector.Name, important, cancellationToken);
+                RecordLlmInteraction(
+                    "connector-observation-analysis",
+                    analysis.LlmAttempted,
+                    analysis.LlmSucceeded,
+                    $"{connector.Name} logs",
+                    analysis.Summary,
+                    analysis.Source);
+
+                _legacyState.RecordIncident(connector.Name, analysis.Classification, analysis.Summary);
+                await _neoCortex.RecordIncidentAsync(new EvolutionIncidentRecord
+                {
+                    Request = $"observe logs {connector.Name}",
+                    IntendedOutcome = "continuous_observation",
+                    FailureReason = analysis.Summary,
+                    MissingCapability = analysis.MissingCapability,
+                    RecurrencePrevention = analysis.RecurrencePrevention,
+                    Classification = analysis.Classification,
+                    Timestamp = DateTime.UtcNow,
+                    Resolved = false
+                }, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _legacyState.RecordAgentError($"connector observation failed for {connector.Name}: {ex.Message}");
             }
         }
     }
@@ -330,178 +617,57 @@ internal sealed class AgentRuntime
             route.ClassifierSource);
     }
 
-    private async Task ObserveServersAsync(CancellationToken cancellationToken)
+    private static int ScoreImportance(string line, string? level, IEnumerable<string> dynamicRules)
     {
-        var interval = TimeSpan.FromSeconds(Math.Max(5, _config.Monitor.PollSeconds));
-        if (DateTime.UtcNow - _lastObservationAtUtc < interval)
-        {
-            return;
-        }
+        var normalized = line.ToLowerInvariant();
+        var severity = (level ?? string.Empty).ToLowerInvariant();
 
-        _lastObservationAtUtc = DateTime.UtcNow;
-
-        List<string> servers;
-        try
-        {
-            using var list = await _api.GetAsync("/servers", cancellationToken);
-            servers = list.RootElement.ValueKind == JsonValueKind.Array
-                ? list.RootElement.EnumerateArray()
-                    .Where(node => node.ValueKind == JsonValueKind.String)
-                    .Select(node => node.GetString())
-                    .Where(name => !string.IsNullOrWhiteSpace(name))
-                    .Select(name => name!)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList()
-                : new List<string>();
-        }
-        catch (Exception ex)
-        {
-            _legacyState.RecordAgentError($"server observation failed: {ex.Message}");
-            return;
-        }
-
-        foreach (var server in servers)
-        {
-            if (_stop || cancellationToken.IsCancellationRequested)
-            {
-                return;
-            }
-
-            try
-            {
-                await ObserveServerHealthAsync(server, cancellationToken);
-                await ObserveServerLogsAsync(server, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _legacyState.RecordAgentError($"observation failed for {server}: {ex.Message}");
-            }
-        }
-    }
-
-    private async Task ObserveServerHealthAsync(string server, CancellationToken cancellationToken)
-    {
-        using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
-        var root = health.RootElement;
-        var state = ReadHealthState(root);
-        var recentErrors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
-            ? errorsNode.EnumerateArray().Select(item => item.ToString()).Where(item => !string.IsNullOrWhiteSpace(item)).Take(3).ToList()
-            : new List<string>();
-
-        if (recentErrors.Count == 0)
-        {
-            return;
-        }
-
-        var fingerprint = $"{state}|{string.Join("|", recentErrors)}";
-        if (_observationFingerprints.TryGetValue($"{server}:health", out var previous) &&
-            string.Equals(previous, fingerprint, StringComparison.Ordinal))
-        {
-            return;
-        }
-
-        _observationFingerprints[$"{server}:health"] = fingerprint;
-        var analysis = await AnalyzeObservationWithLlmAsync(server, state, recentErrors, cancellationToken);
-        RecordLlmInteraction(
-            "observation-analysis",
-            analysis.LlmAttempted,
-            analysis.LlmSucceeded,
-            $"{server} health observation",
-            analysis.Summary,
-            analysis.Source);
-        var summary = analysis.Summary;
-        _legacyState.RecordIncident(server, "health_observation", summary);
-        await _neoCortex.RecordIncidentAsync(new EvolutionIncidentRecord
-        {
-            Request = $"observe health {server}",
-            IntendedOutcome = "continuous_observation",
-            FailureReason = summary,
-            MissingCapability = analysis.MissingCapability,
-            RecurrencePrevention = analysis.RecurrencePrevention,
-            Classification = analysis.Classification,
-            Timestamp = DateTime.UtcNow,
-            Resolved = false
-        }, cancellationToken);
-    }
-
-    private async Task ObserveServerLogsAsync(string server, CancellationToken cancellationToken)
-    {
-        _logOffsets.TryGetValue(server, out var offset);
-        var path = $"/servers/{Uri.EscapeDataString(server)}/logs/read?offset={offset}&maxBytes=65536";
-        using var logs = await _api.GetAsync(path, cancellationToken);
-        var root = logs.RootElement;
-
-        if (root.TryGetProperty("endOffset", out var endOffsetNode) && endOffsetNode.ValueKind == JsonValueKind.Number)
-        {
-            _logOffsets[server] = endOffsetNode.GetInt64();
-        }
-
-        var knowledge = _neoCortex.LoadLogs();
-        var changed = false;
-        if (root.TryGetProperty("entries", out var entriesNode) && entriesNode.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var entry in entriesNode.EnumerateArray())
-            {
-                var line = entry.TryGetProperty("message", out var messageNode) ? messageNode.GetString() ?? string.Empty : string.Empty;
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    continue;
-                }
-
-                var lowered = line.ToLowerInvariant();
-                if (knowledge.IgnorePatterns.Any(pattern => lowered.Contains(pattern.ToLowerInvariant(), StringComparison.Ordinal)))
-                {
-                    continue;
-                }
-
-                var importance = ScoreImportance(lowered, knowledge.ImportanceRules);
-                knowledge.RecentEntries.Add(new LogObservation
-                {
-                    ServerName = server,
-                    Line = line,
-                    Importance = importance,
-                    CapturedAtUtc = DateTime.UtcNow
-                });
-                changed = true;
-            }
-        }
-
-        if (!changed)
-        {
-            return;
-        }
-
-        knowledge.RecentEntries = knowledge.RecentEntries.TakeLast(400).ToList();
-        _neoCortex.SaveLogs(knowledge);
-    }
-
-    private static string ReadHealthState(JsonElement root)
-    {
-        if (root.TryGetProperty("status", out var statusNode) &&
-            statusNode.ValueKind == JsonValueKind.Object &&
-            statusNode.TryGetProperty("state", out var nestedState))
-        {
-            return nestedState.GetString() ?? "unknown";
-        }
-
-        return root.TryGetProperty("state", out var stateNode)
-            ? stateNode.GetString() ?? "unknown"
-            : "unknown";
-    }
-
-    private static int ScoreImportance(string line, IEnumerable<string> dynamicRules)
-    {
-        if (line.Contains("exception") || line.Contains("failed") || line.Contains("error"))
+        if (severity is "critical" or "fatal" or "error")
         {
             return 3;
         }
 
-        if (line.Contains("warn") || line.Contains("disconnect"))
+        if (severity is "warn" or "warning")
         {
             return 2;
         }
 
-        return dynamicRules.Any(rule => line.Contains(rule, StringComparison.OrdinalIgnoreCase)) ? 2 : 1;
+        if (normalized.Contains("exception") || normalized.Contains("failed") || normalized.Contains("error"))
+        {
+            return 3;
+        }
+
+        if (normalized.Contains("warn") || normalized.Contains("disconnect") || normalized.Contains("timeout"))
+        {
+            return 2;
+        }
+
+        return dynamicRules.Any(rule => normalized.Contains(rule, StringComparison.OrdinalIgnoreCase)) ? 2 : 1;
+    }
+
+    private bool TryRegisterObservationFingerprint(string source, string line)
+    {
+        var fingerprint = $"{source}:{TrimSingleLine(line, 220)}";
+        if (_observationFingerprints.ContainsKey(fingerprint))
+        {
+            return false;
+        }
+
+        _observationFingerprints[fingerprint] = DateTime.UtcNow.ToString("O");
+        if (_observationFingerprints.Count > 2500)
+        {
+            var oldest = _observationFingerprints
+                .OrderBy(kvp => kvp.Value, StringComparer.Ordinal)
+                .Take(400)
+                .Select(kvp => kvp.Key)
+                .ToList();
+            foreach (var key in oldest)
+            {
+                _observationFingerprints.Remove(key);
+            }
+        }
+
+        return true;
     }
 
     private static string TrimSingleLine(string input, int maxLength)
@@ -537,26 +703,25 @@ internal sealed class AgentRuntime
     }
 
     private async Task<ObservationAnalysis> AnalyzeObservationWithLlmAsync(
-        string server,
-        string state,
-        IReadOnlyList<string> recentErrors,
+        string source,
+        IReadOnlyList<string> lines,
         CancellationToken cancellationToken)
     {
-        var fallbackSummary = $"{server} is {state}. Recent errors: {string.Join(" | ", recentErrors)}";
+        var fallbackSummary = $"{source} reported operational signals in recent logs.";
         if (_kernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
         {
             return new ObservationAnalysis(
                 fallbackSummary,
-                "health_observation",
-                "health_issue_detected",
-                "Review recent errors and server health details.",
+                "connector_observation",
+                "log_signal_detected",
+                "Review the latest connector events and confirm whether operator action is required.",
                 false,
                 false,
                 _kernel is null ? "template_no_kernel" : "template_llm_disabled");
         }
 
         var prompt = $$"""
-You are analyzing Rust server health events for recurring operational issues.
+You are analyzing operational logs from MSP tools.
 Return strict JSON only with keys:
 summary, classification, missingCapability, recurrencePrevention
 
@@ -567,10 +732,9 @@ Constraints:
 - recurrencePrevention: one sentence with concrete operator action
 - do not invent data
 
-Server: {{server}}
-State: {{state}}
-RecentErrors:
-{{string.Join("\n", recentErrors)}}
+Source: {{source}}
+RecentSignals:
+{{string.Join("\n", lines.Take(12))}}
 """;
 
         try
@@ -582,9 +746,9 @@ RecentErrors:
             {
                 return new ObservationAnalysis(
                     fallbackSummary,
-                    "health_observation",
-                    "health_issue_detected",
-                    "Review recent errors and server health details.",
+                    "connector_observation",
+                    "log_signal_detected",
+                    "Review the latest connector events and confirm whether operator action is required.",
                     true,
                     false,
                     "llm_parse_failure");
@@ -599,9 +763,9 @@ RecentErrors:
 
             return new ObservationAnalysis(
                 string.IsNullOrWhiteSpace(summary) ? fallbackSummary : summary!,
-                SanitizeToken(classification, "health_observation"),
-                SanitizeToken(missing, "health_issue_detected"),
-                string.IsNullOrWhiteSpace(prevention) ? "Review recent errors and server health details." : prevention!,
+                SanitizeToken(classification, "connector_observation"),
+                SanitizeToken(missing, "log_signal_detected"),
+                string.IsNullOrWhiteSpace(prevention) ? "Review the latest connector events and confirm whether operator action is required." : prevention!,
                 true,
                 true,
                 "llm");
@@ -610,9 +774,9 @@ RecentErrors:
         {
             return new ObservationAnalysis(
                 fallbackSummary,
-                "health_observation",
-                "health_issue_detected",
-                "Review recent errors and server health details.",
+                "connector_observation",
+                "log_signal_detected",
+                "Review the latest connector events and confirm whether operator action is required.",
                 true,
                 false,
                 $"llm_error:{ex.GetType().Name}");
@@ -639,12 +803,7 @@ RecentErrors:
         }
 
         var token = new string(value.Trim().ToLowerInvariant().Where(ch => char.IsLetterOrDigit(ch) || ch == '_' || ch == '-').ToArray());
-        if (string.IsNullOrWhiteSpace(token))
-        {
-            return fallback;
-        }
-
-        return token;
+        return string.IsNullOrWhiteSpace(token) ? fallback : token;
     }
 
     private sealed record ObservationAnalysis(
@@ -723,7 +882,10 @@ RecentErrors:
 
     private static void TryDelete(string path)
     {
-        try { File.Delete(path); }
+        try
+        {
+            File.Delete(path);
+        }
         catch (Exception ex)
         {
             RustOpsSentry.CaptureException(

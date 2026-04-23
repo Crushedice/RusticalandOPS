@@ -5,12 +5,9 @@ namespace RustOpsAgent.Core.Contracts;
 internal enum AdminIntentType
 {
     Chat,
-    ServerControl,
-    PlayerLookup,
-    RconCommand,
-    FileEdit,
     StatusCheck,
     Troubleshooting,
+    FileEdit,
     Clarification
 }
 

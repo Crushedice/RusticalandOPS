@@ -10,6 +10,7 @@ internal sealed class AgentConfig
     [JsonPropertyName("outbox")] public OutboxSettings Outbox { get; set; } = new();
     [JsonPropertyName("monitor")] public MonitorSettings Monitor { get; set; } = new();
     [JsonPropertyName("gitOps")] public GitOpsSettings GitOps { get; set; } = new();
+    [JsonPropertyName("integrations")] public IntegrationSettings Integrations { get; set; } = new();
     [JsonPropertyName("llm")] public LlmSettings Llm { get; set; } = new();
 }
 
@@ -30,6 +31,7 @@ internal sealed class InboxSettings
     [JsonPropertyName("feedbackInboxPath")] public string FeedbackInboxPath { get; set; } = "data/feedback-inbox";
     [JsonPropertyName("decisionInboxPath")] public string DecisionInboxPath { get; set; } = "data/decision-inbox";
     [JsonPropertyName("chatInboxPath")] public string ChatInboxPath { get; set; } = "data/chat-inbox";
+    [JsonPropertyName("logInboxPath")] public string LogInboxPath { get; set; } = "data/log-inbox";
 }
 
 internal sealed class OutboxSettings
@@ -40,6 +42,41 @@ internal sealed class OutboxSettings
 internal sealed class MonitorSettings
 {
     [JsonPropertyName("pollSeconds")] public int PollSeconds { get; set; } = 10;
+}
+
+internal sealed class IntegrationSettings
+{
+    [JsonPropertyName("pollSeconds")] public int PollSeconds { get; set; } = 120;
+    [JsonPropertyName("maxLogsPerPoll")] public int MaxLogsPerPoll { get; set; } = 200;
+    [JsonPropertyName("autotask")] public ApiConnectorSettings Autotask { get; set; } = new()
+    {
+        Enabled = false,
+        Name = "autotask",
+        LogsEndpointPath = "/atservicesrest/v1.0/Logs",
+        StatusEndpointPath = "/atservicesrest/v1.0/HealthCheck"
+    };
+    [JsonPropertyName("dattoRmm")] public ApiConnectorSettings DattoRmm { get; set; } = new()
+    {
+        Enabled = false,
+        Name = "datto-rmm",
+        LogsEndpointPath = "/api/v2/audit/logs",
+        StatusEndpointPath = "/api/v2/account"
+    };
+}
+
+internal sealed class ApiConnectorSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    [JsonPropertyName("name")] public string Name { get; set; } = string.Empty;
+    [JsonPropertyName("baseUrl")] public string BaseUrl { get; set; } = string.Empty;
+    [JsonPropertyName("accessToken")] public string? AccessToken { get; set; }
+    [JsonPropertyName("apiKey")] public string? ApiKey { get; set; }
+    [JsonPropertyName("apiSecret")] public string? ApiSecret { get; set; }
+    [JsonPropertyName("integrationCode")] public string? IntegrationCode { get; set; }
+    [JsonPropertyName("username")] public string? Username { get; set; }
+    [JsonPropertyName("password")] public string? Password { get; set; }
+    [JsonPropertyName("logsEndpointPath")] public string LogsEndpointPath { get; set; } = "/logs";
+    [JsonPropertyName("statusEndpointPath")] public string StatusEndpointPath { get; set; } = "/health";
 }
 
 internal sealed class GitOpsSettings
@@ -105,4 +142,23 @@ internal sealed class AdapterMessage
     [JsonPropertyName("actionId")] public string? ActionId { get; set; }
     [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
     [JsonPropertyName("createdAtUtc")] public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
+}
+
+internal sealed class LogIngestInboxItem
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    [JsonPropertyName("requestId")] public string? RequestId { get; set; }
+    [JsonPropertyName("adminId")] public string AdminId { get; set; } = "web-admin";
+    [JsonPropertyName("source")] public string Source { get; set; } = "manual";
+    [JsonPropertyName("connector")] public string? Connector { get; set; }
+    [JsonPropertyName("content")] public string? Content { get; set; }
+    [JsonPropertyName("lines")] public List<LogIngestLine> Lines { get; set; } = new();
+    [JsonPropertyName("channel")] public string? Channel { get; set; }
+}
+
+internal sealed class LogIngestLine
+{
+    [JsonPropertyName("timestampUtc")] public DateTime? TimestampUtc { get; set; }
+    [JsonPropertyName("level")] public string? Level { get; set; }
+    [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
 }

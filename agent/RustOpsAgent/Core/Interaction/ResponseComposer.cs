@@ -36,11 +36,11 @@ internal sealed class ResponseComposer : IResponseComposer
 
         var prompt = $$"""
 {{BuildSystemPrefix()}}
-You are an operations reasoning assistant for a Rust server admin.
+You are an operations reasoning assistant for an IT operations admin.
 Write a concise operator response in plain text.
 Requirements:
 - Start with the direct outcome.
-- Mention server and next action when relevant.
+- Mention connector/source and next action when relevant.
 - Do not invent facts beyond the provided data.
 - Keep it under 120 words unless critical failure details require more.
 

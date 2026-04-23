@@ -19,7 +19,8 @@
   "inbox": {
     "feedbackInboxPath": "data/feedback-inbox",
     "decisionInboxPath": "data/decision-inbox",
-    "chatInboxPath": "data/chat-inbox"
+    "chatInboxPath": "data/chat-inbox",
+    "logInboxPath": "data/log-inbox"
   },
   "outbox": {
     "messageOutboxPath": "data/message-outbox"
@@ -87,20 +88,37 @@
     "maxWaitMs": 12000,
     "maxOutputChars": 8000,
     "allowList": [
-      "playerlist",
-      "serverinfo",
-      "bans",
-      "oxide.plugins",
       "status",
-      "version"
+      "alerts",
+      "tickets",
+      "devices.list",
+      "jobs.list"
     ]
   },
-  "pluginUpdates": {
-    "enabled": true,
-    "checkIntervalMinutes": 60,
-    "notifyAdmins": true,
-    "searchUrlTemplate": "https://umod.org/plugins/search.json?query={0}&page=1&sort=title&sortdir=asc&filter={1}",
-    "searchFilter": "rust"
+  "integrations": {
+    "pollSeconds": 120,
+    "maxLogsPerPoll": 200,
+    "autotask": {
+      "enabled": false,
+      "name": "autotask",
+      "baseUrl": "${OPS_AUTOTASK_BASE_URL}",
+      "integrationCode": "${OPS_AUTOTASK_INTEGRATION_CODE}",
+      "username": "${OPS_AUTOTASK_USERNAME}",
+      "apiSecret": "${OPS_AUTOTASK_API_SECRET}",
+      "accessToken": "${OPS_AUTOTASK_ACCESS_TOKEN}",
+      "logsEndpointPath": "/atservicesrest/v1.0/Logs",
+      "statusEndpointPath": "/atservicesrest/v1.0/HealthCheck"
+    },
+    "dattoRmm": {
+      "enabled": false,
+      "name": "datto-rmm",
+      "baseUrl": "${OPS_DATTO_RMM_BASE_URL}",
+      "apiKey": "${OPS_DATTO_RMM_API_KEY}",
+      "apiSecret": "${OPS_DATTO_RMM_API_SECRET}",
+      "accessToken": "${OPS_DATTO_RMM_ACCESS_TOKEN}",
+      "logsEndpointPath": "/api/v2/audit/logs",
+      "statusEndpointPath": "/api/v2/account"
+    }
   },
   "llm": {
     "enabled": true,
@@ -121,6 +139,6 @@
       "appTitle": "${RUSTOPS_LLM_SECONDARY_APP_TITLE}"
     },
     "useChatSystemPrompt": true,
-    "chatSystemPrompt": "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\nIf an admin asks to push source changes to git, use git_push_branch.\nIf an admin asks to pull latest source updates, use git_pull_rebuild.\nIf an admin asks for the banlist or bans, use get_server_bans.\nYou can use read_scope_file to read the contents of plugin files or config files if you know their relative paths."
+    "chatSystemPrompt": "You are a local operations agent for MSP administrators.\nFocus on connector status, incoming logs, and practical operator actions.\nPrioritize facts from tool output and avoid guessing.\nIf a request is ambiguous, ask a concise clarification question.\nStart responses with the direct outcome, then key evidence and next action."
   }
 }
