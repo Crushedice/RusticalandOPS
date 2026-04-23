@@ -13,8 +13,8 @@
     "logRulesPath": "agent-log-rules.json"
   },
   "memory": {
-    "statePath": "${RUSTOPS_AGENT_STATE_PATH}",
-    "neoCortexRoot": "data/NeoCortex"
+    "statePath": "/opt/rust-manager/agent/RustOpsAgent/data/agent-state.json",
+	"neoCortexRoot": "/opt/rust-manager/agent/RustOpsAgent/data/NeoCortex"
   },
   "inbox": {
     "feedbackInboxPath": "${RUSTOPS_FEEDBACK_INBOX_PATH}",
@@ -22,7 +22,7 @@
     "chatInboxPath": "${RUSTOPS_CHAT_INBOX_PATH}"
   },
   "outbox": {
-    "messageOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_PATH}"
+     "messageOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_PATH}"
   },
   "policy": {
     "allowAnyServerCommand": false,
@@ -33,7 +33,8 @@
       "version",
       "plugins",
       "global.",
-      "serverinfo"
+      "serverinfo",
+      "server."
     ],
     "autoAllowedActions": [
       "validate-oxide",
@@ -50,6 +51,20 @@
       "create-task"
     ]
   },
+  "gitOps": {
+    "enabled": true,
+    "repoPath": "/opt/rust-manager/src",
+    "remoteName": "origin",
+    "baseBranch": "main",
+    "pushBranchPrefix": "agent/",
+    "allowPush": true,
+    "allowManualPullRebuild": true,
+    "autoPullEnabled": false,
+    "autoPullIntervalMinutes": 15,
+    "autoPullRebuild": true,
+    "autoRestartAfterPullRebuild": true,
+    "requireCleanWorktreeForPull": true
+  },
   "commandExecution": {
     "enabled": true,
     "freeMode": false,
@@ -62,7 +77,9 @@
       "bans",
       "oxide.plugins",
       "status",
-      "version"
+      "version",
+      "banlist",
+      "mutelist"
     ]
   },
   "pluginUpdates": {
@@ -81,9 +98,9 @@
     "httpReferer": "${RUSTOPS_LLM_HTTP_REFERER}",
     "appTitle": "${RUSTOPS_LLM_APP_TITLE}",
     "useForRecommendations": true,
-    "requestStrategy": "fallback",
+    "requestStrategy": "${RUSTOPS_LLM_REQUEST_STRATEGY}",
     "secondary": {
-      "enabled": false,
+      "enabled": true,
       "baseUrl": "${RUSTOPS_LLM_SECONDARY_BASE_URL}",
       "model": "${RUSTOPS_LLM_SECONDARY_MODEL}",
       "apiKey": "${RUSTOPS_LLM_SECONDARY_API_KEY}",
@@ -91,6 +108,6 @@
       "appTitle": "${RUSTOPS_LLM_SECONDARY_APP_TITLE}"
     },
     "useChatSystemPrompt": true,
-    "chatSystemPrompt": "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nFor status and health requests with plural wording (all/every/all 4 servers), default to all configured servers.\nOn follow-up corrections like 'no, I meant all 4 servers', keep the prior intent unless the admin clearly changes tasks.\nFor aggregate checks, return best-effort results and include partial failures explicitly.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\nIf an admin asks to push source changes to git, use git_push_branch.\nIf an admin asks to pull latest source updates, use git_pull_rebuild.\nIf an admin asks for the banlist or bans, use get_server_bans.\nYou can use read_scope_file to read the contents of plugin files or config files if you know their relative paths."
+    "chatSystemPrompt": "You are a local Rust game-server operations agent talking to a server admin.\nUse the tool results and context provided to answer accurately.\nDo not invent facts — base all answers on the data given.\nFor start, stop, restart, and validate-oxide actions you must target a known server.\nIf the target server is unclear, ask a short clarification question rather than guessing.\nUse recent actions, incidents, and log context to explain what is happening.\nReply in plain, direct operational language — lead with the answer, then supporting evidence.\nKeep replies concise unless critical failure details require more."
   }
 }

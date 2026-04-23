@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using System.Collections.Concurrent;
 using Sentry;
 using RustOpsAgent.Core.Contracts;
+using RustOpsAgent.Core.Interaction;
 using RustOpsAgent.Domains.Rust.Rcon;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.Memory;
@@ -23,30 +24,143 @@ internal sealed class RustStatusToolHandler : IToolHandler
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
-        if (string.IsNullOrWhiteSpace(server))
+        var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+        var scope = RustToolHelper.ResolveServerScope(context, knownServers, allowPluralDefaultAll: true);
+        if (scope.Servers.Count == 0)
         {
-            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
-            var list = knownServers.Count > 0 ? string.Join(", ", knownServers.Take(10)) : "none";
-            return new ToolExecutionResult(true, $"Known servers: {list}");
+            var clarification = RustToolHelper.BuildScopeClarificationQuestion(
+                context.Route.Intent,
+                knownServers,
+                allowAllServers: true);
+            return new ToolExecutionResult(
+                false,
+                clarification,
+                context.SelectionState.LastServerName,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
-        using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
-        var root = health.RootElement;
-        var state = root.TryGetProperty("status", out var statusNode) &&
-                    statusNode.ValueKind == JsonValueKind.Object &&
-                    statusNode.TryGetProperty("state", out var nestedState)
-            ? nestedState.GetString()
-            : (root.TryGetProperty("state", out var stateNode) ? stateNode.GetString() : "unknown");
-        var errors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
-            ? errorsNode.EnumerateArray().Select(e => e.ToString()).Take(3).ToList()
-            : new List<string>();
+        var results = new List<AggregateStatusServerResult>();
+        foreach (var server in scope.Servers)
+        {
+            results.Add(await CheckServerStatusAsync(server, cancellationToken));
+        }
 
-        var msg = errors.Count > 0
-            ? $"{server} is {state}. Recent errors: {string.Join(" | ", errors)}"
-            : $"{server} is {state}. No recent errors were reported.";
+        var successful = results.Where(result => result.CheckSucceeded).ToList();
+        var failedServers = results
+            .Where(result => !result.CheckSucceeded)
+            .Select(result => result.Server)
+            .ToList();
+        var offlineServers = successful
+            .Where(result => !result.Online)
+            .Select(result => result.Server)
+            .ToList();
+        var onlineCount = successful.Count(result => result.Online);
 
-        return new ToolExecutionResult(true, msg, server, false, Payload: root.ToString());
+        if (scope.ScopeKind == ServerScopeKind.Single && successful.Count == 1)
+        {
+            var single = successful[0];
+            var singleMessage = single.RecentErrors is { Count: > 0 }
+                ? $"{single.Server} is {single.State}. Recent errors: {string.Join(" | ", single.RecentErrors.Take(3))}"
+                : $"{single.Server} is {single.State}. No recent errors were reported.";
+
+            return new ToolExecutionResult(
+                true,
+                singleMessage,
+                single.Server,
+                false,
+                Payload: single,
+                SelectedServers: new[] { single.Server },
+                ScopeKind: ServerScopeKind.Single);
+        }
+
+        var aggregatePayload = new AggregateStatusPayload(
+            scope.ScopeKind == ServerScopeKind.Unspecified ? ServerScopeKind.Subset : scope.ScopeKind,
+            scope.Servers,
+            onlineCount,
+            offlineServers,
+            failedServers,
+            results);
+
+        var message = $"{onlineCount}/{scope.Servers.Count} servers are online.";
+        if (offlineServers.Count > 0)
+        {
+            message += $" Offline: {string.Join(", ", offlineServers)}.";
+        }
+
+        if (failedServers.Count > 0)
+        {
+            message += $" Failed to check: {string.Join(", ", failedServers)}.";
+        }
+
+        return new ToolExecutionResult(
+            successful.Count > 0,
+            message,
+            null,
+            false,
+            successful.Count > 0 ? null : "status_check_failed",
+            aggregatePayload,
+            scope.Servers,
+            scope.ScopeKind);
+    }
+
+    private async Task<AggregateStatusServerResult> CheckServerStatusAsync(string server, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
+            var root = health.RootElement;
+            var state = ReadHealthState(root);
+            var errors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
+                ? errorsNode.EnumerateArray().Select(item => item.ToString()).Where(item => !string.IsNullOrWhiteSpace(item)).Take(3).ToList()
+                : new List<string>();
+
+            return new AggregateStatusServerResult(
+                server,
+                state,
+                IsOnlineState(state),
+                true,
+                null,
+                errors);
+        }
+        catch (Exception ex)
+        {
+            return new AggregateStatusServerResult(
+                server,
+                "unknown",
+                false,
+                false,
+                ex.Message,
+                Array.Empty<string>());
+        }
+    }
+
+    private static string ReadHealthState(JsonElement root)
+    {
+        if (root.TryGetProperty("status", out var statusNode) &&
+            statusNode.ValueKind == JsonValueKind.Object &&
+            statusNode.TryGetProperty("state", out var nestedState))
+        {
+            return nestedState.GetString() ?? "unknown";
+        }
+
+        return root.TryGetProperty("state", out var stateNode)
+            ? stateNode.GetString() ?? "unknown"
+            : "unknown";
+    }
+
+    private static bool IsOnlineState(string? state)
+    {
+        if (string.IsNullOrWhiteSpace(state))
+        {
+            return false;
+        }
+
+        return state.Equals("running", StringComparison.OrdinalIgnoreCase) ||
+               state.Equals("online", StringComparison.OrdinalIgnoreCase) ||
+               state.Equals("healthy", StringComparison.OrdinalIgnoreCase);
     }
 }
 
@@ -68,7 +182,15 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for server control actions.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.ServerControl, knownServers, allowAllServers: false),
+                null,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
         if (message.Contains("countdown") || message.Contains("in 3") || message.Contains("in three") || message.Contains("3 min"))
@@ -126,7 +248,15 @@ internal sealed class RustRconToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for RCON commands.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.RconCommand, knownServers, allowAllServers: false),
+                null,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
         var command = context.Route.Slots.CommandText;
@@ -198,7 +328,15 @@ internal sealed class RustPlayerLookupToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for player lookup.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.PlayerLookup, knownServers, allowAllServers: false),
+                null,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
         var command = context.Message.Contains("ban", StringComparison.OrdinalIgnoreCase)
@@ -258,7 +396,15 @@ internal sealed class RustLogsToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for log inspection.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.StatusCheck, knownServers, allowAllServers: true),
+                null,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
         using var logs = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/logs/tail?lines=120", cancellationToken);
@@ -337,7 +483,15 @@ internal sealed class RustPluginToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for plugin checks.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.StatusCheck, knownServers, allowAllServers: true),
+                null,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
         using var validate = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/oxide/validate", cancellationToken);
@@ -439,28 +593,52 @@ internal static class RustToolHelper
     public static async Task<string?> ResolveServerAsync(RustOpsApiClient api, ToolExecutionContext context, CancellationToken cancellationToken)
     {
         var knownServers = await GetKnownServersAsync(api, cancellationToken);
+        var scope = ResolveServerScope(
+            context,
+            knownServers,
+            allowPluralDefaultAll: false);
+        return scope.Servers.Count == 1
+            ? scope.Servers[0]
+            : null;
+    }
 
-        var routeServer = MatchKnownServer(context.Route.Slots.ServerName, knownServers);
-        if (!string.IsNullOrWhiteSpace(routeServer))
-            return routeServer;
+    public static ScopeResolution ResolveServerScope(
+        ToolExecutionContext context,
+        IReadOnlyList<string> knownServers,
+        bool allowPluralDefaultAll)
+    {
+        return ServerScopeResolver.Resolve(
+            context.Message,
+            knownServers,
+            context.SelectionState,
+            context.Route.Slots.ScopeKind,
+            context.Route.Slots.ServerNames,
+            context.Route.Slots.ServerName,
+            allowPluralDefaultAll,
+            allowLastScopeFallback: true);
+    }
 
-        var rememberedServer = MatchKnownServer(context.SelectionState.LastServerName, knownServers);
-        if (ShouldUseLastServer(context.Message) && !string.IsNullOrWhiteSpace(rememberedServer))
-            return rememberedServer;
+    public static string BuildScopeClarificationQuestion(
+        AdminIntentType intent,
+        IReadOnlyList<string> knownServers,
+        bool allowAllServers)
+    {
+        var known = knownServers.Count == 0
+            ? "No configured servers are currently available."
+            : $"Known servers: {string.Join(", ", knownServers)}.";
 
-        if (knownServers.Count == 0)
-            return rememberedServer;
-
-        var lowered = context.Message.ToLowerInvariant();
-        foreach (var server in knownServers)
+        if (!allowAllServers)
         {
-            if (lowered.Contains(server.ToLowerInvariant(), StringComparison.Ordinal))
+            return intent switch
             {
-                return server;
-            }
+                AdminIntentType.ServerControl => $"Which single server should I target? {known}",
+                AdminIntentType.RconCommand => $"Which server should receive this command? {known}",
+                AdminIntentType.PlayerLookup => $"Which server should I query for players? {known}",
+                _ => $"Which server should I use? {known}"
+            };
         }
 
-        return knownServers.Count == 1 ? knownServers[0] : null;
+        return $"Which server should I check? You can name one server or say 'all servers'. {known}";
     }
 
     public static async Task<List<string>> GetKnownServersAsync(RustOpsApiClient api, CancellationToken cancellationToken)
@@ -468,16 +646,14 @@ internal static class RustToolHelper
         try
         {
             using var list = await api.GetAsync("/servers", cancellationToken);
-            return list.RootElement.ValueKind == JsonValueKind.Array
-                ? list.RootElement.EnumerateArray()
-                    .Where(node => node.ValueKind == JsonValueKind.String)
-                    .Select(node => node.GetString())
-                    .Where(name => !string.IsNullOrWhiteSpace(name))
-                    .Select(name => name!)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-                    .ToList()
-                : new List<string>();
+            var knownServers = ParseKnownServers(list.RootElement).ToList();
+            if (knownServers.Count > 0)
+            {
+                return knownServers;
+            }
+
+            using var summary = await api.GetAsync("/servers/summary", cancellationToken);
+            return ParseSummaryServers(summary.RootElement).ToList();
         }
         catch (Exception ex)
         {
@@ -489,82 +665,62 @@ internal static class RustToolHelper
         }
     }
 
-    private static bool ShouldUseLastServer(string message)
+    internal static IReadOnlyList<string> ParseKnownServers(JsonElement root)
     {
-        var lowered = message.ToLowerInvariant();
-        return lowered.Contains("that one") ||
-               lowered.Contains("same server") ||
-               lowered.Contains("same one") ||
-               lowered.Contains("again") ||
-               lowered.Contains("restart it") ||
-               lowered.Contains("stop it") ||
-               lowered.Contains("start it") ||
-               lowered.Contains("kill it") ||
-               lowered.Contains("update it") ||
-               lowered.Contains("check it");
-    }
-
-    private static string? MatchKnownServer(string? candidate, IReadOnlyCollection<string> knownServers)
-    {
-        if (string.IsNullOrWhiteSpace(candidate))
+        if (root.ValueKind != JsonValueKind.Array)
         {
-            return null;
+            return Array.Empty<string>();
         }
 
-        var trimmed = candidate.Trim();
-        var exact = knownServers.FirstOrDefault(server => string.Equals(server, trimmed, StringComparison.OrdinalIgnoreCase));
-        if (!string.IsNullOrWhiteSpace(exact))
+        var names = new List<string>();
+        foreach (var node in root.EnumerateArray())
         {
-            return exact;
-        }
-
-        var normalizedCandidate = NormalizeServerKey(trimmed);
-        var candidateTokens = SplitServerTokens(trimmed);
-
-        return knownServers
-            .Select(server => new
+            if (node.ValueKind == JsonValueKind.String)
             {
-                Server = server,
-                Score = ScoreServerMatch(server, trimmed, normalizedCandidate, candidateTokens)
-            })
-            .Where(item => item.Score > 0)
-            .OrderByDescending(item => item.Score)
-            .ThenBy(item => item.Server.Length)
-            .Select(item => item.Server)
-            .FirstOrDefault();
-    }
+                var value = node.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    names.Add(value.Trim());
+                }
+                continue;
+            }
 
-    private static int ScoreServerMatch(string server, string trimmedCandidate, string normalizedCandidate, IReadOnlyCollection<string> candidateTokens)
-    {
-        if (server.Contains(trimmedCandidate, StringComparison.OrdinalIgnoreCase) ||
-            trimmedCandidate.Contains(server, StringComparison.OrdinalIgnoreCase))
-        {
-            return 100;
+            if (node.ValueKind == JsonValueKind.Object &&
+                node.TryGetProperty("name", out var nameNode) &&
+                nameNode.ValueKind == JsonValueKind.String)
+            {
+                var value = nameNode.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    names.Add(value.Trim());
+                }
+            }
         }
 
-        var normalizedServer = NormalizeServerKey(server);
-        if (!string.IsNullOrWhiteSpace(normalizedCandidate) &&
-            (normalizedServer.Contains(normalizedCandidate, StringComparison.OrdinalIgnoreCase) ||
-             normalizedCandidate.Contains(normalizedServer, StringComparison.OrdinalIgnoreCase)))
-        {
-            return 80;
-        }
-
-        var serverTokens = SplitServerTokens(server);
-        var shared = serverTokens.Intersect(candidateTokens, StringComparer.OrdinalIgnoreCase).Count();
-        return shared;
-    }
-
-    private static string NormalizeServerKey(string value) =>
-        new string(value.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
-
-    private static IReadOnlyCollection<string> SplitServerTokens(string value) =>
-        value
-            .Split(new[] { '-', '_', '.', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Where(token => token.Length >= 3)
-            .Select(token => token.ToLowerInvariant())
+        return names
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static IReadOnlyList<string> ParseSummaryServers(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<string>();
+        }
+
+        return root.EnumerateArray()
+            .Where(node => node.ValueKind == JsonValueKind.Object &&
+                           node.TryGetProperty("name", out var nameNode) &&
+                           nameNode.ValueKind == JsonValueKind.String)
+            .Select(node => node.GetProperty("name").GetString())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
 }
 
 internal static class RustDirectRconHelper

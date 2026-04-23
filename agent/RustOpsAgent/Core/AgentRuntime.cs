@@ -215,7 +215,8 @@ internal sealed class AgentRuntime
                     selection.Conversations.Add(state);
                 }
 
-                var route = await _classifier.ClassifyAsync(item.Message, state, cancellationToken);
+                var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+                var route = await _classifier.ClassifyAsync(item.Message, state, knownServers, cancellationToken);
                 Console.WriteLine($"[chat] {item.AdminId}: intent={route.Intent} target={route.TargetRef ?? "?"} llm={route.ClassifierSource}");
                 RecordIntentRoutingInteraction(item.Message, route);
                 var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);
@@ -231,8 +232,9 @@ internal sealed class AgentRuntime
                     composedReply.Source);
                 var reply = composedReply.Message;
 
-                UpdateSelectionState(state, route, result);
+                UpdateSelectionState(state, item.Message, route, result);
                 _neoCortex.SaveSelection(selection);
+                var primaryServer = ResolvePrimaryServer(result, route);
 
                 var operations = _neoCortex.LoadOperations();
                 operations.RuntimeStatus = new RuntimeStatus
@@ -246,7 +248,7 @@ internal sealed class AgentRuntime
                 {
                     Intent = route.Intent.ToString(),
                     Result = result.Success ? "success" : (result.ErrorCode ?? "failed"),
-                    ServerName = result.SelectedServer ?? route.Slots.ServerName,
+                    ServerName = primaryServer,
                     TimestampUtc = DateTime.UtcNow
                 });
                 operations.RecentActions = operations.RecentActions.TakeLast(100).ToList();
@@ -257,7 +259,7 @@ internal sealed class AgentRuntime
                     route.Intent.ToString().ToLowerInvariant(),
                     result.Success,
                     result.Message,
-                    result.SelectedServer ?? route.Slots.ServerName,
+                    primaryServer,
                     "chat");
 
                 if (!result.Success)
@@ -274,7 +276,7 @@ internal sealed class AgentRuntime
                         Resolved = false
                     };
                     await _neoCortex.RecordIncidentAsync(incident, cancellationToken);
-                    _legacyState.RecordIncident(result.SelectedServer ?? route.Slots.ServerName, result.ErrorCode ?? "execution_failure", result.Message);
+                    _legacyState.RecordIncident(primaryServer, result.ErrorCode ?? "execution_failure", result.Message);
 
                     if (_config.GitOps.Enabled && _config.GitOps.AllowPush)
                     {
@@ -282,7 +284,7 @@ internal sealed class AgentRuntime
                     }
                 }
 
-                WriteOutbox(item.AdminId, reply, actionId, result.SelectedServer ?? route.Slots.ServerName);
+                WriteOutbox(item.AdminId, reply, actionId, primaryServer);
             }
             catch (Exception ex)
             {
@@ -711,13 +713,79 @@ RecentErrors:
             .ToArray();
     }
 
-    private void UpdateSelectionState(ConversationSelectionState state, AdminIntentRoute route, ToolExecutionResult result)
+    private void UpdateSelectionState(ConversationSelectionState state, string message, AdminIntentRoute route, ToolExecutionResult result)
     {
         state.LastIntent = route.Intent.ToString();
-        state.LastServerName = result.SelectedServer ?? route.Slots.ServerName ?? state.LastServerName;
+        var resolvedServers = (result.SelectedServers ?? route.Slots.ServerNames ?? Array.Empty<string>())
+            .Where(server => !string.IsNullOrWhiteSpace(server))
+            .Select(server => server.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var primaryServer = ResolvePrimaryServer(result, route);
+        if (resolvedServers.Count == 0 && !string.IsNullOrWhiteSpace(primaryServer))
+        {
+            resolvedServers.Add(primaryServer!);
+        }
+
+        if (resolvedServers.Count > 0)
+        {
+            state.LastResolvedServers = resolvedServers;
+            state.LastServerName = resolvedServers[0];
+            state.LastScopeKind = result.ScopeKind != ServerScopeKind.Unspecified
+                ? result.ScopeKind
+                : route.Slots.ScopeKind != ServerScopeKind.Unspecified
+                    ? route.Slots.ScopeKind
+                    : resolvedServers.Count == 1
+                        ? ServerScopeKind.Single
+                        : ServerScopeKind.Subset;
+        }
+
         state.LastCommandText = route.Slots.CommandText ?? state.LastCommandText;
         state.LastTimeRange = route.Slots.TimeRange ?? state.LastTimeRange;
+        state.LastUserMessageSummary = TrimSingleLine(message, 180);
+        if (string.Equals(result.ErrorCode, "clarification_required", StringComparison.OrdinalIgnoreCase))
+        {
+            state.PendingClarification = new ConversationPendingClarification
+            {
+                Intent = route.Intent.ToString(),
+                TargetRef = route.TargetRef,
+                Question = result.Message,
+                ScopeKind = route.Slots.ScopeKind,
+                AskedAtUtc = DateTime.UtcNow
+            };
+        }
+        else if (route.Intent != AdminIntentType.Clarification)
+        {
+            state.PendingClarification = null;
+        }
+
         state.UpdatedAtUtc = DateTime.UtcNow;
+    }
+
+    private static string? ResolvePrimaryServer(ToolExecutionResult result, AdminIntentRoute route)
+    {
+        if (!string.IsNullOrWhiteSpace(result.SelectedServer))
+        {
+            return result.SelectedServer;
+        }
+
+        if (result.SelectedServers is { Count: > 0 })
+        {
+            return result.SelectedServers[0];
+        }
+
+        if (!string.IsNullOrWhiteSpace(route.Slots.ServerName))
+        {
+            return route.Slots.ServerName;
+        }
+
+        if (route.Slots.ServerNames is { Count: > 0 })
+        {
+            return route.Slots.ServerNames[0];
+        }
+
+        return null;
     }
 
     private void WriteOutbox(string adminId, string message, string? actionId, string? serverName)

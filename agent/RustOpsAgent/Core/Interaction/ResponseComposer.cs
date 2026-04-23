@@ -17,6 +17,30 @@ internal sealed class ResponseComposer : IResponseComposer
     public async Task<ComposedReply> ComposeAsync(ToolExecutionContext context, ToolExecutionResult result, CancellationToken cancellationToken)
     {
         var fallback = ComposeFallback(result);
+
+        if (string.Equals(result.ErrorCode, "clarification_required", StringComparison.OrdinalIgnoreCase))
+        {
+            return new ComposedReply(
+                result.Message,
+                "response-compose-clarification",
+                false,
+                false,
+                "template_clarification",
+                result.Message);
+        }
+
+        if (result.Payload is AggregateStatusPayload aggregatePayload)
+        {
+            var aggregateMessage = ComposeAggregateStatusMessage(aggregatePayload);
+            return new ComposedReply(
+                aggregateMessage,
+                "response-compose-aggregate",
+                false,
+                false,
+                "template_aggregate_status",
+                aggregateMessage);
+        }
+
         if (_kernel is null || !_settings.Enabled)
         {
             return new ComposedReply(
@@ -42,6 +66,7 @@ Requirements:
 - Start with the direct outcome.
 - Mention server and next action when relevant.
 - Do not invent facts beyond the provided data.
+- Do not mention internal routing details, error codes, or tool names.
 - Keep it under 120 words unless critical failure details require more.
 
 Context:
@@ -98,6 +123,27 @@ Return only the final reply text.
         }
 
         return $"Operation could not be completed: {result.Message}";
+    }
+
+    private static string ComposeAggregateStatusMessage(AggregateStatusPayload payload)
+    {
+        var total = payload.TargetServers.Count;
+        var parts = new List<string>
+        {
+            $"{payload.OnlineCount}/{total} servers are online."
+        };
+
+        if (payload.OfflineServers.Count > 0)
+        {
+            parts.Add($"Offline: {string.Join(", ", payload.OfflineServers)}.");
+        }
+
+        if (payload.FailedServers.Count > 0)
+        {
+            parts.Add($"Failed to check: {string.Join(", ", payload.FailedServers)}.");
+        }
+
+        return string.Join(" ", parts);
     }
 
     private string BuildSystemPrefix()

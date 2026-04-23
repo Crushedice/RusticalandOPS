@@ -1,5 +1,5 @@
-using System.Text.RegularExpressions;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.SemanticKernel;
 using RustOpsAgent.Core.Contracts;
 
@@ -16,11 +16,15 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         _settings = settings ?? new LlmSettings();
     }
 
-    public async Task<AdminIntentRoute> ClassifyAsync(string message, ConversationSelectionState state, CancellationToken cancellationToken)
+    public async Task<AdminIntentRoute> ClassifyAsync(
+        string message,
+        ConversationSelectionState state,
+        IReadOnlyList<string> knownServers,
+        CancellationToken cancellationToken)
     {
         if (_kernel is null)
         {
-            return HeuristicFallback(message, state, "heuristic_no_kernel", false, false);
+            return HeuristicFallback(message, state, knownServers, "heuristic_no_kernel", false, false);
         }
 
         var prompt = $$"""
@@ -35,12 +39,28 @@ targetRef enum:
 rust.server.control, rust.player.lookup, rust.rcon.command, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply
 
 slots object keys:
-serverName, playerName, commandText, timeRange, severity
+serverName, serverNames, scopeKind, playerName, commandText, timeRange, severity
+
+scopeKind enum:
+unspecified, single, all, subset
+
+Rules:
+- Interpret all/every/all N/all servers as scopeKind=all.
+- Preserve previous intent on correction follow-ups unless user clearly switches tasks.
+- For plural status/health questions with no explicit server names, default to all configured servers.
 
 Conversation context:
 lastServer={{state.LastServerName ?? ""}}
 lastIntent={{state.LastIntent ?? ""}}
+lastScopeKind={{state.LastScopeKind}}
+lastResolvedServers={{string.Join(", ", state.LastResolvedServers)}}
 lastCommand={{state.LastCommandText ?? ""}}
+pendingClarificationIntent={{state.PendingClarification?.Intent ?? ""}}
+pendingClarificationQuestion={{state.PendingClarification?.Question ?? ""}}
+lastUserSummary={{state.LastUserMessageSummary ?? ""}}
+
+Known servers:
+{{string.Join(", ", knownServers)}}
 
 Admin message:
 {{message}}
@@ -54,13 +74,13 @@ Admin message:
         }
         catch
         {
-            return HeuristicFallback(message, state, "heuristic_after_llm_error", true, false);
+            return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_error", true, false);
         }
 
         var json = TryExtractJson(raw);
         if (json is null)
         {
-            return HeuristicFallback(message, state, "heuristic_after_llm_parse_failure", true, false);
+            return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_parse_failure", true, false);
         }
 
         try
@@ -68,12 +88,27 @@ Admin message:
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
             var lowered = message.ToLowerInvariant();
+
             var intentText = root.TryGetProperty("intent", out var intentNode) ? intentNode.GetString() ?? "clarification" : "clarification";
             var intent = ParseIntent(intentText);
+            if (ShouldPromoteToStatusIntent(intent, lowered))
+            {
+                intent = AdminIntentType.StatusCheck;
+            }
+
+            var correctionFollowUp = IsCorrectionFollowUp(lowered);
+            if (correctionFollowUp &&
+                !HasExplicitIntentSignal(lowered) &&
+                TryParseStateIntent(state.LastIntent, out var previousIntent) &&
+                previousIntent is not (AdminIntentType.Chat or AdminIntentType.Clarification))
+            {
+                intent = previousIntent;
+            }
+
             var confidence = root.TryGetProperty("confidence", out var confidenceNode) && confidenceNode.ValueKind == JsonValueKind.Number
                 ? confidenceNode.GetDouble()
                 : 0.4;
-            var needsClarification = root.TryGetProperty("needsClarification", out var needsNode) && needsNode.ValueKind == JsonValueKind.True;
+            var llmNeedsClarification = root.TryGetProperty("needsClarification", out var needsNode) && needsNode.ValueKind == JsonValueKind.True;
             var clarification = root.TryGetProperty("clarificationQuestion", out var questionNode) ? questionNode.GetString() : null;
             var targetRef = root.TryGetProperty("targetRef", out var targetNode) ? targetNode.GetString() : null;
 
@@ -82,6 +117,8 @@ Admin message:
             string? commandText = null;
             string? timeRange = null;
             string? severity = null;
+            var scopeKind = ServerScopeKind.Unspecified;
+            List<string>? serverNames = null;
 
             if (root.TryGetProperty("slots", out var slots) && slots.ValueKind == JsonValueKind.Object)
             {
@@ -90,22 +127,57 @@ Admin message:
                 commandText = slots.TryGetProperty("commandText", out var cn) ? cn.GetString() : null;
                 timeRange = slots.TryGetProperty("timeRange", out var tn) ? tn.GetString() : null;
                 severity = slots.TryGetProperty("severity", out var sv) ? sv.GetString() : null;
+                scopeKind = slots.TryGetProperty("scopeKind", out var scopeNode)
+                    ? ParseScopeKind(scopeNode.GetString())
+                    : ServerScopeKind.Unspecified;
+
+                if (slots.TryGetProperty("serverNames", out var namesNode) && namesNode.ValueKind == JsonValueKind.Array)
+                {
+                    serverNames = namesNode
+                        .EnumerateArray()
+                        .Where(item => item.ValueKind == JsonValueKind.String)
+                        .Select(item => item.GetString())
+                        .Where(item => !string.IsNullOrWhiteSpace(item))
+                        .Select(item => item!.Trim())
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                }
             }
 
-            if (string.IsNullOrWhiteSpace(serverName) && ShouldUseLastServer(message))
-            {
-                serverName = state.LastServerName;
-            }
             if (string.IsNullOrWhiteSpace(serverName))
             {
                 serverName = ExtractServerHint(message);
             }
 
+            var allowPluralDefaultAll = intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting;
+            var scope = ServerScopeResolver.Resolve(
+                message,
+                knownServers,
+                state,
+                scopeKind,
+                serverNames,
+                serverName,
+                allowPluralDefaultAll: allowPluralDefaultAll,
+                allowLastScopeFallback: true);
+
+            serverNames = scope.Servers.ToList();
+            serverName = serverNames.Count == 1 ? serverNames[0] : null;
+            scopeKind = scope.ScopeKind;
+
             targetRef = NormalizeTargetRef(targetRef) ?? InferTargetRef(intent, lowered);
+            var needsClarification = llmNeedsClarification || (RequiresServerScope(intent) && scope.RequiresClarification);
+            if (!scope.RequiresClarification)
+            {
+                needsClarification = false;
+            }
+
+            clarification = needsClarification
+                ? BuildClarificationQuestion(intent, knownServers, clarification)
+                : null;
 
             return new AdminIntentRoute(
                 intent,
-                new AdminIntentSlots(serverName, playerName, commandText, timeRange, severity),
+                new AdminIntentSlots(serverName, playerName, commandText, timeRange, severity, scopeKind, serverNames),
                 Math.Clamp(confidence, 0.0, 1.0),
                 needsClarification,
                 clarification,
@@ -116,60 +188,148 @@ Admin message:
         }
         catch
         {
-            return HeuristicFallback(message, state, "heuristic_after_llm_json_error", true, false);
+            return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_json_error", true, false);
         }
     }
 
-    private static AdminIntentRoute HeuristicFallback(string message, ConversationSelectionState state, string source, bool llmAttempted, bool llmSucceeded)
+    private static AdminIntentRoute HeuristicFallback(
+        string message,
+        ConversationSelectionState state,
+        IReadOnlyList<string> knownServers,
+        string source,
+        bool llmAttempted,
+        bool llmSucceeded)
     {
         var lowered = message.ToLowerInvariant();
-        AdminIntentType intent;
-        if (lowered.Contains("network") || lowered.Contains("throughput") || lowered.Contains("latency") || lowered.Contains("eth0") || lowered.Contains("wg1") || lowered.Contains("wt1"))
-            intent = AdminIntentType.StatusCheck;
-        else if (lowered.Contains("plugin") || lowered.Contains("umod") || lowered.Contains("oxide"))
-            intent = AdminIntentType.Troubleshooting;
-        else if (lowered.Contains("restart") || lowered.Contains("start") || lowered.Contains("stop") || lowered.Contains("kill") || lowered.Contains("update"))
-            intent = AdminIntentType.ServerControl;
-        else if (lowered.Contains("player") || lowered.Contains("ban"))
-            intent = AdminIntentType.PlayerLookup;
-        else if (lowered.Contains("rcon") || lowered.Contains("command") || lowered.Contains("say ") || lowered.Contains("global."))
-            intent = AdminIntentType.RconCommand;
-        else if (lowered.Contains("status") || lowered.Contains("health") || lowered.Contains("logs"))
-            intent = AdminIntentType.StatusCheck;
-        else if (lowered.Contains("fix") || lowered.Contains("error") || lowered.Contains("fail"))
-            intent = AdminIntentType.Troubleshooting;
-        else
-            intent = AdminIntentType.Chat;
+        var intent = InferHeuristicIntent(lowered);
 
-        var serverName = ShouldUseLastServer(message) ? state.LastServerName : ExtractServerHint(message);
+        if (IsCorrectionFollowUp(lowered) &&
+            !HasExplicitIntentSignal(lowered) &&
+            TryParseStateIntent(state.LastIntent, out var previousIntent) &&
+            previousIntent is not (AdminIntentType.Chat or AdminIntentType.Clarification))
+        {
+            intent = previousIntent;
+        }
+
+        var hintedServer = ExtractServerHint(message);
+        var scope = ServerScopeResolver.Resolve(
+            message,
+            knownServers,
+            state,
+            ServerScopeKind.Unspecified,
+            null,
+            hintedServer,
+            allowPluralDefaultAll: intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting,
+            allowLastScopeFallback: true);
+
+        var selectedServer = scope.Servers.Count == 1 ? scope.Servers[0] : null;
+        var needsClarification = RequiresServerScope(intent) && scope.RequiresClarification;
         var targetRef = InferTargetRef(intent, lowered);
 
         return new AdminIntentRoute(
             intent,
-            new AdminIntentSlots(serverName, null, null, null, null),
+            new AdminIntentSlots(selectedServer, null, null, null, null, scope.ScopeKind, scope.Servers),
             0.4,
-            false,
-            null,
+            needsClarification,
+            needsClarification ? BuildClarificationQuestion(intent, knownServers, null) : null,
             targetRef,
             source,
             llmAttempted,
             llmSucceeded);
     }
 
-    private static bool ShouldUseLastServer(string message)
+    private static AdminIntentType InferHeuristicIntent(string lowered)
     {
-        var lowered = message.ToLowerInvariant();
-        // Only reuse the last server for explicit follow-up phrasing, not generic uses of "it" or "same".
-        return lowered.Contains("that one") ||
-               lowered.Contains("same server") ||
-               lowered.Contains("same one") ||
-               lowered.Contains("again") ||
-               lowered.Contains("restart it") ||
-               lowered.Contains("stop it") ||
-               lowered.Contains("start it") ||
-               lowered.Contains("kill it") ||
-               lowered.Contains("update it") ||
-               lowered.Contains("check it");
+        if (lowered.Contains("network") || lowered.Contains("throughput") || lowered.Contains("latency") || lowered.Contains("eth0") || lowered.Contains("wg1") || lowered.Contains("wt1"))
+            return AdminIntentType.StatusCheck;
+        if (lowered.Contains("plugin") || lowered.Contains("umod") || lowered.Contains("oxide"))
+            return AdminIntentType.Troubleshooting;
+        if (lowered.Contains("restart") || lowered.Contains("start") || lowered.Contains("stop") || lowered.Contains("kill") || lowered.Contains("update"))
+            return AdminIntentType.ServerControl;
+        if (lowered.Contains("player") || lowered.Contains("ban"))
+            return AdminIntentType.PlayerLookup;
+        if (lowered.Contains("rcon") || lowered.Contains("command") || lowered.Contains("say ") || lowered.Contains("global."))
+            return AdminIntentType.RconCommand;
+        if (lowered.Contains("status") || lowered.Contains("health") || lowered.Contains("logs") || lowered.Contains("online"))
+            return AdminIntentType.StatusCheck;
+        if (lowered.Contains("fix") || lowered.Contains("error") || lowered.Contains("fail"))
+            return AdminIntentType.Troubleshooting;
+        return AdminIntentType.Chat;
+    }
+
+    private static bool ShouldPromoteToStatusIntent(AdminIntentType intent, string loweredMessage)
+    {
+        if (intent is not (AdminIntentType.Chat or AdminIntentType.Clarification))
+        {
+            return false;
+        }
+
+        return loweredMessage.Contains("online", StringComparison.Ordinal) &&
+               loweredMessage.Contains("server", StringComparison.Ordinal);
+    }
+
+    private static bool HasExplicitIntentSignal(string loweredMessage) =>
+        loweredMessage.Contains("restart", StringComparison.Ordinal) ||
+        loweredMessage.Contains("start ", StringComparison.Ordinal) ||
+        loweredMessage.Contains("stop", StringComparison.Ordinal) ||
+        loweredMessage.Contains("kill", StringComparison.Ordinal) ||
+        loweredMessage.Contains("update", StringComparison.Ordinal) ||
+        loweredMessage.Contains("player", StringComparison.Ordinal) ||
+        loweredMessage.Contains("ban", StringComparison.Ordinal) ||
+        loweredMessage.Contains("rcon", StringComparison.Ordinal) ||
+        loweredMessage.Contains("command", StringComparison.Ordinal);
+
+    private static bool IsCorrectionFollowUp(string loweredMessage) =>
+        loweredMessage.StartsWith("no ", StringComparison.Ordinal) ||
+        loweredMessage.StartsWith("no,", StringComparison.Ordinal) ||
+        loweredMessage.StartsWith("nah", StringComparison.Ordinal) ||
+        loweredMessage.StartsWith("actually", StringComparison.Ordinal) ||
+        loweredMessage.Contains("i meant", StringComparison.Ordinal);
+
+    private static bool TryParseStateIntent(string? intentText, out AdminIntentType intent)
+    {
+        intent = AdminIntentType.Chat;
+        if (string.IsNullOrWhiteSpace(intentText))
+        {
+            return false;
+        }
+
+        var normalized = intentText.Trim();
+        if (Enum.TryParse(normalized, true, out intent))
+        {
+            return true;
+        }
+
+        intent = ParseIntent(normalized.Replace(" ", "_", StringComparison.Ordinal));
+        return intent != AdminIntentType.Clarification || normalized.Contains("clarification", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool RequiresServerScope(AdminIntentType intent) =>
+        intent is
+            AdminIntentType.ServerControl or
+            AdminIntentType.PlayerLookup or
+            AdminIntentType.RconCommand or
+            AdminIntentType.StatusCheck or
+            AdminIntentType.Troubleshooting;
+
+    private static string BuildClarificationQuestion(AdminIntentType intent, IReadOnlyList<string> knownServers, string? preferredQuestion)
+    {
+        if (!string.IsNullOrWhiteSpace(preferredQuestion))
+        {
+            return preferredQuestion.Trim();
+        }
+
+        var known = knownServers.Count == 0
+            ? "No configured servers are currently available."
+            : $"Known servers: {string.Join(", ", knownServers)}.";
+
+        return intent switch
+        {
+            AdminIntentType.ServerControl => $"Which single server should I target? {known}",
+            AdminIntentType.PlayerLookup => $"Which server should I query for players? {known}",
+            AdminIntentType.RconCommand => $"Which server should receive the RCON command? {known}",
+            _ => $"Which server should I check? You can name one server or say 'all servers'. {known}"
+        };
     }
 
     private static string? InferTargetRef(AdminIntentType intent, string loweredMessage) =>
@@ -223,6 +383,14 @@ Admin message:
             _ => targetRef
         };
     }
+
+    private static ServerScopeKind ParseScopeKind(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "single" => ServerScopeKind.Single,
+        "all" => ServerScopeKind.All,
+        "subset" => ServerScopeKind.Subset,
+        _ => ServerScopeKind.Unspecified
+    };
 
     private static AdminIntentType ParseIntent(string value) => value.ToLowerInvariant() switch
     {

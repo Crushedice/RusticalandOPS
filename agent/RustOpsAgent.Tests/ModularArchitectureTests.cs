@@ -209,9 +209,10 @@ public class ModularArchitectureTests
         var classifier = new AdminIntentClassifier(kernel: null);
         var state = new ConversationSelectionState { AdminId = "admin", LastServerName = "alpha" };
 
-        var route = await classifier.ClassifyAsync("what is it doing now", state, CancellationToken.None);
+        var route = await classifier.ClassifyAsync("what is it doing now", state, new[] { "alpha", "beta" }, CancellationToken.None);
 
         Assert.Null(route.Slots.ServerName);
+        Assert.Equal(ServerScopeKind.Unspecified, route.Slots.ScopeKind);
     }
 
     [Fact]
@@ -220,10 +221,150 @@ public class ModularArchitectureTests
         var classifier = new AdminIntentClassifier(kernel: null);
         var state = new ConversationSelectionState { AdminId = "admin" };
 
-        var route = await classifier.ClassifyAsync("can you give me the current playerlist from monthly ?", state, CancellationToken.None);
+        var route = await classifier.ClassifyAsync(
+            "can you give me the current playerlist from monthly ?",
+            state,
+            new[] { "monthly", "weekly", "alpha", "beta" },
+            CancellationToken.None);
 
         Assert.Equal(AdminIntentType.PlayerLookup, route.Intent);
         Assert.Equal("monthly", route.Slots.ServerName);
+        Assert.Equal(ServerScopeKind.Single, route.Slots.ScopeKind);
         Assert.False(route.LlmAttempted);
+    }
+
+    [Fact]
+    public async Task Classifier_Resolves_All_Servers_For_Collective_Status_Request()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+        var known = new[] { "monthly", "weekly", "sandbox", "staging" };
+
+        var route = await classifier.ClassifyAsync("are all servers online?", state, known, CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.StatusCheck, route.Intent);
+        Assert.Equal(ServerScopeKind.All, route.Slots.ScopeKind);
+        Assert.Equal(4, route.Slots.ServerNames!.Count);
+        Assert.False(route.NeedsClarification);
+    }
+
+    [Fact]
+    public async Task Classifier_Preserves_Previous_Intent_On_Scope_Correction_FollowUp()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null);
+        var state = new ConversationSelectionState
+        {
+            AdminId = "admin",
+            LastIntent = AdminIntentType.StatusCheck.ToString(),
+            PendingClarification = new ConversationPendingClarification
+            {
+                Intent = AdminIntentType.StatusCheck.ToString(),
+                Question = "Which server should I check?"
+            }
+        };
+        var known = new[] { "monthly", "weekly", "sandbox", "staging" };
+
+        var route = await classifier.ClassifyAsync("no, I meant all 4 servers", state, known, CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.StatusCheck, route.Intent);
+        Assert.Equal(ServerScopeKind.All, route.Slots.ScopeKind);
+        Assert.False(route.NeedsClarification);
+    }
+
+    [Fact]
+    public async Task Classifier_Clarifies_For_Ambiguous_Single_Server_Status_Question()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var route = await classifier.ClassifyAsync(
+            "is server online?",
+            state,
+            new[] { "monthly", "weekly", "sandbox", "staging" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.StatusCheck, route.Intent);
+        Assert.True(route.NeedsClarification);
+        Assert.Equal(ServerScopeKind.Unspecified, route.Slots.ScopeKind);
+    }
+
+    [Fact]
+    public void RustToolHelper_Parses_KnownServers_From_String_And_Object_Api_Shapes()
+    {
+        using var stringDoc = JsonDocument.Parse("""["monthly","weekly"]""");
+        using var objectDoc = JsonDocument.Parse("""[{"name":"monthly","configExists":true},{"name":"weekly","configExists":true}]""");
+
+        var fromStrings = RustToolHelper.ParseKnownServers(stringDoc.RootElement);
+        var fromObjects = RustToolHelper.ParseKnownServers(objectDoc.RootElement);
+
+        Assert.Equal(new[] { "monthly", "weekly" }, fromStrings);
+        Assert.Equal(new[] { "monthly", "weekly" }, fromObjects);
+    }
+
+    [Fact]
+    public async Task ActionExecutor_Does_Not_Block_Status_Handler_On_Clarification_Flag()
+    {
+        var handler = new PassThroughStatusHandler();
+        var registry = new ToolRegistry(new IToolHandler[] { handler });
+        var executor = new ActionExecutor(registry);
+        var route = new AdminIntentRoute(
+            AdminIntentType.StatusCheck,
+            new AdminIntentSlots(null, null, null, null, null, ServerScopeKind.All, new[] { "monthly", "weekly" }),
+            0.7,
+            true,
+            "Which server?",
+            "rust.status.check");
+
+        var result = await executor.ExecuteAsync(
+            new ToolExecutionContext("admin", "all servers?", route, new ConversationSelectionState(), DateTime.UtcNow),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("status-handler-ran", result.Message);
+    }
+
+    [Fact]
+    public async Task ResponseComposer_Formats_Aggregate_Status_Directly()
+    {
+        var composer = new ResponseComposer(kernel: null, new LlmSettings { Enabled = false });
+        var route = new AdminIntentRoute(
+            AdminIntentType.StatusCheck,
+            new AdminIntentSlots(null, null, null, null, null, ServerScopeKind.All, new[] { "monthly", "weekly", "sandbox", "staging" }),
+            0.9,
+            false,
+            null,
+            "rust.status.check");
+        var context = new ToolExecutionContext("admin", "are all servers online?", route, new ConversationSelectionState(), DateTime.UtcNow);
+        var payload = new AggregateStatusPayload(
+            ServerScopeKind.All,
+            new[] { "monthly", "weekly", "sandbox", "staging" },
+            3,
+            new[] { "sandbox" },
+            new[] { "staging" },
+            new[]
+            {
+                new AggregateStatusServerResult("monthly", "running", true, true),
+                new AggregateStatusServerResult("weekly", "running", true, true),
+                new AggregateStatusServerResult("sandbox", "offline", false, true),
+                new AggregateStatusServerResult("staging", "unknown", false, false, "timeout")
+            });
+
+        var composed = await composer.ComposeAsync(
+            context,
+            new ToolExecutionResult(true, "ignored", Payload: payload, SelectedServers: payload.TargetServers, ScopeKind: ServerScopeKind.All),
+            CancellationToken.None);
+
+        Assert.StartsWith("3/4 servers are online.", composed.Message);
+        Assert.Contains("Offline: sandbox.", composed.Message);
+        Assert.Contains("Failed to check: staging.", composed.Message);
+    }
+
+    private sealed class PassThroughStatusHandler : IToolHandler
+    {
+        public string Name => "rust.status.check";
+        public IReadOnlyCollection<AdminIntentType> EligibleIntents => new[] { AdminIntentType.StatusCheck };
+
+        public Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken) =>
+            Task.FromResult(new ToolExecutionResult(true, "status-handler-ran"));
     }
 }

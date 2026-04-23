@@ -1,0 +1,23 @@
+{
+  "steam": {
+    "username": "${RUSTOPS_STEAM_USERNAME}",
+    "password": "${RUSTOPS_STEAM_PASSWORD}",
+    "personaName": "Rusticaland Ops",
+    "adminSteamIds": []
+  },
+  "api": {
+    "baseUrl": "${RUSTOPS_API_BASE_URL}",
+    "apiKey": "${RUSTMGR_API_KEY}"
+  },
+  "agent": {
+    "statePath": "${RUSTOPS_AGENT_STATE_PATH}",
+    "feedbackInboxPath": "${RUSTOPS_FEEDBACK_INBOX_PATH}",
+    "decisionInboxPath": "${RUSTOPS_DECISION_INBOX_PATH}",
+    "chatInboxPath": "${RUSTOPS_CHAT_INBOX_PATH}",
+    "messageOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_PATH}",
+    "sentOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_SENT_PATH}",
+    "deadLetterPath": "${RUSTOPS_STEAM_DEADLETTER_PATH}",
+    "outboxPollSeconds": 3,
+    "outboxMaxRetries": 5
+  }
+}

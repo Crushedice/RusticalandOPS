@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/rust-manager/agent/RustOpsAgent
-ExecStart=/usr/bin/dotnet /opt/rust-manager/agent/RustOpsAgent/RustOpsAgent.dll /opt/rust-manager/agent/RustOpsAgent/agentsettings.json
+ExecStart=/usr/bin/dotnet /opt/rust-manager/agent/RustOpsAgent/RustOpsAgent.dll --config /opt/rust-manager/agent/RustOpsAgent/agentsettings.json
 Restart=always
 RestartSec=5
 User=rustmgr
