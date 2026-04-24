@@ -1,7 +1,9 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.SemanticKernel;
 using RustOpsAgent.Core.Contracts;
+using RustOpsAgent.Infrastructure.Memory;
 
 namespace RustOpsAgent.Core.Interaction;
 
@@ -9,11 +11,13 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
 {
     private readonly Kernel? _kernel;
     private readonly LlmSettings _settings;
+    private readonly NeoCortexStore? _neoCortex;
 
-    public AdminIntentClassifier(Kernel? kernel, LlmSettings? settings = null)
+    public AdminIntentClassifier(Kernel? kernel, LlmSettings? settings = null, NeoCortexStore? neoCortex = null)
     {
         _kernel = kernel;
         _settings = settings ?? new LlmSettings();
+        _neoCortex = neoCortex;
     }
 
     public async Task<AdminIntentRoute> ClassifyAsync(
@@ -28,7 +32,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         }
 
         var prompt = $$"""
-{{BuildSystemPrefix()}}
+{{BuildSystemPrefix()}}{{BuildLearnedRulesSection()}}
 Return strict JSON only with keys:
 intent, confidence, needsClarification, clarificationQuestion, targetRef, slots
 
@@ -48,6 +52,8 @@ Rules:
 - Interpret all/every/all N/all servers as scopeKind=all.
 - Preserve previous intent on correction follow-ups unless user clearly switches tasks.
 - For plural status/health questions with no explicit server names, default to all configured servers.
+- "compile errors", "compile", "compilation", "plugin errors", "cs errors", "plugin issues", "oxide issues", "umod issues" → intent=troubleshooting, targetRef=rust.plugins.verify. NEVER treat "compile" as a server name.
+- Words like "issue", "issues", "problem", "problems" when paired with "plugin", "oxide", or "umod" → intent=troubleshooting, targetRef=rust.plugins.verify.
 
 Conversation context:
 lastServer={{state.LastServerName ?? ""}}
@@ -242,7 +248,7 @@ Admin message:
     {
         if (lowered.Contains("network") || lowered.Contains("throughput") || lowered.Contains("latency") || lowered.Contains("eth0") || lowered.Contains("wg1") || lowered.Contains("wt1"))
             return AdminIntentType.StatusCheck;
-        if (lowered.Contains("plugin") || lowered.Contains("umod") || lowered.Contains("oxide"))
+        if (lowered.Contains("plugin") || lowered.Contains("umod") || lowered.Contains("oxide") || lowered.Contains("compile") || lowered.Contains("compilation"))
             return AdminIntentType.Troubleshooting;
         if (lowered.Contains("restart") || lowered.Contains("start") || lowered.Contains("stop") || lowered.Contains("kill") || lowered.Contains("update"))
             return AdminIntentType.ServerControl;
@@ -350,7 +356,8 @@ Admin message:
             return "rust.network.inspect";
         }
 
-        if (loweredMessage.Contains("plugin") || loweredMessage.Contains("umod") || loweredMessage.Contains("oxide"))
+        if (loweredMessage.Contains("compile") || loweredMessage.Contains("compilation") ||
+            loweredMessage.Contains("plugin") || loweredMessage.Contains("umod") || loweredMessage.Contains("oxide"))
         {
             return "rust.plugins.verify";
         }
@@ -428,6 +435,23 @@ Admin message:
         }
 
         return null;
+    }
+
+    private string BuildLearnedRulesSection()
+    {
+        if (_neoCortex is null) return string.Empty;
+        try
+        {
+            var knowledge = _neoCortex.LoadClassifierKnowledge();
+            if (knowledge.LearnedRules.Count == 0) return string.Empty;
+
+            var sb = new StringBuilder("Learned from admin corrections (highest priority):\n");
+            foreach (var rule in knowledge.LearnedRules.TakeLast(20))
+                sb.AppendLine($"- {rule.Rule}");
+            sb.AppendLine();
+            return sb.ToString();
+        }
+        catch { return string.Empty; }
     }
 
     private string BuildSystemPrefix()

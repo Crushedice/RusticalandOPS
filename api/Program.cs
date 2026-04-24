@@ -3266,6 +3266,8 @@ static string BuildDashboardHtml() => """
         <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
         <div class="card"><h2>Capability Gaps <span class="legend" data-tip="Patterns the agent recorded when it could not fulfill a request. Each entry feeds the self-repair evolution cycle to propose a concrete improvement.">?</span></h2><div id="capabilityGaps" class="list"></div></div>
         <div class="card"><h2>Evolution History <span class="legend" data-tip="Each entry is one self-repair cycle: how many bounded actions were applied, what they changed, and the LLM reasoning behind the decision.">?</span></h2><div id="selfRepairHistory" class="list"></div></div>
+        <div class="card"><h2>Server Console <span class="legend" data-tip="Live error counts per server pulled from the agent's console monitor. Errors are deduplicated and counted since the last agent restart.">?</span></h2><div id="consoleStats" class="list"></div></div>
+        <div class="card"><h2>Player Chat <span class="legend" data-tip="Stats computed from the player chat stream the agent reads in real time. Word counts cover today's messages only. Sentiment is updated every 30 minutes by the LLM.">?</span></h2><div id="chatStats" class="list"></div></div>
         <div class="card wide"><h2>Incident Feedback <span class="legend" data-tip="Each row is an incident the agent recorded when it failed to fulfill a request. Use the verdict buttons and note field to give the agent real feedback — it reads this to improve future handling.">?</span></h2><div id="incidentFeedbackStatus" class="muted" style="margin-bottom:10px;">Loading incidents…</div><div id="incidentFeedbackList" class="list"></div></div>
         <div class="card"><h2>Agent Log Rules <span class="legend" data-tip="Edit JSON arrays here.\nignoreContains: always ignore these substrings.\nstartupIgnoreContains: ignore only during startup window.\nincidentContains: always elevate these substrings.\nExample:\n{\n  &quot;ignoreContains&quot;: [&quot;known noise&quot;],\n  &quot;startupIgnoreContains&quot;: [&quot;shader unsupported&quot;],\n  &quot;incidentContains&quot;: [&quot;Error while compiling&quot;]\n}">?</span></h2><div id="rulesMeta" class="muted">Not loaded.</div><textarea id="rulesEditor" spellcheck="false" style="margin-top:12px;"></textarea><div class="toolbar"><div id="rulesSaveStatus" class="muted">No changes saved yet.</div><button id="saveRules">Save Rules</button></div></div>
         <div class="card"><h2>Command Policy <span class="legend" data-tip="Controls whether the agent can execute raw server commands.\nIf Free mode is disabled, only allowlisted commands can be executed.\nChanges apply after restarting rustopsagent.service.">?</span></h2><div id="commandConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="commandEnabled" type="checkbox"> Command execution enabled</label><label class="check"><input id="commandFreeMode" type="checkbox"> Free mode (no allowlist restriction)</label></div><div class="row" style="margin-top:12px;"><div><label for="commandDefaultWaitMs" class="tiny muted">Default wait (ms)</label><input id="commandDefaultWaitMs" type="number" min="200" max="20000" step="100"></div><div><label for="commandMaxWaitMs" class="tiny muted">Max wait (ms)</label><input id="commandMaxWaitMs" type="number" min="500" max="30000" step="100"></div></div><div class="row" style="margin-top:12px;"><div><label for="commandMaxOutputChars" class="tiny muted">Max output chars</label><input id="commandMaxOutputChars" type="number" min="500" max="64000" step="100"></div></div><div style="margin-top:12px;"><label for="commandAllowList" class="tiny muted">Allowlist (comma/line separated)</label><textarea id="commandAllowList" spellcheck="false" style="min-height:140px;"></textarea></div><div class="toolbar"><div id="commandSaveStatus" class="muted">No changes saved yet.</div><button id="saveCommandConfig">Save Command Policy</button></div></div>
@@ -3419,13 +3421,15 @@ static string BuildDashboardHtml() => """
     async function load() {
       localStorage.setItem('rustops.apiKey', keyInput.value.trim());
       try {
-        const [summary, _, llmSummary, llmConfig, commandConfig] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config')]);
+        const [summary, _, llmSummary, llmConfig, commandConfig, consoleData, chatData] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config'), fetchJson('/agent/console-monitor').catch(() => ({})), fetchJson('/agent/player-chat/recent').catch(() => ({}))]);
         $('stamp').textContent = `Updated ${fmt(summary.generatedAtUtc)} | API ${summary.host.bindUrl}`;
         $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'configured via rustmgr'), metric('Online', summary.counts?.onlineServers ?? 0, 'currently running'), metric('Pending Actions', summary.counts?.pendingActions ?? 0, 'agent approval queue'), metric('Incidents', summary.counts?.incidents ?? 0, 'recent tracked issues'), metric('Outbox', summary.counts?.messageOutbox ?? 0, 'messages waiting for Steam'), metric('LLM Calls', (summary.llmInteractions || []).length, 'recent recorded interactions'), metric('Capability Gaps', summary.counts?.capabilityGaps ?? 0, 'unfulfilled request patterns'), metric('Evolution Runs', summary.counts?.selfRepairRuns ?? 0, 'agent improvement cycles')].join('');
         renderServers(summary.servers || []);
         renderAgent(summary);
         renderLlm(summary, llmSummary, llmConfig);
         renderCommandConfig(commandConfig);
+        renderConsoleStats(consoleData);
+        renderChatStats(chatData);
       } catch (error) { alert(`Dashboard request failed: ${error.message}`); }
     }
 
@@ -3462,6 +3466,54 @@ static string BuildDashboardHtml() => """
         $('commandSaveStatus').textContent = `Saved ${new Date().toLocaleString()} | restart rustopsagent.service`;
         await load();
       } catch (error) { alert(`Failed to save command policy: ${error.message}`); }
+    }
+
+    function renderConsoleStats(data) {
+      const servers = data?.servers || {};
+      const entries = Object.entries(servers);
+      if (entries.length === 0) { $('consoleStats').innerHTML = '<div class="muted">No console data yet.</div>'; return; }
+      $('consoleStats').innerHTML = entries.map(([name, s]) => {
+        const topErrors = (s.recentErrors || []).sort((a, b) => b.count - a.count).slice(0, 3);
+        const topHtml = topErrors.length ? topErrors.map(e => `<div class="muted" style="margin-top:4px;font-size:12px;">• ${esc(e.message.length > 70 ? e.message.slice(0,70)+'…' : e.message)} <span style="color:var(--accent)">(${e.count}x)</span></div>`).join('') : '<div class="muted" style="font-size:12px;">No errors recorded.</div>';
+        const total = s.totalErrorsIngested ?? 0;
+        return `<div class="item"><div style="font-weight:700;">${esc(name)}</div><div class="muted" style="margin-top:4px;font-size:12px;">${total} error${total !== 1 ? 's' : ''} ingested total</div>${topHtml}</div>`;
+      }).join('');
+    }
+
+    function renderChatStats(data) {
+      const messages = data?.recentMessages || [];
+      const score = data?.sentimentScore;
+      const label = data?.sentimentLabel || 'unknown';
+      const summary = data?.sentimentSummary || '';
+      const themes = (data?.keyThemes || []).slice(0, 5);
+      const feedback = (data?.constructiveFeedback || []).slice(0, 3);
+
+      const today = new Date().toDateString();
+      const todayMsgs = messages.filter(m => m.capturedAtUtc && new Date(m.capturedAtUtc).toDateString() === today);
+
+      // Word frequency (excluding common stopwords)
+      const stopwords = new Set(['the','and','to','a','in','i','you','is','it','of','for','on','that','this','was','are','with','he','she','they','we','be','at','by','not','my','have','had','has','do','me','can','get','just','so','go','up','got','did','yeah','ok','im','its','but','no','yes','hey','lol','gg','wtf','idk']);
+      const freq = {};
+      for (const m of messages) { for (const [w] of ((m.message||'').toLowerCase().matchAll(/\b[a-z]{3,}\b/g))) { if (!stopwords.has(w)) freq[w] = (freq[w]||0) + 1; } }
+      const topWords = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,8);
+
+      // Fun word counts for today
+      const funWords = ['fuck','shit','damn','noob','toxic','cheater','hacker','cope','seethe'];
+      const funStats = funWords.map(w => [w, todayMsgs.filter(m=>(m.message||'').toLowerCase().includes(w)).length]).filter(([,c])=>c>0);
+
+      const scoreColor = score == null ? 'var(--muted)' : score >= 6 ? '#4caf50' : score >= 4 ? '#ff9800' : '#f44336';
+      const scoreHtml = score != null ? `<span style="color:${scoreColor};font-weight:700;">${score.toFixed(1)}/10</span> <span class="muted">${esc(label)}</span>` : '<span class="muted">Not yet analysed</span>';
+
+      const parts = [
+        `<div class="item"><div style="font-weight:700;">Sentiment</div><div style="margin-top:6px;">${scoreHtml}</div>${summary ? `<div class="muted" style="margin-top:4px;font-size:12px;">${esc(summary)}</div>` : ''}</div>`,
+        `<div class="item"><div style="font-weight:700;">Volume</div><div class="muted" style="margin-top:6px;font-size:12px;">${messages.length} messages total &nbsp;·&nbsp; ${todayMsgs.length} today</div></div>`,
+      ];
+      if (themes.length) parts.push(`<div class="item"><div style="font-weight:700;">Key Themes</div><div class="muted" style="margin-top:6px;font-size:12px;">${themes.map(t=>esc(t)).join(' · ')}</div></div>`);
+      if (feedback.length) parts.push(`<div class="item"><div style="font-weight:700;">Player Feedback</div>${feedback.map(f=>`<div class="muted" style="margin-top:4px;font-size:12px;">• ${esc(f)}</div>`).join('')}</div>`);
+      if (topWords.length) parts.push(`<div class="item"><div style="font-weight:700;">Top Words</div><div style="margin-top:6px;font-size:12px;">${topWords.map(([w,c])=>`<span style="margin-right:10px;">${esc(w)} <span class="muted">${c}</span></span>`).join('')}</div></div>`);
+      if (funStats.length) parts.push(`<div class="item"><div style="font-weight:700;">Today's Fun Facts</div>${funStats.map(([w,c])=>`<div class="muted" style="margin-top:4px;font-size:12px;">"${esc(w)}" said ${c}x today</div>`).join('')}</div>`);
+      if (!parts.length) { $('chatStats').innerHTML = '<div class="muted">No player chat data yet.</div>'; return; }
+      $('chatStats').innerHTML = parts.join('');
     }
 
     async function loadIncidentFeedback() {

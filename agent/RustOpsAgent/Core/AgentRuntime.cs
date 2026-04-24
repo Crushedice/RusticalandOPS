@@ -21,14 +21,17 @@ internal sealed class AgentRuntime
     private readonly IGitOpsService _gitOps;
     private readonly AutoPullService _autoPull;
     private readonly RustOpsApiClient _api;
-    private readonly Kernel? _kernel;
+    private readonly Kernel? _deepKernel;
     private readonly Dictionary<string, long> _logOffsets = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _observationFingerprints = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _appliedAffinityPids = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _compileErrorCounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _adminLocks = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastObservationAtUtc = DateTime.MinValue;
     private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
     private DateTime _lastSentimentAnalysisAtUtc = DateTime.MinValue;
+    private DateTime _lastClassifierEvolutionAtUtc = DateTime.MinValue;
+    private double? _lastKnownSentimentScore;
     private volatile bool _stop;
 
     public AgentRuntime(
@@ -52,7 +55,7 @@ internal sealed class AgentRuntime
         _gitOps = gitOps;
         _autoPull = autoPull;
         _api = api;
-        _kernel = kernel;
+        _deepKernel = kernel;
     }
 
     public void RequestStop() => _stop = true;
@@ -82,6 +85,7 @@ internal sealed class AgentRuntime
             await ObserveServersAsync(cancellationToken);
             await ReviewIncidentsAsync(cancellationToken);
             await AnalyzePlayerSentimentAsync(cancellationToken);
+            await EvolveClassifierAsync(cancellationToken);
             _legacyState.Save();
             tick++;
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
@@ -110,8 +114,9 @@ internal sealed class AgentRuntime
 
                 _legacyState.RecordFeedback(payload.AdminId, payload.ActionId, payload.Verdict, payload.Note, payload.ServerName);
 
-                // Allow admins to teach the log filter using partial-match directives.
                 var note = payload.Note ?? payload.Preference;
+
+                // Allow admins to teach the log filter using partial-match directives.
                 if (!string.IsNullOrWhiteSpace(note) && note.StartsWith("ignore ", StringComparison.OrdinalIgnoreCase))
                 {
                     var pattern = note["ignore ".Length..].Trim();
@@ -133,9 +138,32 @@ internal sealed class AgentRuntime
                     }
                 }
 
+                // Record bad-verdict feedback as a misclassification candidate for classifier evolution.
+                var isBadVerdict = string.Equals(payload.Verdict, "bad", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(payload.Verdict, "note", StringComparison.OrdinalIgnoreCase);
+                if (isBadVerdict && !string.IsNullOrWhiteSpace(note))
+                {
+                    var detectedIntent = TryFindRecentDetectedIntent();
+                    var knowledge = _neoCortex.LoadClassifierKnowledge();
+                    knowledge.PendingMisclassifications.Add(new MisclassificationRecord
+                    {
+                        AdminId = payload.AdminId,
+                        FeedbackNote = note,
+                        DetectedIntent = detectedIntent,
+                        CapturedAtUtc = DateTime.UtcNow
+                    });
+                    knowledge.PendingMisclassifications = knowledge.PendingMisclassifications.TakeLast(50).ToList();
+                    _neoCortex.SaveClassifierKnowledge(knowledge);
+                    Console.WriteLine($"[evolution] Misclassification queued: \"{note}\" (detected={detectedIntent})");
+                }
+
+                var ackMessage = isBadVerdict && !string.IsNullOrWhiteSpace(note)
+                    ? "Got it. I've noted the correction and will refine my intent understanding during the next learning cycle."
+                    : "Feedback received and applied.";
+
                 if (!string.IsNullOrWhiteSpace(payload.AdminId))
                 {
-                    WriteOutbox(payload.AdminId!, "Feedback received and applied.", payload.ActionId, payload.ServerName);
+                    WriteOutbox(payload.AdminId!, ackMessage, payload.ActionId, payload.ServerName);
                 }
             }
             catch (Exception ex)
@@ -347,14 +375,17 @@ internal sealed class AgentRuntime
                 LastLlmInteractionAtUtc = operations.LlmInteractions.FirstOrDefault()?.AtUtc,
                 UpdatedAtUtc = DateTime.UtcNow
             };
-            operations.RecentActions.Add(new ActionRecord
+            if (route.Intent is not (AdminIntentType.Chat or AdminIntentType.Clarification))
             {
-                Intent = route.Intent.ToString(),
-                Result = result.Success ? "success" : (result.ErrorCode ?? "failed"),
-                ServerName = primaryServer,
-                TimestampUtc = DateTime.UtcNow
-            });
-            operations.RecentActions = operations.RecentActions.TakeLast(100).ToList();
+                operations.RecentActions.Add(new ActionRecord
+                {
+                    Intent = route.Intent.ToString(),
+                    Result = result.Success ? "success" : (result.ErrorCode ?? "failed"),
+                    ServerName = primaryServer,
+                    TimestampUtc = DateTime.UtcNow
+                });
+                operations.RecentActions = operations.RecentActions.TakeLast(100).ToList();
+            }
             _neoCortex.SaveOperations(operations);
 
             _legacyState.RecordAction(
@@ -750,6 +781,27 @@ internal sealed class AgentRuntime
                         serverConsole.TotalErrorsIngested++;
                         serverConsole.ErrorCountSinceLastAlert++;
                         consoleChanged = true;
+
+                        // Track compile/oxide errors for learning seeding
+                        if (lowered.Contains("oxide") || lowered.Contains("compil") || lowered.Contains("error while"))
+                        {
+                            _compileErrorCounts.TryGetValue(server, out var ceCount);
+                            _compileErrorCounts[server] = ceCount + 1;
+                            if (_compileErrorCounts[server] >= _config.ConsoleMonitor.CompileErrorSeedThreshold)
+                            {
+                                _compileErrorCounts[server] = 0;
+                                var ck = _neoCortex.LoadClassifierKnowledge();
+                                ck.PendingMisclassifications.Add(new MisclassificationRecord
+                                {
+                                    FeedbackNote = $"Repeated plugin/oxide compilation errors observed on server '{server}'. Queries about errors on this server likely relate to plugin compilation.",
+                                    DetectedIntent = "observation",
+                                    CapturedAtUtc = DateTime.UtcNow
+                                });
+                                ck.PendingMisclassifications = ck.PendingMisclassifications.TakeLast(50).ToList();
+                                _neoCortex.SaveClassifierKnowledge(ck);
+                                Console.WriteLine($"[evolution] Compile/oxide observation seeded for '{server}'.");
+                            }
+                        }
                     }
 
                     // Track repeating info/debug messages
@@ -804,6 +856,14 @@ internal sealed class AgentRuntime
             if (serverConsole.ErrorCountSinceLastAlert >= _config.ConsoleMonitor.ErrorEscalationThreshold)
             {
                 Console.WriteLine($"[console] ESCALATE {server}: {serverConsole.ErrorCountSinceLastAlert} errors since last alert.");
+                var topErrors = serverConsole.RecentErrors
+                    .OrderByDescending(e => e.Count)
+                    .Take(3)
+                    .Select(e => $"  • {e.Message[..(Math.Min(e.Message.Length, 60))]} ({e.Count}x)")
+                    .ToList();
+                var alertMsg = $"[{server}] {serverConsole.ErrorCountSinceLastAlert} console errors since last alert." +
+                    (topErrors.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topErrors) : string.Empty);
+                BroadcastOutbox(alertMsg, server);
                 serverConsole.LastAlertAtUtc = DateTime.UtcNow;
                 serverConsole.ErrorCountSinceLastAlert = 0;
             }
@@ -874,7 +934,7 @@ internal sealed class AgentRuntime
         if (chat.RecentMessages.Count < 5)
             return;
 
-        if (_kernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
             return;
 
         var recent = chat.RecentMessages.TakeLast(50).ToList();
@@ -898,7 +958,7 @@ Recent player chat (newest last):
 
         try
         {
-            var response = await _kernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null) return;
@@ -923,6 +983,18 @@ Recent player chat (newest last):
             _neoCortex.SavePlayerChat(chat);
 
             Console.WriteLine($"[sentiment] Score={chat.SentimentScore:F1} Label={chat.SentimentLabel} — {chat.SentimentSummary}");
+
+            // Notify admins when sentiment drops below threshold or drops significantly from last reading
+            var score = chat.SentimentScore ?? 5.0;
+            var threshold = _config.ConsoleMonitor.SentimentAlertThreshold;
+            var dropped = _lastKnownSentimentScore.HasValue && _lastKnownSentimentScore.Value >= threshold && score < threshold;
+            if (score < threshold && (dropped || !_lastKnownSentimentScore.HasValue))
+            {
+                var themes = chat.KeyThemes.Count > 0 ? $" Themes: {string.Join(", ", chat.KeyThemes.Take(3))}." : string.Empty;
+                BroadcastOutbox($"[Player Sentiment] Score dropped to {score:F1}/10 ({chat.SentimentLabel}). {chat.SentimentSummary}{themes}", null);
+                Console.WriteLine($"[sentiment] ALERT: score {score:F1} below threshold {threshold}. Notified admins.");
+            }
+            _lastKnownSentimentScore = score;
             RecordLlmInteraction("player-sentiment", true, true, $"{recent.Count} chat messages", chat.SentimentSummary, "llm");
         }
         catch (Exception ex)
@@ -999,7 +1071,7 @@ Recent player chat (newest last):
         CancellationToken cancellationToken)
     {
         var fallbackSummary = $"{server} is {state}. Recent errors: {string.Join(" | ", recentErrors)}";
-        if (_kernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
         {
             return new ObservationAnalysis(
                 fallbackSummary,
@@ -1008,7 +1080,7 @@ Recent player chat (newest last):
                 "Review recent errors and server health details.",
                 false,
                 false,
-                _kernel is null ? "template_no_kernel" : "template_llm_disabled");
+                _deepKernel is null ? "template_no_deepKernel" : "template_llm_disabled");
         }
 
         var prompt = $$"""
@@ -1031,7 +1103,7 @@ RecentErrors:
 
         try
         {
-            var response = await _kernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (string.IsNullOrWhiteSpace(json))
@@ -1103,6 +1175,129 @@ RecentErrors:
         return token;
     }
 
+    private string TryFindRecentDetectedIntent()
+    {
+        try
+        {
+            var ops = _neoCortex.LoadOperations();
+            var recent = ops.LlmInteractions
+                .Where(i => i.Type is "intent-routing" or "intent-routing-fallback")
+                .OrderByDescending(i => i.AtUtc)
+                .FirstOrDefault();
+            return recent?.ResponsePreview ?? "unknown";
+        }
+        catch { return "unknown"; }
+    }
+
+    private async Task EvolveClassifierAsync(CancellationToken cancellationToken)
+    {
+        var interval = TimeSpan.FromMinutes(Math.Max(10, _config.Monitor.ClassifierEvolutionIntervalMinutes));
+        if (DateTime.UtcNow - _lastClassifierEvolutionAtUtc < interval)
+            return;
+
+        _lastClassifierEvolutionAtUtc = DateTime.UtcNow;
+
+        var knowledge = _neoCortex.LoadClassifierKnowledge();
+        var pending = knowledge.PendingMisclassifications.Where(m => !m.Processed).ToList();
+
+        if (pending.Count == 0)
+        {
+            Console.WriteLine("[evolution] No pending misclassifications to learn from.");
+            return;
+        }
+
+        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        {
+            Console.WriteLine("[evolution] Deep LLM unavailable — skipping classifier evolution.");
+            return;
+        }
+
+        Console.WriteLine($"[evolution] Synthesizing classifier rules from {pending.Count} correction(s).");
+
+        var corrections = string.Join("\n", pending.Select((m, i) =>
+            $"{i + 1}. Note: \"{m.FeedbackNote}\" | Prior detected intent: {m.DetectedIntent}"));
+
+        var existingRulesText = knowledge.LearnedRules.Count > 0
+            ? "Existing learned rules (do not duplicate):\n" + string.Join("\n", knowledge.LearnedRules.Select(r => $"- {r.Rule}"))
+            : "No existing learned rules.";
+
+        var prompt = $$"""
+You are improving an intent classifier for a Rust game server operations bot.
+Admin corrections indicate the bot misunderstood their intent.
+Derive concise routing rules from these corrections.
+
+Return strict JSON: { "rules": [ { "rule": "...", "rationale": "..." } ] }
+- "rule": One concise routing rule in plain English, e.g. "compile errors / compilation → intent=troubleshooting, target=rust.plugins.verify"
+- "rationale": One-sentence explanation
+- Return only NEW rules not already covered by existing ones
+- Return an empty "rules" array if corrections relate to execution failures or general dissatisfaction, not misrouting
+- Maximum 5 new rules per cycle
+
+{{existingRulesText}}
+
+Admin corrections:
+{{corrections}}
+""";
+
+        try
+        {
+            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var raw = response.GetValue<string>() ?? string.Empty;
+            var json = TryExtractJson(raw);
+            if (json is null)
+            {
+                Console.WriteLine("[evolution] LLM returned unparseable rule synthesis.");
+                return;
+            }
+
+            using var doc = JsonDocument.Parse(json);
+            if (!doc.RootElement.TryGetProperty("rules", out var rulesNode) || rulesNode.ValueKind != JsonValueKind.Array)
+            {
+                Console.WriteLine("[evolution] No rules array in LLM response.");
+                return;
+            }
+
+            var newRules = new List<LearnedClassifierRule>();
+            foreach (var ruleNode in rulesNode.EnumerateArray())
+            {
+                var rule = ruleNode.TryGetProperty("rule", out var r) ? r.GetString() : null;
+                var rationale = ruleNode.TryGetProperty("rationale", out var rat) ? rat.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(rule))
+                {
+                    newRules.Add(new LearnedClassifierRule
+                    {
+                        Rule = rule!,
+                        Rationale = rationale ?? string.Empty,
+                        LearnedAtUtc = DateTime.UtcNow
+                    });
+                }
+            }
+
+            foreach (var m in pending)
+                m.Processed = true;
+
+            knowledge.LearnedRules.AddRange(newRules);
+            knowledge.LearnedRules = knowledge.LearnedRules.TakeLast(50).ToList();
+            knowledge.LastEvolutionAtUtc = DateTime.UtcNow;
+            knowledge.EvolutionCycleCount++;
+            _neoCortex.SaveClassifierKnowledge(knowledge);
+
+            Console.WriteLine($"[evolution] Cycle #{knowledge.EvolutionCycleCount}: learned {newRules.Count} new rule(s). Total: {knowledge.LearnedRules.Count}.");
+            foreach (var r in newRules)
+                Console.WriteLine($"[evolution]   + {r.Rule}");
+
+            RecordLlmInteraction("classifier-evolution", true, true,
+                $"{pending.Count} correction(s)",
+                $"{newRules.Count} rule(s) synthesized",
+                "deep-llm");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[evolution] Classifier evolution failed: {ex.Message}");
+            RustOpsSentry.CaptureException(ex, "Classifier evolution LLM failed.", "agent.evolution");
+        }
+    }
+
     private sealed record ObservationAnalysis(
         string Summary,
         string Classification,
@@ -1139,7 +1334,7 @@ RecentErrors:
 
         Console.WriteLine($"[review] {review.OpenIncidents.Count} open incident(s) — analysing with LLM.");
 
-        if (_kernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
         {
             Console.WriteLine("[review] LLM disabled — skipping trend analysis.");
             return;
@@ -1168,7 +1363,7 @@ Open incidents (newest first):
 
         try
         {
-            var response = await _kernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null)
@@ -1377,6 +1572,24 @@ Open incidents (newest first):
             TargetAdminId = adminId,
             ServerName = serverName ?? string.Empty,
             ActionId = actionId,
+            Message = message,
+            CreatedAtUtc = DateTime.UtcNow
+        };
+
+        Directory.CreateDirectory(_config.Outbox.MessageOutboxPath);
+        var path = Path.Combine(_config.Outbox.MessageOutboxPath, $"{payload.CreatedAtUtc:yyyyMMddHHmmssfff}-chat-reply-{payload.Id}.json");
+        File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonDefaults.Default));
+    }
+
+    private void BroadcastOutbox(string message, string? serverName)
+    {
+        var payload = new AdapterMessage
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            Kind = "chat-reply",
+            Audience = "admins",
+            TargetAdminId = null,
+            ServerName = serverName ?? string.Empty,
             Message = message,
             CreatedAtUtc = DateTime.UtcNow
         };

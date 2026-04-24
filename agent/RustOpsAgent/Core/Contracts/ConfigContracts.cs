@@ -11,6 +11,7 @@ internal sealed class AgentConfig
     [JsonPropertyName("monitor")] public MonitorSettings Monitor { get; set; } = new();
     [JsonPropertyName("gitOps")] public GitOpsSettings GitOps { get; set; } = new();
     [JsonPropertyName("llm")] public LlmSettings Llm { get; set; } = new();
+    [JsonPropertyName("llmDeep")] public LlmSettings LlmDeep { get; set; } = new();
     [JsonPropertyName("autoPull")] public AutoPullSettings AutoPull { get; set; } = new();
     [JsonPropertyName("network")] public NetworkSettings Network { get; set; } = new();
     [JsonPropertyName("pluginUpdates")] public PluginUpdateSettings PluginUpdates { get; set; } = new();
@@ -47,6 +48,7 @@ internal sealed class MonitorSettings
 {
     [JsonPropertyName("pollSeconds")] public int PollSeconds { get; set; } = 10;
     [JsonPropertyName("incidentReviewIntervalMinutes")] public int IncidentReviewIntervalMinutes { get; set; } = 30;
+    [JsonPropertyName("classifierEvolutionIntervalMinutes")] public int ClassifierEvolutionIntervalMinutes { get; set; } = 60;
 }
 
 internal sealed class CommandExecutionSettings
@@ -111,6 +113,8 @@ internal sealed class ConsoleMonitorSettings
     [JsonPropertyName("repeatThreshold")] public int RepeatThreshold { get; set; } = 5;
     [JsonPropertyName("sentimentAnalysisIntervalMinutes")] public int SentimentAnalysisIntervalMinutes { get; set; } = 30;
     [JsonPropertyName("maxChatMessages")] public int MaxChatMessages { get; set; } = 200;
+    [JsonPropertyName("sentimentAlertThreshold")] public double SentimentAlertThreshold { get; set; } = 4.0;
+    [JsonPropertyName("compileErrorSeedThreshold")] public int CompileErrorSeedThreshold { get; set; } = 5;
 }
 
 internal sealed class LlmSettings

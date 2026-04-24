@@ -149,3 +149,31 @@ internal sealed class PlayerChatEntry
     [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
     [JsonPropertyName("capturedAtUtc")] public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;
 }
+
+// Classifier learning types — persist admin corrections and synthesized routing rules.
+
+internal sealed class MisclassificationRecord
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    [JsonPropertyName("originalMessage")] public string OriginalMessage { get; set; } = string.Empty;
+    [JsonPropertyName("detectedIntent")] public string DetectedIntent { get; set; } = string.Empty;
+    [JsonPropertyName("feedbackNote")] public string? FeedbackNote { get; set; }
+    [JsonPropertyName("adminId")] public string? AdminId { get; set; }
+    [JsonPropertyName("capturedAtUtc")] public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("processed")] public bool Processed { get; set; }
+}
+
+internal sealed class LearnedClassifierRule
+{
+    [JsonPropertyName("rule")] public string Rule { get; set; } = string.Empty;
+    [JsonPropertyName("rationale")] public string Rationale { get; set; } = string.Empty;
+    [JsonPropertyName("learnedAtUtc")] public DateTime LearnedAtUtc { get; set; } = DateTime.UtcNow;
+}
+
+internal sealed class ClassifierKnowledgeState
+{
+    [JsonPropertyName("learnedRules")] public List<LearnedClassifierRule> LearnedRules { get; set; } = new();
+    [JsonPropertyName("pendingMisclassifications")] public List<MisclassificationRecord> PendingMisclassifications { get; set; } = new();
+    [JsonPropertyName("lastEvolutionAtUtc")] public DateTime? LastEvolutionAtUtc { get; set; }
+    [JsonPropertyName("evolutionCycleCount")] public int EvolutionCycleCount { get; set; }
+}

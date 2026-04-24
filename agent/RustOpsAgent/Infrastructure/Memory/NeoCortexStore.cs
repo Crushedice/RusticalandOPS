@@ -18,6 +18,7 @@ internal sealed class NeoCortexStore : IEvolutionStore
     private readonly string _migrationMarkerPath;
     private readonly string _consolePath;
     private readonly string _playerChatPath;
+    private readonly string _classifierPath;
     private readonly SemaphoreSlim _incidentWriteLock = new(1, 1);
 
     public NeoCortexStore(string root, string legacyStatePath)
@@ -34,6 +35,7 @@ internal sealed class NeoCortexStore : IEvolutionStore
         _migrationMarkerPath = Path.Combine(root, ".migration-complete");
         _consolePath = Path.Combine(root, "console", "monitor.json");
         _playerChatPath = Path.Combine(root, "chat", "knowledge.json");
+        _classifierPath = Path.Combine(root, "classifier", "knowledge.json");
 
         Directory.CreateDirectory(Path.GetDirectoryName(_operationsPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_selectionPath)!);
@@ -43,6 +45,7 @@ internal sealed class NeoCortexStore : IEvolutionStore
         Directory.CreateDirectory(Path.GetDirectoryName(_cachePath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_consolePath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_playerChatPath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_classifierPath)!);
     }
 
     public void EnsureMigrated()
@@ -161,6 +164,9 @@ internal sealed class NeoCortexStore : IEvolutionStore
 
     public PlayerChatKnowledge LoadPlayerChat() => LoadJson(_playerChatPath, new PlayerChatKnowledge());
     public void SavePlayerChat(PlayerChatKnowledge knowledge) => SaveJson(_playerChatPath, knowledge);
+
+    public ClassifierKnowledgeState LoadClassifierKnowledge() => LoadJson(_classifierPath, new ClassifierKnowledgeState());
+    public void SaveClassifierKnowledge(ClassifierKnowledgeState state) => SaveJson(_classifierPath, state);
 
     // Compact (non-indented) options for JSONL — one object per line is required.
     private static readonly JsonSerializerOptions JsonlOptions = new()

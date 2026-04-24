@@ -82,6 +82,7 @@ internal sealed class OpsSteamBot
     private string? _authCode;
     private bool _isRunning;
     private DateTime _lastOutboxPollUtc = DateTime.MinValue;
+    private int _pendingChats;
 
     public OpsSteamBot(AppConfig config, RustMgrApiClient api)
     {
@@ -206,7 +207,7 @@ internal sealed class OpsSteamBot
 
         Console.WriteLine("Logged on.");
         RustOpsSentry.AddBreadcrumb("Logged on to Steam.", "steam.connection");
-        _friends.SetPersonaState(EPersonaState.Online);
+        _friends.SetPersonaState(EPersonaState.Away);
         if (!string.IsNullOrWhiteSpace(_config.Steam.PersonaName))
             _friends.SetPersonaName(_config.Steam.PersonaName);
     }
@@ -218,7 +219,7 @@ internal sealed class OpsSteamBot
 
     private void OnAccountInfo(SteamUser.AccountInfoCallback callback)
     {
-        _friends.SetPersonaState(EPersonaState.Online);
+        _friends.SetPersonaState(EPersonaState.Away);
     }
 
     private async void OnFriendMessage(SteamFriends.FriendMsgCallback callback)
@@ -242,10 +243,13 @@ internal sealed class OpsSteamBot
         try
         {
             var response = await HandleIncomingMessageAsync(senderId, text);
-            foreach (var chunk in ChunkMessage(response))
+            if (!string.IsNullOrWhiteSpace(response))
             {
-                _friends.SendChatMessage(callback.Sender, EChatEntryType.ChatMsg, chunk);
-                await Task.Delay(350);
+                foreach (var chunk in ChunkMessage(response))
+                {
+                    _friends.SendChatMessage(callback.Sender, EChatEntryType.ChatMsg, chunk);
+                    await Task.Delay(350);
+                }
             }
         }
         catch (Exception ex)
@@ -308,6 +312,16 @@ internal sealed class OpsSteamBot
 
                 ArchiveOutboxFile(path);
                 _outboxFailureCounts.Remove(path);
+
+                if (IsChatReplyOutboxFile(path))
+                {
+                    var remaining = Interlocked.Decrement(ref _pendingChats);
+                    if (remaining <= 0)
+                    {
+                        _pendingChats = 0;
+                        _friends.SetPersonaState(EPersonaState.Away);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -498,7 +512,9 @@ internal sealed class OpsSteamBot
         };
 
         WriteInboxFile(_config.Agent.ChatInboxPath, "chat", item);
-        return "Request received. I'll reply shortly.";
+        Interlocked.Increment(ref _pendingChats);
+        _friends.SetPersonaState(EPersonaState.Online);
+        return string.Empty;
     }
 
     private string GetHelpText()

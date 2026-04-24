@@ -77,7 +77,20 @@ else
 {
     Console.WriteLine($"[agent] LLM kernel ready. provider={config.Llm.Provider} model={config.Llm.Model} recommendations={config.Llm.UseForRecommendations}");
 }
-var classifier = new AdminIntentClassifier(kernel, config.Llm);
+
+// Deep kernel: used for background analysis (incident review, classifier evolution, sentiment).
+// Falls back to the fast kernel if llmDeep is not configured.
+var deepKernelConfigured = !string.IsNullOrWhiteSpace(config.LlmDeep.BaseUrl)
+    && !RustOpsEnv.HasUnresolvedPlaceholder(config.LlmDeep.BaseUrl)
+    && config.LlmDeep.Enabled;
+var deepKernel = deepKernelConfigured ? BuildKernel(config.LlmDeep) : null;
+if (deepKernel is not null)
+    Console.WriteLine($"[agent] Deep LLM kernel ready. provider={config.LlmDeep.Provider} model={config.LlmDeep.Model}");
+else
+    Console.WriteLine("[agent] Deep LLM not configured — background tasks will share the fast kernel.");
+deepKernel ??= kernel;
+
+var classifier = new AdminIntentClassifier(kernel, config.Llm, neoCortex);
 using var apiClient = new RustOpsApiClient(config.Api);
 
 if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.OrdinalIgnoreCase))
@@ -131,7 +144,7 @@ var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry);
 var composer = new ResponseComposer(kernel, config.Llm);
 
-var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, autoPull, apiClient, kernel);
+var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, autoPull, apiClient, deepKernel);
 
 Console.CancelKeyPress += (_, e) =>
 {

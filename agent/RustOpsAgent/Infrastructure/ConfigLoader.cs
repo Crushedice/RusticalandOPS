@@ -82,6 +82,31 @@ internal static class ConfigLoader
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_CHAT_SYSTEM_PROMPT", "RUSTOPS_OLLAMA_CHAT_SYSTEM_PROMPT")
             ?? RustOpsEnv.ResolvePlaceholders(config.Llm.ChatSystemPrompt ?? string.Empty);
 
+        // Deep LLM — used for background analysis, classifier evolution, and incident review.
+        // Falls back to the fast LLM if not configured.
+        config.LlmDeep.Enabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_LLM_DEEP_ENABLED", config.LlmDeep.Enabled);
+        config.LlmDeep.Provider =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_DEEP_PROVIDER")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmDeep.Provider);
+        config.LlmDeep.BaseUrl =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_DEEP_BASE_URL")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmDeep.BaseUrl);
+        config.LlmDeep.Model =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_DEEP_MODEL")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmDeep.Model);
+        config.LlmDeep.ApiKey =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_DEEP_API_KEY")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmDeep.ApiKey ?? string.Empty);
+        config.LlmDeep.HttpReferer =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_DEEP_HTTP_REFERER")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmDeep.HttpReferer ?? string.Empty);
+        config.LlmDeep.AppTitle =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_DEEP_APP_TITLE")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmDeep.AppTitle ?? string.Empty);
+        config.LlmDeep.UseForRecommendations =
+            RustOpsEnv.GetBoolean("RUSTOPS_LLM_DEEP_USE_FOR_RECOMMENDATIONS", config.LlmDeep.UseForRecommendations);
+
         config.Memory.StatePath = ResolvePath(config.Memory.StatePath, root);
         config.Memory.NeoCortexRoot = ResolvePath(config.Memory.NeoCortexRoot, root);
         config.Inbox.ChatInboxPath = ResolvePath(config.Inbox.ChatInboxPath, root);
