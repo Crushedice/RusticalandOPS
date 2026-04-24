@@ -270,6 +270,27 @@ internal sealed class AgentRuntime
 
             var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
             var route = await _classifier.ClassifyAsync(item.Message, state, knownServers, cancellationToken);
+
+            // If there's an outstanding clarification and the classifier didn't find a new intent,
+            // re-route to the handler that originally asked the question so it can process the answer.
+            var pending = state.PendingClarification;
+            if (pending is not null &&
+                (route.Intent == AdminIntentType.Clarification || route.Intent == AdminIntentType.Chat) &&
+                Enum.TryParse<AdminIntentType>(pending.Intent, true, out var pendingIntent) &&
+                pendingIntent != AdminIntentType.Clarification)
+            {
+                var serverName = route.Slots.ServerName ?? state.LastServerName;
+                var overriddenSlots = route.Slots with { ServerName = serverName };
+                route = route with
+                {
+                    Intent = pendingIntent,
+                    Slots = overriddenSlots,
+                    TargetRef = route.TargetRef ?? pending.TargetRef,
+                    ClassifierSource = route.ClassifierSource + "+pending-clarification-override"
+                };
+                Console.WriteLine($"[chat] Overriding intent to {pendingIntent} (pending clarification answer)");
+            }
+
             Console.WriteLine($"[chat] {item.AdminId}: intent={route.Intent} target={route.TargetRef ?? "?"} llm={route.ClassifierSource}");
             RecordIntentRoutingInteraction(item.Message, route);
             var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);

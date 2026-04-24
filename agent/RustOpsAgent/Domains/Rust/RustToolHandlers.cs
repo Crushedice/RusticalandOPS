@@ -181,6 +181,20 @@ internal sealed class RustServerControlToolHandler : IToolHandler
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
         var message = context.Message.ToLowerInvariant();
+
+        // If admin is answering our pending restart-countdown clarification ("60", "300 seconds", "5 min"),
+        // reconstruct the full restart intent from conversation state instead of falling through to /start.
+        var pending = context.SelectionState.PendingClarification;
+        if (pending is not null &&
+            string.Equals(pending.Intent, "ServerControl", StringComparison.OrdinalIgnoreCase) &&
+            pending.Question?.Contains("seconds", StringComparison.OrdinalIgnoreCase) == true &&
+            !string.IsNullOrWhiteSpace(context.SelectionState.LastServerName))
+        {
+            var secs = TryExtractAnyNumber(message);
+            if (secs.HasValue)
+                return await ExecuteRestartAsync(context, context.SelectionState.LastServerName, secs.Value, cancellationToken);
+        }
+
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
@@ -188,19 +202,25 @@ internal sealed class RustServerControlToolHandler : IToolHandler
             return new ToolExecutionResult(
                 false,
                 RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.ServerControl, knownServers, allowAllServers: false),
-                null,
-                false,
-                "clarification_required",
+                null, false, "clarification_required",
                 SelectedServers: context.SelectionState.LastResolvedServers,
                 ScopeKind: ServerScopeKind.Unspecified);
         }
 
         if (message.Contains("restart"))
-        {
             return await HandleRestartAsync(context, server, cancellationToken);
-        }
 
         var endpoint = ResolveEndpoint(message);
+        if (endpoint is null)
+        {
+            return new ToolExecutionResult(
+                false,
+                $"What should I do to {server}? Say start, stop, restart, kill, or update.",
+                server, false, "clarification_required",
+                SelectedServers: new[] { server },
+                ScopeKind: ServerScopeKind.Single);
+        }
+
         using var response = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(server)), new { }, cancellationToken);
         return new ToolExecutionResult(true, $"Executed {endpoint.Split('/').Last()} for {server}.", server, true, Payload: response.RootElement.ToString());
     }
@@ -217,6 +237,11 @@ internal sealed class RustServerControlToolHandler : IToolHandler
                 SelectedServers: context.SelectionState.LastResolvedServers,
                 ScopeKind: ServerScopeKind.Single);
         }
+        return await ExecuteRestartAsync(context, server, seconds.Value, cancellationToken);
+    }
+
+    private async Task<ToolExecutionResult> ExecuteRestartAsync(ToolExecutionContext context, string server, int seconds, CancellationToken cancellationToken)
+    {
 
         // Send RCON restart command (Rust's graceful countdown shutdown).
         // If RCON is unavailable, fall back to the API restart endpoint which triggers rustmgr immediately.
@@ -243,7 +268,7 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         var adminId = context.AdminId;
         var notifyAdmin = _notifyAdmin;
         var api = _api;
-        var countdownSeconds = seconds.Value;
+        var countdownSeconds = seconds;
 
         // Background task: monitor offline → online transition and notify the admin.
         _ = Task.Run(async () =>
@@ -365,12 +390,28 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         return null;
     }
 
-    private static string ResolveEndpoint(string message)
+    // Returns null when the message doesn't match a known operation — caller must handle.
+    private static string? ResolveEndpoint(string message)
     {
         if (message.Contains("kill")) return "/servers/{server}/kill";
         if (message.Contains("stop")) return "/servers/{server}/stop";
         if (message.Contains("update")) return "/servers/{server}/update";
-        return "/servers/{server}/start";
+        if (message.Contains("start")) return "/servers/{server}/start";
+        return null;
+    }
+
+    // Extracts any number from the message, preferring minute-scaled values.
+    private static int? TryExtractAnyNumber(string message)
+    {
+        var minMatch = Regex.Match(message, @"(\d+)\s*(?:minute|min)\b", RegexOptions.IgnoreCase);
+        if (minMatch.Success && int.TryParse(minMatch.Groups[1].Value, out var mins) && mins > 0)
+            return mins * 60;
+
+        var numMatch = Regex.Match(message, @"\b(\d+)\b");
+        if (numMatch.Success && int.TryParse(numMatch.Groups[1].Value, out var n) && n > 0)
+            return n;
+
+        return null;
     }
 }
 
@@ -696,7 +737,11 @@ internal sealed class RustPluginToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
     private readonly Core.Contracts.PluginUpdateSettings _settings;
-    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
+    private static readonly HttpClient _http = new(new HttpClientHandler { AllowAutoRedirect = true })
+    {
+        Timeout = TimeSpan.FromSeconds(15),
+        DefaultRequestHeaders = { { "User-Agent", "RustOpsAgent/1.0 (server-ops-bot)" } }
+    };
 
     public RustPluginToolHandler(RustOpsApiClient api, Core.Contracts.PluginUpdateSettings? settings = null)
     {
@@ -716,87 +761,132 @@ internal sealed class RustPluginToolHandler : IToolHandler
             return new ToolExecutionResult(
                 false,
                 RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.StatusCheck, knownServers, allowAllServers: true),
-                null,
-                false,
-                "clarification_required",
+                null, false, "clarification_required",
                 SelectedServers: context.SelectionState.LastResolvedServers,
                 ScopeKind: ServerScopeKind.Unspecified);
         }
 
-        using var validate = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/oxide/validate", cancellationToken);
+        var msgLow = context.Message.ToLowerInvariant();
+        var wantsCompileCheck = msgLow.Contains("error") || msgLow.Contains("fail") || msgLow.Contains("compile")
+                                || msgLow.Contains("issue") || msgLow.Contains("broken") || msgLow.Contains("check");
+        var wantsInstall = msgLow.Contains("install") || msgLow.Contains("update") || msgLow.Contains("download");
 
-        var wantsInstall = context.Message.Contains("install", StringComparison.OrdinalIgnoreCase)
-            || context.Message.Contains("update", StringComparison.OrdinalIgnoreCase)
-            || context.Message.Contains("download", StringComparison.OrdinalIgnoreCase);
-
-        var updateMessages = new List<string>();
-        var pendingDownloads = new List<(string slug, string latestVersion, string downloadUrl)>();
-
-        if (validate.RootElement.TryGetProperty("plugins", out var plugins) && plugins.ValueKind == JsonValueKind.Array)
+        // --- Step 1: RCON oxide.plugins for live compile status --------------------------------
+        if (wantsCompileCheck)
         {
-            foreach (var plugin in plugins.EnumerateArray().Take(20))
+            var rconOutput = await RustDirectRconHelper.TryExecuteAsync(server, "oxide.plugins", cancellationToken);
+            if (!string.IsNullOrWhiteSpace(rconOutput))
             {
-                var pluginName = plugin.TryGetProperty("pluginName", out var nameNode) ? nameNode.GetString() : null;
-                var pluginSlug = plugin.TryGetProperty("pluginSlug", out var slugNode) ? slugNode.GetString() : null;
-                var pluginVersion = plugin.TryGetProperty("pluginVersion", out var versionNode) ? versionNode.GetString() : null;
-                var query = !string.IsNullOrWhiteSpace(pluginSlug) ? pluginSlug : pluginName;
-                if (string.IsNullOrWhiteSpace(query))
-                    continue;
-
-                var escaped = Uri.EscapeDataString(query);
-                var searchUrl = string.Format(_settings.SearchUrlTemplate, escaped, _settings.SearchFilter);
-                try
+                var lines = rconOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                var failed = lines.Where(l => l.Contains("failed to compile", StringComparison.OrdinalIgnoreCase)).ToList();
+                if (failed.Count > 0)
                 {
-                    using var stream = await _http.GetStreamAsync(searchUrl, cancellationToken);
-                    using var responseDoc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-                    if (!responseDoc.RootElement.TryGetProperty("data", out var data)
-                        || data.ValueKind != JsonValueKind.Array
-                        || data.GetArrayLength() == 0)
-                    {
-                        updateMessages.Add($"{query}: not on uMod");
-                        continue;
-                    }
-
-                    var entry = data[0];
-                    var latest = entry.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
-                    var downloadUrl = entry.TryGetProperty("download_url", out var dlNode) ? dlNode.GetString() : null;
-
-                    if (string.IsNullOrWhiteSpace(latest) || string.Equals(latest, pluginVersion, StringComparison.OrdinalIgnoreCase))
-                    {
-                        updateMessages.Add($"{query}: up to date ({pluginVersion ?? "?"})");
-                    }
-                    else
-                    {
-                        updateMessages.Add($"{query}: {pluginVersion ?? "?"} → {latest}");
-                        if (!string.IsNullOrWhiteSpace(downloadUrl))
-                            pendingDownloads.Add((query, latest, downloadUrl));
-                    }
+                    return new ToolExecutionResult(true,
+                        $"[{server}] {failed.Count} plugin(s) failed to compile:\n{string.Join('\n', failed)}",
+                        server, false);
                 }
-                catch (Exception ex)
-                {
-                    updateMessages.Add($"{query}: check failed ({ex.GetType().Name})");
-                }
+
+                var totalLoaded = lines.Count(l => l.TrimStart().StartsWith('[') || Regex.IsMatch(l, @"^\s*\w.*\(\d+ms\)"));
+                var summary = $"[{server}] All plugins loaded OK ({totalLoaded} reported). No compile errors.";
+                if (!wantsInstall)
+                    return new ToolExecutionResult(true, summary, server, false);
             }
         }
 
-        var summary = updateMessages.Count > 0
-            ? string.Join(" | ", updateMessages)
-            : "No plugin metadata available.";
-
-        // Download and stage updates if enabled and admin asked for it
-        if (wantsInstall && _settings.DownloadEnabled && pendingDownloads.Count > 0)
+        // --- Step 2: oxide/validate for file-level info + uMod version check ----------------
+        JsonDocument? validate = null;
+        try
         {
-            var staged = await StageDownloadsAsync(server, pendingDownloads, cancellationToken);
-            return new ToolExecutionResult(true,
-                $"Plugin check for {server}: {summary}\n{staged}",
-                server, false);
+            validate = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/oxide/validate", cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return new ToolExecutionResult(false,
+                $"Could not reach oxide/validate for {server}: {ex.Message}",
+                server, false, "api_error");
         }
 
-        var actionHint = pendingDownloads.Count > 0 && _settings.DownloadEnabled
-            ? $" ({pendingDownloads.Count} update(s) available — say 'install updates' to apply)"
-            : string.Empty;
+        using (validate)
+        {
+            var updateMessages = new List<string>();
+            var pendingDownloads = new List<(string slug, string latestVersion, string downloadUrl)>();
 
-        return new ToolExecutionResult(true, $"Plugin check for {server}: {summary}{actionHint}", server, false);
+            if (validate.RootElement.TryGetProperty("plugins", out var plugins) && plugins.ValueKind == JsonValueKind.Array)
+            {
+                // Show any file-level issues from the validator
+                var fileIssues = plugins.EnumerateArray()
+                    .Where(p => p.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False)
+                    .Select(p => $"{(p.TryGetProperty("pluginName", out var n) ? n.GetString() : "?")}: {(p.TryGetProperty("message", out var m) ? m.GetString() : "validation error")}")
+                    .ToList();
+
+                foreach (var plugin in plugins.EnumerateArray().Take(20))
+                {
+                    var pluginName = plugin.TryGetProperty("pluginName", out var nameNode) ? nameNode.GetString() : null;
+                    var pluginSlug = plugin.TryGetProperty("pluginSlug", out var slugNode) ? slugNode.GetString() : null;
+                    var pluginVersion = plugin.TryGetProperty("pluginVersion", out var versionNode) ? versionNode.GetString() : null;
+                    var query = !string.IsNullOrWhiteSpace(pluginSlug) ? pluginSlug : pluginName;
+                    if (string.IsNullOrWhiteSpace(query)) continue;
+
+                    var searchUrl = string.Format(_settings.SearchUrlTemplate, Uri.EscapeDataString(query), _settings.SearchFilter);
+                    try
+                    {
+                        using var httpResponse = await _http.GetAsync(searchUrl, cancellationToken);
+                        if (!httpResponse.IsSuccessStatusCode)
+                        {
+                            updateMessages.Add($"{query}: uMod returned {(int)httpResponse.StatusCode}");
+                            continue;
+                        }
+
+                        using var responseDoc = await JsonDocument.ParseAsync(
+                            await httpResponse.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
+
+                        if (!responseDoc.RootElement.TryGetProperty("data", out var data)
+                            || data.ValueKind != JsonValueKind.Array
+                            || data.GetArrayLength() == 0)
+                        {
+                            updateMessages.Add($"{query}: not found on uMod");
+                            continue;
+                        }
+
+                        var entry = data[0];
+                        var latest = entry.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+                        var downloadUrl = entry.TryGetProperty("download_url", out var dlNode) ? dlNode.GetString() : null;
+
+                        if (string.IsNullOrWhiteSpace(latest) || string.Equals(latest, pluginVersion, StringComparison.OrdinalIgnoreCase))
+                            updateMessages.Add($"{query}: up to date ({pluginVersion ?? "?"})");
+                        else
+                        {
+                            updateMessages.Add($"{query}: {pluginVersion ?? "?"} → {latest}");
+                            if (!string.IsNullOrWhiteSpace(downloadUrl))
+                                pendingDownloads.Add((query, latest, downloadUrl));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        updateMessages.Add($"{query}: check failed ({ex.Message.Split('\n')[0]})");
+                    }
+                }
+
+                if (fileIssues.Count > 0)
+                    updateMessages.Insert(0, $"FILE ISSUES: {string.Join(" | ", fileIssues)}");
+            }
+
+            var versionSummary = updateMessages.Count > 0
+                ? string.Join(" | ", updateMessages)
+                : "No plugin files found at the configured oxide path.";
+
+            if (wantsInstall && _settings.DownloadEnabled && pendingDownloads.Count > 0)
+            {
+                var staged = await StageDownloadsAsync(server, pendingDownloads, cancellationToken);
+                return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}\n{staged}", server, false);
+            }
+
+            var actionHint = pendingDownloads.Count > 0 && _settings.DownloadEnabled
+                ? $" ({pendingDownloads.Count} update(s) available — say 'install updates' to apply)"
+                : string.Empty;
+
+            return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}{actionHint}", server, false);
+        }
     }
 
     private async Task<string> StageDownloadsAsync(
