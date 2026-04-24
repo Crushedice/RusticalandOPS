@@ -11,6 +11,10 @@ internal sealed class AgentConfig
     [JsonPropertyName("monitor")] public MonitorSettings Monitor { get; set; } = new();
     [JsonPropertyName("gitOps")] public GitOpsSettings GitOps { get; set; } = new();
     [JsonPropertyName("llm")] public LlmSettings Llm { get; set; } = new();
+    [JsonPropertyName("autoPull")] public AutoPullSettings AutoPull { get; set; } = new();
+    [JsonPropertyName("network")] public NetworkSettings Network { get; set; } = new();
+    [JsonPropertyName("pluginUpdates")] public PluginUpdateSettings PluginUpdates { get; set; } = new();
+    [JsonPropertyName("commandExecution")] public CommandExecutionSettings CommandExecution { get; set; } = new();
 }
 
 internal sealed class ApiSettings
@@ -40,6 +44,16 @@ internal sealed class OutboxSettings
 internal sealed class MonitorSettings
 {
     [JsonPropertyName("pollSeconds")] public int PollSeconds { get; set; } = 10;
+    [JsonPropertyName("incidentReviewIntervalMinutes")] public int IncidentReviewIntervalMinutes { get; set; } = 30;
+}
+
+internal sealed class CommandExecutionSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("freeMode")] public bool FreeMode { get; set; }
+    [JsonPropertyName("allowList")] public List<string> AllowList { get; set; } = new() { "playerlist", "serverinfo", "bans", "oxide.plugins", "status", "version" };
+    [JsonPropertyName("autoAllowAfterSuccesses")] public int AutoAllowAfterSuccesses { get; set; } = 5;
+    [JsonPropertyName("requireApprovalAfterFailures")] public int RequireApprovalAfterFailures { get; set; } = 2;
 }
 
 internal sealed class GitOpsSettings
@@ -50,6 +64,35 @@ internal sealed class GitOpsSettings
     [JsonPropertyName("baseBranch")] public string BaseBranch { get; set; } = "main";
     [JsonPropertyName("pushBranchPrefix")] public string PushBranchPrefix { get; set; } = "agent/";
     [JsonPropertyName("allowPush")] public bool AllowPush { get; set; }
+}
+
+internal sealed class AutoPullSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    [JsonPropertyName("intervalMinutes")] public int IntervalMinutes { get; set; } = 60;
+    [JsonPropertyName("repoPath")] public string RepoPath { get; set; } = "/opt/rust-manager/src";
+    [JsonPropertyName("remoteName")] public string RemoteName { get; set; } = "origin";
+    [JsonPropertyName("branchName")] public string BranchName { get; set; } = "main";
+    [JsonPropertyName("buildEnabled")] public bool BuildEnabled { get; set; }
+    [JsonPropertyName("buildScript")] public string BuildScript { get; set; } = "Agent-Build.sh";
+    [JsonPropertyName("restartEnabled")] public bool RestartEnabled { get; set; }
+    [JsonPropertyName("serviceName")] public string ServiceName { get; set; } = "rustopsagent";
+}
+
+internal sealed class NetworkSettings
+{
+    [JsonPropertyName("trackedInterfaces")] public List<string> TrackedInterfaces { get; set; } = new() { "eth0", "wt1", "wg1" };
+}
+
+internal sealed class PluginUpdateSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("checkIntervalMinutes")] public int CheckIntervalMinutes { get; set; } = 60;
+    [JsonPropertyName("notifyAdmins")] public bool NotifyAdmins { get; set; } = true;
+    [JsonPropertyName("searchUrlTemplate")] public string SearchUrlTemplate { get; set; } = "https://umod.org/plugins/search.json?query={0}&page=1&sort=title&sortdir=asc&filter={1}";
+    [JsonPropertyName("searchFilter")] public string SearchFilter { get; set; } = "rust";
+    [JsonPropertyName("downloadEnabled")] public bool DownloadEnabled { get; set; }
+    [JsonPropertyName("stagingPath")] public string StagingPath { get; set; } = "data/plugin-staging";
 }
 
 internal sealed class LlmSettings

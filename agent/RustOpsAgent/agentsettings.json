@@ -10,7 +10,8 @@
     "healthCooldownMinutes": 10,
     "startupIgnoreSeconds": 180,
     "pluginUpdateCheckMinutes": 180,
-    "logRulesPath": "agent-log-rules.json"
+    "logRulesPath": "agent-log-rules.json",
+    "incidentReviewIntervalMinutes": 30
   },
   "memory": {
     "statePath": "${RUSTOPS_AGENT_STATE_PATH}",
@@ -63,14 +64,32 @@
       "oxide.plugins",
       "status",
       "version"
-    ]
+    ],
+    "autoAllowAfterSuccesses": 5,
+    "requireApprovalAfterFailures": 2
   },
   "pluginUpdates": {
     "enabled": true,
     "checkIntervalMinutes": 60,
     "notifyAdmins": true,
     "searchUrlTemplate": "https://umod.org/plugins/search.json?query={0}&page=1&sort=title&sortdir=asc&filter={1}",
-    "searchFilter": "rust"
+    "searchFilter": "rust",
+    "downloadEnabled": false,
+    "stagingPath": "data/plugin-staging"
+  },
+  "autoPull": {
+    "enabled": false,
+    "intervalMinutes": 60,
+    "repoPath": "/opt/rust-manager/src",
+    "remoteName": "origin",
+    "branchName": "main",
+    "buildEnabled": false,
+    "buildScript": "Agent-Build.sh",
+    "restartEnabled": false,
+    "serviceName": "rustopsagent"
+  },
+  "network": {
+    "trackedInterfaces": ["eth0", "wt1", "wg1"]
   },
   "llm": {
     "enabled": true,
@@ -91,6 +110,6 @@
       "appTitle": "${RUSTOPS_LLM_SECONDARY_APP_TITLE}"
     },
     "useChatSystemPrompt": true,
-    "chatSystemPrompt": "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nFor status and health requests with plural wording (all/every/all 4 servers), default to all configured servers.\nOn follow-up corrections like 'no, I meant all 4 servers', keep the prior intent unless the admin clearly changes tasks.\nFor aggregate checks, return best-effort results and include partial failures explicitly.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\nIf an admin asks to push source changes to git, use git_push_branch.\nIf an admin asks to pull latest source updates, use git_pull_rebuild.\nIf an admin asks for the banlist or bans, use get_server_bans.\nYou can use read_scope_file to read the contents of plugin files or config files if you know their relative paths."
+    "chatSystemPrompt": "You are RustOps, an AI assistant managing Rust game servers on behalf of the admins.\nYou have direct access to server health, logs, players, plugins, RCON, and the repo.\nYou remember what was discussed and use that context — never ask for something you already know.\nBe direct: state the outcome first, add supporting detail after. Keep replies under 100 words unless the situation demands more.\nTalk like a knowledgeable ops colleague, not a chatbot or status board.\nWhen something fails, say what went wrong and what the next step is.\nWhen something works, confirm it and flag anything worth watching.\nFor plural status requests (all servers, every server), check all known servers.\nOn follow-up corrections, keep the previous intent unless the admin clearly switches topic.\nDo not mention internal routing, error codes, tool names, or implementation details.\nDo not invent facts — if you don't have data, say so and offer to fetch it.\nWhen an admin teaches you something (ignore pattern, preference, importance rule), confirm you've noted it."
   }
 }

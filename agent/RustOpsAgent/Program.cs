@@ -8,6 +8,7 @@ using RustOpsAgent.Domains.Rust;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
+using AutoPullService = RustOpsAgent.Infrastructure.AutoPullService;
 
 RustOpsEnv.LoadFromDefaultLocations();
 using var sentry = RustOpsSentry.Initialize("rustopsagent");
@@ -79,15 +80,29 @@ else
 var classifier = new AdminIntentClassifier(kernel, config.Llm);
 using var apiClient = new RustOpsApiClient(config.Api);
 
+if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.OrdinalIgnoreCase))
+{
+    throw new InvalidOperationException("gitOps.pushBranchPrefix must be agent/ to satisfy branch safety policy.");
+}
+
+var gitOps = new GitOpsService(config.GitOps);
+var autoPull = new AutoPullService(config.AutoPull);
+
+if (config.PluginUpdates.DownloadEnabled)
+{
+    Directory.CreateDirectory(config.PluginUpdates.StagingPath);
+}
+
 var handlers = new List<IToolHandler>
 {
     new RustServerControlToolHandler(apiClient),
     new RustStatusToolHandler(apiClient),
     new RustPlayerLookupToolHandler(apiClient),
-    new RustRconToolHandler(apiClient),
+    new RustRconToolHandler(apiClient, neoCortex, config.CommandExecution),
     new RustLogsToolHandler(apiClient, neoCortex),
-    new RustPluginToolHandler(apiClient),
-    new RustNetworkToolHandler(apiClient),
+    new RustPluginToolHandler(apiClient, config.PluginUpdates),
+    new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
+    new RustFileEditToolHandler(apiClient, gitOps, config.GitOps),
     new RustChatToolHandler(neoCortex)
 };
 
@@ -95,14 +110,7 @@ var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry);
 var composer = new ResponseComposer(kernel, config.Llm);
 
-if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.OrdinalIgnoreCase))
-{
-    throw new InvalidOperationException("gitOps.pushBranchPrefix must be agent/ to satisfy branch safety policy.");
-}
-
-var gitOps = new GitOpsService(config.GitOps);
-
-var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, apiClient, kernel);
+var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, autoPull, apiClient, kernel);
 
 Console.CancelKeyPress += (_, e) =>
 {

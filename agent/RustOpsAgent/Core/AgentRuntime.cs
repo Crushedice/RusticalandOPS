@@ -6,6 +6,7 @@ using RustOpsAgent.Domains.Rust;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
+using AutoPullService = RustOpsAgent.Infrastructure.AutoPullService;
 
 namespace RustOpsAgent.Core;
 
@@ -18,11 +19,14 @@ internal sealed class AgentRuntime
     private readonly NeoCortexStore _neoCortex;
     private readonly LegacyAgentStateStore _legacyState;
     private readonly IGitOpsService _gitOps;
+    private readonly AutoPullService _autoPull;
     private readonly RustOpsApiClient _api;
     private readonly Kernel? _kernel;
     private readonly Dictionary<string, long> _logOffsets = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _observationFingerprints = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _adminLocks = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastObservationAtUtc = DateTime.MinValue;
+    private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
     private volatile bool _stop;
 
     public AgentRuntime(
@@ -33,6 +37,7 @@ internal sealed class AgentRuntime
         NeoCortexStore neoCortex,
         LegacyAgentStateStore legacyState,
         IGitOpsService gitOps,
+        AutoPullService autoPull,
         RustOpsApiClient api,
         Kernel? kernel)
     {
@@ -43,6 +48,7 @@ internal sealed class AgentRuntime
         _neoCortex = neoCortex;
         _legacyState = legacyState;
         _gitOps = gitOps;
+        _autoPull = autoPull;
         _api = api;
         _kernel = kernel;
     }
@@ -56,8 +62,13 @@ internal sealed class AgentRuntime
         while (!_stop && !cancellationToken.IsCancellationRequested)
         {
             _legacyState.UpdateRuntimeStatus(_config.Llm);
-            await ProcessFeedbackInboxAsync(cancellationToken);
-            await ProcessDecisionInboxAsync(cancellationToken);
+
+            // Feedback and decision are independent — run them concurrently.
+            await Task.WhenAll(
+                ProcessFeedbackInboxAsync(cancellationToken),
+                ProcessDecisionInboxAsync(cancellationToken));
+
+            await _autoPull.TickAsync(cancellationToken);
 
             var chatFiles = Directory.Exists(_config.Inbox.ChatInboxPath)
                 ? Directory.GetFiles(_config.Inbox.ChatInboxPath, "*.json").Length
@@ -67,6 +78,7 @@ internal sealed class AgentRuntime
 
             await ProcessChatInboxAsync(cancellationToken);
             await ObserveServersAsync(cancellationToken);
+            await ReviewIncidentsAsync(cancellationToken);
             _legacyState.Save();
             tick++;
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
@@ -187,140 +199,228 @@ internal sealed class AgentRuntime
     private async Task ProcessChatInboxAsync(CancellationToken cancellationToken)
     {
         if (!Directory.Exists(_config.Inbox.ChatInboxPath))
-        {
             return;
-        }
 
-        foreach (var file in EnumerateInboxFiles(_config.Inbox.ChatInboxPath))
+        var files = EnumerateInboxFiles(_config.Inbox.ChatInboxPath).ToArray();
+        if (files.Length == 0) return;
+
+        // Group messages by adminId so each admin's messages stay ordered,
+        // but different admins are processed concurrently.
+        var groups = files
+            .Select(f =>
+            {
+                try
+                {
+                    var item = JsonSerializer.Deserialize<ChatInboxItem>(File.ReadAllText(f), JsonDefaults.Default);
+                    return (file: f, item);
+                }
+                catch { return (file: f, item: (ChatInboxItem?)null); }
+            })
+            .GroupBy(x => x.item?.AdminId ?? "__invalid__", StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        await Task.WhenAll(groups.Select(group => ProcessAdminChatGroupAsync(group, cancellationToken)));
+    }
+
+    private async Task ProcessAdminChatGroupAsync(
+        IEnumerable<(string file, ChatInboxItem? item)> group,
+        CancellationToken cancellationToken)
+    {
+        var adminId = group.First().item?.AdminId ?? "__invalid__";
+        var adminLock = _adminLocks.GetOrAdd(adminId, _ => new SemaphoreSlim(1, 1));
+        await adminLock.WaitAsync(cancellationToken);
+        try
         {
-            if (_stop || cancellationToken.IsCancellationRequested)
+            foreach (var (file, item) in group)
+            {
+                if (_stop || cancellationToken.IsCancellationRequested) return;
+                await ProcessSingleChatMessageAsync(file, item, cancellationToken);
+            }
+        }
+        finally
+        {
+            adminLock.Release();
+        }
+    }
+
+    private async Task ProcessSingleChatMessageAsync(string file, ChatInboxItem? item, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (item is null || string.IsNullOrWhiteSpace(item.Message))
                 return;
 
-            ChatInboxItem? item = null;
-            try
+            // Detect inline importance rule directives before routing.
+            var quickReply = TryHandleLearnDirective(item.Message);
+            if (quickReply is not null)
             {
-                item = JsonSerializer.Deserialize<ChatInboxItem>(File.ReadAllText(file), JsonDefaults.Default);
-                if (item is null || string.IsNullOrWhiteSpace(item.Message))
-                {
-                    continue;
-                }
-
-                var actionId = string.IsNullOrWhiteSpace(item.RequestId) ? item.Id : item.RequestId!;
-
-                var selection = _neoCortex.LoadSelection();
-                var state = selection.Conversations.FirstOrDefault(c => string.Equals(c.AdminId, item.AdminId, StringComparison.OrdinalIgnoreCase));
-                if (state is null)
-                {
-                    state = new ConversationSelectionState { AdminId = item.AdminId };
-                    selection.Conversations.Add(state);
-                }
-
-                var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
-                var route = await _classifier.ClassifyAsync(item.Message, state, knownServers, cancellationToken);
-                Console.WriteLine($"[chat] {item.AdminId}: intent={route.Intent} target={route.TargetRef ?? "?"} llm={route.ClassifierSource}");
-                RecordIntentRoutingInteraction(item.Message, route);
-                var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);
-                var result = await _executor.ExecuteAsync(context, cancellationToken);
-                var composedReply = await _composer.ComposeAsync(context, result, cancellationToken);
-                Console.WriteLine($"[chat] compose source={composedReply.Source} llm_ok={composedReply.LlmSucceeded}");
-                RecordLlmInteraction(
-                    composedReply.Type,
-                    composedReply.LlmAttempted,
-                    composedReply.LlmSucceeded,
-                    item.Message,
-                    composedReply.ResponsePreview ?? composedReply.Message,
-                    composedReply.Source);
-                var reply = composedReply.Message;
-
-                UpdateSelectionState(state, item.Message, route, result);
-                _neoCortex.SaveSelection(selection);
-                var primaryServer = ResolvePrimaryServer(result, route);
-
-                var operations = _neoCortex.LoadOperations();
-                operations.RuntimeStatus = new RuntimeStatus
-                {
-                    LlmEnabled = _config.Llm.Enabled,
-                    LlmProvider = _config.Llm.Provider,
-                    LastLlmInteractionAtUtc = operations.LlmInteractions.FirstOrDefault()?.AtUtc,
-                    UpdatedAtUtc = DateTime.UtcNow
-                };
-                operations.RecentActions.Add(new ActionRecord
-                {
-                    Intent = route.Intent.ToString(),
-                    Result = result.Success ? "success" : (result.ErrorCode ?? "failed"),
-                    ServerName = primaryServer,
-                    TimestampUtc = DateTime.UtcNow
-                });
-                operations.RecentActions = operations.RecentActions.TakeLast(100).ToList();
-                _neoCortex.SaveOperations(operations);
-
-                _legacyState.RecordAction(
-                    actionId,
-                    route.Intent.ToString().ToLowerInvariant(),
-                    result.Success,
-                    result.Message,
-                    primaryServer,
-                    "chat");
-
-                if (!result.Success)
-                {
-                    var incident = new EvolutionIncidentRecord
-                    {
-                        Request = item.Message,
-                        IntendedOutcome = route.Intent.ToString(),
-                        FailureReason = result.Message,
-                        MissingCapability = result.ErrorCode ?? "unknown",
-                        RecurrencePrevention = "Improve handler coverage and routing slots.",
-                        Classification = result.ErrorCode ?? "execution_failure",
-                        Timestamp = DateTime.UtcNow,
-                        Resolved = false
-                    };
-                    await _neoCortex.RecordIncidentAsync(incident, cancellationToken);
-                    _legacyState.RecordIncident(primaryServer, result.ErrorCode ?? "execution_failure", result.Message);
-
-                    if (_config.GitOps.Enabled && _config.GitOps.AllowPush)
-                    {
-                        _ = TryProposeIncidentBranchAsync(incident, cancellationToken);
-                    }
-                }
-
-                WriteOutbox(item.AdminId, reply, actionId, primaryServer);
+                WriteOutbox(item.AdminId, quickReply, item.RequestId ?? item.Id, null);
+                return;
             }
-            catch (Exception ex)
+
+            var actionId = string.IsNullOrWhiteSpace(item.RequestId) ? item.Id : item.RequestId!;
+            var selection = _neoCortex.LoadSelection();
+            var state = selection.Conversations.FirstOrDefault(c =>
+                string.Equals(c.AdminId, item.AdminId, StringComparison.OrdinalIgnoreCase));
+            if (state is null)
             {
-                await _neoCortex.RecordIncidentAsync(new EvolutionIncidentRecord
+                state = new ConversationSelectionState { AdminId = item.AdminId };
+                selection.Conversations.Add(state);
+            }
+
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            var route = await _classifier.ClassifyAsync(item.Message, state, knownServers, cancellationToken);
+            Console.WriteLine($"[chat] {item.AdminId}: intent={route.Intent} target={route.TargetRef ?? "?"} llm={route.ClassifierSource}");
+            RecordIntentRoutingInteraction(item.Message, route);
+            var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);
+            var result = await _executor.ExecuteAsync(context, cancellationToken);
+            var composedReply = await _composer.ComposeAsync(context, result, cancellationToken);
+            Console.WriteLine($"[chat] compose source={composedReply.Source} llm_ok={composedReply.LlmSucceeded}");
+            RecordLlmInteraction(
+                composedReply.Type,
+                composedReply.LlmAttempted,
+                composedReply.LlmSucceeded,
+                item.Message,
+                composedReply.ResponsePreview ?? composedReply.Message,
+                composedReply.Source);
+            var reply = composedReply.Message;
+
+            UpdateSelectionState(state, item.Message, route, result);
+            RecordConversationTurn(state, item.Message, reply);
+            _neoCortex.SaveSelection(selection);
+            var primaryServer = ResolvePrimaryServer(result, route);
+
+            var operations = _neoCortex.LoadOperations();
+            operations.RuntimeStatus = new RuntimeStatus
+            {
+                LlmEnabled = _config.Llm.Enabled,
+                LlmProvider = _config.Llm.Provider,
+                LastLlmInteractionAtUtc = operations.LlmInteractions.FirstOrDefault()?.AtUtc,
+                UpdatedAtUtc = DateTime.UtcNow
+            };
+            operations.RecentActions.Add(new ActionRecord
+            {
+                Intent = route.Intent.ToString(),
+                Result = result.Success ? "success" : (result.ErrorCode ?? "failed"),
+                ServerName = primaryServer,
+                TimestampUtc = DateTime.UtcNow
+            });
+            operations.RecentActions = operations.RecentActions.TakeLast(100).ToList();
+            _neoCortex.SaveOperations(operations);
+
+            _legacyState.RecordAction(
+                actionId,
+                route.Intent.ToString().ToLowerInvariant(),
+                result.Success,
+                result.Message,
+                primaryServer,
+                "chat");
+
+            if (!result.Success)
+            {
+                var incident = new EvolutionIncidentRecord
                 {
-                    Request = item?.Message ?? "<invalid inbox item>",
-                    IntendedOutcome = "processing",
-                    FailureReason = ex.Message,
-                    MissingCapability = "processing_error",
-                    RecurrencePrevention = "Validate chat inbox payloads before processing.",
-                    Classification = "processing_error",
+                    Request = item.Message,
+                    IntendedOutcome = route.Intent.ToString(),
+                    FailureReason = result.Message,
+                    MissingCapability = result.ErrorCode ?? "unknown",
+                    RecurrencePrevention = "Improve handler coverage and routing slots.",
+                    Classification = result.ErrorCode ?? "execution_failure",
                     Timestamp = DateTime.UtcNow,
                     Resolved = false
-                }, cancellationToken);
+                };
+                await _neoCortex.RecordIncidentAsync(incident, cancellationToken);
+                _legacyState.RecordIncident(primaryServer, result.ErrorCode ?? "execution_failure", result.Message);
 
-                _legacyState.RecordAgentError(ex.Message);
-                _legacyState.RecordIncident(null, "processing_error", ex.Message);
-                RustOpsSentry.CaptureException(
-                    ex,
-                    "Chat inbox processing failed.",
-                    "agent.inbox",
-                    tags: new Dictionary<string, string?> { ["inbox.kind"] = "chat" },
-                    extras: new Dictionary<string, object?>
-                    {
-                        ["file"] = file,
-                        ["adminId"] = item?.AdminId,
-                        ["requestId"] = item?.RequestId,
-                        ["message"] = item?.Message
-                    });
-                WriteOutbox(item?.AdminId ?? "admin", $"Failed to process request: {ex.Message}", item?.RequestId ?? item?.Id, null);
+                if (_config.GitOps.Enabled && _config.GitOps.AllowPush)
+                    _ = TryProposeIncidentBranchAsync(incident, cancellationToken);
             }
-            finally
+
+            WriteOutbox(item.AdminId, reply, actionId, primaryServer);
+        }
+        catch (Exception ex)
+        {
+            await _neoCortex.RecordIncidentAsync(new EvolutionIncidentRecord
             {
-                TryDelete(file);
+                Request = item?.Message ?? "<invalid inbox item>",
+                IntendedOutcome = "processing",
+                FailureReason = ex.Message,
+                MissingCapability = "processing_error",
+                RecurrencePrevention = "Validate chat inbox payloads before processing.",
+                Classification = "processing_error",
+                Timestamp = DateTime.UtcNow,
+                Resolved = false
+            }, cancellationToken);
+
+            _legacyState.RecordAgentError(ex.Message);
+            _legacyState.RecordIncident(null, "processing_error", ex.Message);
+            RustOpsSentry.CaptureException(
+                ex,
+                "Chat inbox processing failed.",
+                "agent.inbox",
+                tags: new Dictionary<string, string?> { ["inbox.kind"] = "chat" },
+                extras: new Dictionary<string, object?>
+                {
+                    ["file"] = file,
+                    ["adminId"] = item?.AdminId,
+                    ["message"] = item?.Message
+                });
+            WriteOutbox(item?.AdminId ?? "admin",
+                $"Something went wrong processing your request. Check the logs.",
+                item?.RequestId ?? item?.Id, null);
+        }
+        finally
+        {
+            TryDelete(file);
+        }
+    }
+
+    private string? TryHandleLearnDirective(string message)
+    {
+        var lowered = message.Trim().ToLowerInvariant();
+
+        // "importance +pattern" — add importance rule
+        if (lowered.StartsWith("importance +", StringComparison.Ordinal))
+        {
+            var pattern = message["importance +".Length..].Trim();
+            if (!string.IsNullOrWhiteSpace(pattern))
+            {
+                var logs = _neoCortex.LoadLogs();
+                if (!logs.ImportanceRules.Contains(pattern, StringComparer.OrdinalIgnoreCase))
+                {
+                    logs.ImportanceRules.Add(pattern);
+                    _neoCortex.SaveLogs(logs);
+                }
+                return $"Got it — I'll flag any log line matching \"{pattern}\" as high-importance from now on.";
             }
         }
+
+        // "importance -pattern" — remove importance rule
+        if (lowered.StartsWith("importance -", StringComparison.Ordinal))
+        {
+            var pattern = message["importance -".Length..].Trim();
+            if (!string.IsNullOrWhiteSpace(pattern))
+            {
+                var logs = _neoCortex.LoadLogs();
+                var removed = logs.ImportanceRules.RemoveAll(r =>
+                    r.Equals(pattern, StringComparison.OrdinalIgnoreCase));
+                _neoCortex.SaveLogs(logs);
+                return removed > 0
+                    ? $"Removed \"{pattern}\" from importance rules."
+                    : $"No importance rule matched \"{pattern}\".";
+            }
+        }
+
+        // "importance list" — show current rules
+        if (lowered is "importance list" or "importance rules" or "list importance rules")
+        {
+            var logs = _neoCortex.LoadLogs();
+            if (logs.ImportanceRules.Count == 0)
+                return "No custom importance rules set. Defaults: exception/failed/error = high, warn/disconnect = medium.";
+            return $"Custom importance rules: {string.Join(", ", logs.ImportanceRules.Select(r => $"\"{r}\""))}.";
+        }
+
+        return null;
     }
 
     private void RecordIntentRoutingInteraction(string message, AdminIntentRoute route)
@@ -677,6 +777,141 @@ RecentErrors:
         bool LlmSucceeded,
         string Source);
 
+    private async Task ReviewIncidentsAsync(CancellationToken cancellationToken)
+    {
+        var interval = TimeSpan.FromMinutes(Math.Max(5, _config.Monitor.IncidentReviewIntervalMinutes));
+        if (DateTime.UtcNow - _lastIncidentReviewAtUtc < interval)
+            return;
+
+        _lastIncidentReviewAtUtc = DateTime.UtcNow;
+
+        EvolutionReviewResult review;
+        try
+        {
+            review = await _neoCortex.ReviewAsync(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[review] Failed to load incidents: {ex.Message}");
+            return;
+        }
+
+        if (review.OpenIncidents.Count == 0)
+        {
+            Console.WriteLine("[review] No open incidents.");
+            return;
+        }
+
+        Console.WriteLine($"[review] {review.OpenIncidents.Count} open incident(s) — analysing with LLM.");
+
+        if (_kernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        {
+            Console.WriteLine("[review] LLM disabled — skipping trend analysis.");
+            return;
+        }
+
+        var top = review.OpenIncidents.Take(10).ToList();
+        var incidentSummary = string.Join("\n", top.Select((i, idx) =>
+            $"{idx + 1}. [{i.Classification}] {i.Request} → {i.FailureReason}"));
+
+        var prompt = $$"""
+You are reviewing recurring operational failures for a Rust server agent.
+Identify patterns, propose concrete mitigations, and list any configuration changes.
+
+Return strict JSON only with keys:
+trendSummary, topPattern, proposedMitigation, configSuggestion
+
+Constraints:
+- trendSummary: 1-2 sentences
+- topPattern: short snake_case label
+- proposedMitigation: one concrete sentence
+- configSuggestion: one sentence or null
+
+Open incidents (newest first):
+{{incidentSummary}}
+""";
+
+        try
+        {
+            var response = await _kernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var raw = response.GetValue<string>() ?? string.Empty;
+            var json = TryExtractJson(raw);
+            if (json is null)
+            {
+                Console.WriteLine("[review] LLM returned unparseable trend analysis.");
+                return;
+            }
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var summary = root.TryGetProperty("trendSummary", out var s) ? s.GetString() : null;
+            var pattern = root.TryGetProperty("topPattern", out var p) ? p.GetString() : null;
+            var mitigation = root.TryGetProperty("proposedMitigation", out var m) ? m.GetString() : null;
+            var config = root.TryGetProperty("configSuggestion", out var c) ? c.GetString() : null;
+
+            Console.WriteLine($"[review] Trend: {summary}");
+            Console.WriteLine($"[review] Pattern: {pattern} | Mitigation: {mitigation}");
+
+            RecordLlmInteraction(
+                "incident-review",
+                true, true,
+                $"{top.Count} open incidents",
+                summary,
+                "llm");
+
+            // Propose a GitOps branch with the review findings when push is enabled.
+            if (_config.GitOps.Enabled && _config.GitOps.AllowPush && !string.IsNullOrWhiteSpace(pattern))
+            {
+                _ = TryProposeReviewBranchAsync(pattern!, summary, mitigation, config, cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[review] LLM trend analysis failed: {ex.Message}");
+            RustOpsSentry.CaptureException(ex, "Incident review LLM analysis failed.", "agent.review");
+        }
+    }
+
+    private async Task TryProposeReviewBranchAsync(
+        string pattern, string? summary, string? mitigation, string? configSuggestion,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var slug = $"review-{SanitizeToken(pattern, "incident")}";
+            var branch = await _gitOps.EnsureAgentBranchAsync(slug, cancellationToken);
+
+            var reviewNote = $"""
+# Incident Trend Review — {DateTime.UtcNow:yyyy-MM-dd}
+
+## Summary
+{summary ?? "See open incidents."}
+
+## Top Pattern
+{pattern}
+
+## Proposed Mitigation
+{mitigation ?? "Review handler coverage."}
+
+## Config Suggestion
+{configSuggestion ?? "None identified."}
+""";
+            var reviewPath = Path.Combine(_config.GitOps.RepoPath, "agent-reviews", $"{DateTime.UtcNow:yyyyMMdd}-{slug}.md");
+            Directory.CreateDirectory(Path.GetDirectoryName(reviewPath)!);
+            await File.WriteAllTextAsync(reviewPath, reviewNote, cancellationToken);
+
+            await _gitOps.CommitAsync($"agent: incident review {DateTime.UtcNow:yyyyMMdd} pattern={pattern}", cancellationToken);
+            await _gitOps.PushAsync(branch, cancellationToken);
+            await _gitOps.CreatePrAsync(branch, $"[agent] Incident review: {pattern}", reviewNote, cancellationToken);
+            Console.WriteLine($"[review] PR proposed for pattern '{pattern}' on branch {branch}.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[review] GitOps PR for review failed: {ex.Message}");
+            RustOpsSentry.CaptureException(ex, "Review GitOps PR failed.", "agent.review");
+        }
+    }
+
     private async Task TryProposeIncidentBranchAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken)
     {
         try
@@ -711,6 +946,14 @@ RecentErrors:
             .GetFiles(path, "*.json", SearchOption.TopDirectoryOnly)
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    private static void RecordConversationTurn(ConversationSelectionState state, string userMessage, string agentReply)
+    {
+        state.RecentMessages.Add(new ConversationMessage { Role = "user", Text = userMessage, AtUtc = DateTime.UtcNow });
+        state.RecentMessages.Add(new ConversationMessage { Role = "assistant", Text = agentReply, AtUtc = DateTime.UtcNow });
+        if (state.RecentMessages.Count > 12)
+            state.RecentMessages = state.RecentMessages.TakeLast(12).ToList();
     }
 
     private void UpdateSelectionState(ConversationSelectionState state, string message, AdminIntentRoute route, ToolExecutionResult result)

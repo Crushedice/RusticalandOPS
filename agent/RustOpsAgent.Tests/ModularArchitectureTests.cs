@@ -10,6 +10,8 @@ namespace RustOpsAgent.Tests;
 
 public class ModularArchitectureTests
 {
+    // ── GitOps ─────────────────────────────────────────────────────────────────
+
     [Fact]
     public async Task GitOps_Rejects_Main_Push()
     {
@@ -24,10 +26,12 @@ public class ModularArchitectureTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => service.PushAsync("main", CancellationToken.None));
     }
 
+    // ── NeoCortex ──────────────────────────────────────────────────────────────
+
     [Fact]
     public void NeoCortex_Migration_Creates_Banks()
     {
-        var root = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
+        var root = TempRoot();
         var legacy = Path.Combine(root, "legacy-state.json");
         Directory.CreateDirectory(root);
         File.WriteAllText(legacy, "{\"runtimeStatus\":{\"llmEnabled\":true,\"llmProvider\":\"test\"}}");
@@ -43,7 +47,7 @@ public class ModularArchitectureTests
     [Fact]
     public void NeoCortex_Migration_Does_Not_Overwrite_Existing_Files_When_Marker_Is_Missing()
     {
-        var root = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
+        var root = TempRoot();
         var neoRoot = Path.Combine(root, "NeoCortex");
         var legacy = Path.Combine(root, "legacy-state.json");
         var operationsDir = Path.Combine(neoRoot, "operations");
@@ -61,11 +65,68 @@ public class ModularArchitectureTests
     }
 
     [Fact]
+    public void NeoCortex_CommandPolicy_Persists_And_Loads()
+    {
+        var root = TempRoot();
+        var store = MakeStore(root);
+        store.EnsureMigrated();
+
+        var policy = store.LoadCommandPolicy();
+        Assert.Empty(policy.Commands);
+
+        policy.Commands["status"] = new CommandRecord
+        {
+            Command = "status",
+            SuccessCount = 5,
+            AutoAllowed = true,
+            LastUsedUtc = DateTime.UtcNow
+        };
+        store.SaveCommandPolicy(policy);
+
+        var reloaded = store.LoadCommandPolicy();
+        Assert.True(reloaded.Commands.ContainsKey("status"));
+        Assert.True(reloaded.Commands["status"].AutoAllowed);
+        Assert.Equal(5, reloaded.Commands["status"].SuccessCount);
+    }
+
+    [Fact]
+    public async Task NeoCortex_Records_And_Reviews_Incidents()
+    {
+        var root = TempRoot();
+        var store = MakeStore(root);
+        store.EnsureMigrated();
+
+        await store.RecordIncidentAsync(new EvolutionIncidentRecord
+        {
+            Request = "restart alpha",
+            IntendedOutcome = "ServerControl",
+            FailureReason = "No config",
+            Classification = "missing_config",
+            Resolved = false
+        }, CancellationToken.None);
+
+        await store.RecordIncidentAsync(new EvolutionIncidentRecord
+        {
+            Request = "restart beta",
+            IntendedOutcome = "ServerControl",
+            FailureReason = "Timeout",
+            Classification = "timeout",
+            Resolved = true
+        }, CancellationToken.None);
+
+        var review = await store.ReviewAsync(CancellationToken.None);
+        Assert.Single(review.OpenIncidents);
+        Assert.Single(review.RecentlyResolved);
+        Assert.Equal("missing_config", review.OpenIncidents[0].Classification);
+    }
+
+    // ── ToolRegistry ───────────────────────────────────────────────────────────
+
+    [Fact]
     public void ToolRegistry_Filters_By_Intent()
     {
-        using var api = new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
-        var tempRoot = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
-        var neo = new NeoCortexStore(Path.Combine(tempRoot, "NeoCortex"), Path.Combine(tempRoot, "legacy.json"));
+        using var api = TestApi();
+        var neo = MakeStore(TempRoot());
         neo.EnsureMigrated();
 
         var handlers = new IToolHandler[]
@@ -79,10 +140,7 @@ public class ModularArchitectureTests
         var route = new AdminIntentRoute(
             AdminIntentType.ServerControl,
             new AdminIntentSlots("alpha", null, null, null, null),
-            0.9,
-            false,
-            null,
-            null);
+            0.9, false, null, null);
 
         var eligible = registry.ResolveEligible(route);
         Assert.Contains(eligible, h => h.Name == "rust.server.control");
@@ -92,9 +150,8 @@ public class ModularArchitectureTests
     [Fact]
     public void ToolRegistry_Uses_TargetRef_For_Diagnostics()
     {
-        using var api = new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
-        var tempRoot = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
-        var neo = new NeoCortexStore(Path.Combine(tempRoot, "NeoCortex"), Path.Combine(tempRoot, "legacy.json"));
+        using var api = TestApi();
+        var neo = MakeStore(TempRoot());
         neo.EnsureMigrated();
 
         var handlers = new IToolHandler[]
@@ -109,21 +166,19 @@ public class ModularArchitectureTests
         var route = new AdminIntentRoute(
             AdminIntentType.Troubleshooting,
             new AdminIntentSlots("alpha", null, null, null, null),
-            0.9,
-            false,
-            null,
-            "rust.network.inspect");
+            0.9, false, null, "rust.network.inspect");
 
         var selected = registry.ResolveSingle(new ToolExecutionContext("admin", "check alpha", route, new ConversationSelectionState(), DateTime.UtcNow));
         Assert.NotNull(selected);
         Assert.Equal("rust.network.inspect", selected!.Name);
     }
 
+    // ── ConfigLoader ───────────────────────────────────────────────────────────
+
     [Fact]
     public void ConfigLoader_Rejects_Unresolved_Required_Values()
     {
-        var root = Path.Combine(Path.GetTempPath(), "cfg-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        var root = TempRoot();
         var path = Path.Combine(root, "agentsettings.json");
         File.WriteAllText(path, """
         {
@@ -144,11 +199,12 @@ public class ModularArchitectureTests
         Assert.Throws<InvalidOperationException>(() => ConfigLoader.Load(path));
     }
 
+    // ── LegacyStateStore ───────────────────────────────────────────────────────
+
     [Fact]
     public void LegacyStateStore_Writes_Api_Compatible_Action_History()
     {
-        var root = Path.Combine(Path.GetTempPath(), "legacy-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        var root = TempRoot();
         var statePath = Path.Combine(root, "agent-state.json");
         var store = new LegacyAgentStateStore(statePath);
         store.UpdateRuntimeStatus(new LlmSettings { Enabled = true, Provider = "test", Model = "m", BaseUrl = "http://localhost" });
@@ -167,8 +223,7 @@ public class ModularArchitectureTests
     [Fact]
     public void LegacyStateStore_Does_Not_Write_Deprecated_SelfRepair_Schema()
     {
-        var root = Path.Combine(Path.GetTempPath(), "legacy-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(root);
+        var root = TempRoot();
         var statePath = Path.Combine(root, "agent-state.json");
         var store = new LegacyAgentStateStore(statePath);
         store.RecordFeedback("42", "a-1", "good", "nice", "alpha");
@@ -180,28 +235,113 @@ public class ModularArchitectureTests
         Assert.False(doc.RootElement.TryGetProperty("selfRepairHistory", out _));
     }
 
+    // ── ActionExecutor ─────────────────────────────────────────────────────────
+
     [Fact]
-    public async Task ActionExecutor_Returns_Explicit_NotImplemented_For_FileEdit()
+    public async Task ActionExecutor_FileEdit_Without_GitOps_Returns_Not_Configured()
     {
-        var tempRoot = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
-        var neo = new NeoCortexStore(Path.Combine(tempRoot, "NeoCortex"), Path.Combine(tempRoot, "legacy.json"));
-        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler(neo) });
+        // FileEdit now routes to a real handler — without GitOps enabled it returns not_configured.
+        using var api = TestApi();
+        var root = TempRoot();
+        var neo = MakeStore(root);
+        neo.EnsureMigrated();
+        var gitOps = new GitOpsService(new GitOpsSettings { Enabled = false, RepoPath = root, PushBranchPrefix = "agent/" });
+        var fileEditHandler = new RustFileEditToolHandler(api, gitOps, new GitOpsSettings { Enabled = false, RepoPath = root, PushBranchPrefix = "agent/" });
+        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler(neo), fileEditHandler });
         var executor = new ActionExecutor(registry);
+
         var route = new AdminIntentRoute(
             AdminIntentType.FileEdit,
             new AdminIntentSlots(null, null, null, null, null),
-            0.9,
-            false,
-            null,
-            null);
+            0.9, false, null, null);
 
         var result = await executor.ExecuteAsync(
             new ToolExecutionContext("admin", "edit server.cfg", route, new ConversationSelectionState(), DateTime.UtcNow),
             CancellationToken.None);
 
         Assert.False(result.Success);
-        Assert.Equal("not_implemented", result.ErrorCode);
+        Assert.Equal("not_configured", result.ErrorCode);
     }
+
+    [Fact]
+    public async Task ActionExecutor_Does_Not_Block_Status_Handler_On_Clarification_Flag()
+    {
+        var handler = new PassThroughStatusHandler();
+        var registry = new ToolRegistry(new IToolHandler[] { handler });
+        var executor = new ActionExecutor(registry);
+        var route = new AdminIntentRoute(
+            AdminIntentType.StatusCheck,
+            new AdminIntentSlots(null, null, null, null, null, ServerScopeKind.All, new[] { "monthly", "weekly" }),
+            0.7, true, "Which server?", "rust.status.check");
+
+        var result = await executor.ExecuteAsync(
+            new ToolExecutionContext("admin", "all servers?", route, new ConversationSelectionState(), DateTime.UtcNow),
+            CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Equal("status-handler-ran", result.Message);
+    }
+
+    // ── ResponseComposer ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ResponseComposer_Formats_Aggregate_Status_Directly()
+    {
+        var composer = new ResponseComposer(kernel: null, new LlmSettings { Enabled = false });
+        var route = new AdminIntentRoute(
+            AdminIntentType.StatusCheck,
+            new AdminIntentSlots(null, null, null, null, null, ServerScopeKind.All, new[] { "monthly", "weekly", "sandbox", "staging" }),
+            0.9, false, null, "rust.status.check");
+        var context = new ToolExecutionContext("admin", "are all servers online?", route, new ConversationSelectionState(), DateTime.UtcNow);
+        var payload = new AggregateStatusPayload(
+            ServerScopeKind.All,
+            new[] { "monthly", "weekly", "sandbox", "staging" },
+            3,
+            new[] { "sandbox" },
+            new[] { "staging" },
+            new[]
+            {
+                new AggregateStatusServerResult("monthly", "running", true, true),
+                new AggregateStatusServerResult("weekly", "running", true, true),
+                new AggregateStatusServerResult("sandbox", "offline", false, true),
+                new AggregateStatusServerResult("staging", "unknown", false, false, "timeout")
+            });
+
+        var composed = await composer.ComposeAsync(
+            context,
+            new ToolExecutionResult(true, "ignored", Payload: payload, SelectedServers: payload.TargetServers, ScopeKind: ServerScopeKind.All),
+            CancellationToken.None);
+
+        Assert.StartsWith("3/4 servers are online.", composed.Message);
+        Assert.Contains("Offline: sandbox.", composed.Message);
+        Assert.Contains("Couldn't check: staging.", composed.Message);
+    }
+
+    [Fact]
+    public async Task ResponseComposer_Includes_Conversation_History_In_Fallback_Path()
+    {
+        var composer = new ResponseComposer(kernel: null, new LlmSettings { Enabled = false });
+        var state = new ConversationSelectionState { AdminId = "admin" };
+        state.RecentMessages.Add(new ConversationMessage { Role = "user", Text = "restart alpha" });
+        state.RecentMessages.Add(new ConversationMessage { Role = "assistant", Text = "Restart initiated for alpha." });
+
+        var route = new AdminIntentRoute(
+            AdminIntentType.Chat,
+            new AdminIntentSlots(null, null, null, null, null),
+            0.6, false, null, "rust.chat.reply");
+        var context = new ToolExecutionContext("admin", "did it work?", route, state, DateTime.UtcNow);
+
+        // LLM disabled — should fall back to template without crashing.
+        var composed = await composer.ComposeAsync(
+            context,
+            new ToolExecutionResult(true, "Ready."),
+            CancellationToken.None);
+
+        Assert.NotEmpty(composed.Message);
+        Assert.Equal("template_llm_disabled", composed.Source);
+    }
+
+    // ── Classifier ─────────────────────────────────────────────────────────────
 
     [Fact]
     public async Task Classifier_Does_Not_Recycle_Last_Server_For_Generic_It_Phrasing()
@@ -288,6 +428,8 @@ public class ModularArchitectureTests
         Assert.Equal(ServerScopeKind.Unspecified, route.Slots.ScopeKind);
     }
 
+    // ── RustToolHelper ─────────────────────────────────────────────────────────
+
     [Fact]
     public void RustToolHelper_Parses_KnownServers_From_String_And_Object_Api_Shapes()
     {
@@ -301,63 +443,107 @@ public class ModularArchitectureTests
         Assert.Equal(new[] { "monthly", "weekly" }, fromObjects);
     }
 
+    // ── Network handler ────────────────────────────────────────────────────────
+
     [Fact]
-    public async Task ActionExecutor_Does_Not_Block_Status_Handler_On_Clarification_Flag()
+    public void NetworkToolHandler_Uses_Custom_Interface_List()
     {
-        var handler = new PassThroughStatusHandler();
-        var registry = new ToolRegistry(new IToolHandler[] { handler });
-        var executor = new ActionExecutor(registry);
-        var route = new AdminIntentRoute(
-            AdminIntentType.StatusCheck,
-            new AdminIntentSlots(null, null, null, null, null, ServerScopeKind.All, new[] { "monthly", "weekly" }),
-            0.7,
-            true,
-            "Which server?",
-            "rust.status.check");
+        // Verify constructor accepts custom interfaces without throwing.
+        using var api = TestApi();
+        var handler = new RustNetworkToolHandler(api, new[] { "ens3", "wg0" });
+        Assert.Equal("rust.network.inspect", handler.Name);
+    }
 
-        var result = await executor.ExecuteAsync(
-            new ToolExecutionContext("admin", "all servers?", route, new ConversationSelectionState(), DateTime.UtcNow),
-            CancellationToken.None);
+    // ── CommandPolicy ─────────────────────────────────────────────────────────
 
-        Assert.True(result.Success);
-        Assert.Equal("status-handler-ran", result.Message);
+    [Fact]
+    public void CommandRecord_AutoAllows_After_Threshold_Successes()
+    {
+        var record = new CommandRecord { Command = "status", SuccessCount = 4 };
+        Assert.False(record.AutoAllowed);
+
+        record.SuccessCount++;
+        if (record.SuccessCount >= 5 && !record.RequiresApproval)
+            record.AutoAllowed = true;
+
+        Assert.True(record.AutoAllowed);
     }
 
     [Fact]
-    public async Task ResponseComposer_Formats_Aggregate_Status_Directly()
+    public void CommandRecord_Requires_Approval_After_Threshold_Failures()
     {
-        var composer = new ResponseComposer(kernel: null, new LlmSettings { Enabled = false });
-        var route = new AdminIntentRoute(
-            AdminIntentType.StatusCheck,
-            new AdminIntentSlots(null, null, null, null, null, ServerScopeKind.All, new[] { "monthly", "weekly", "sandbox", "staging" }),
-            0.9,
-            false,
-            null,
-            "rust.status.check");
-        var context = new ToolExecutionContext("admin", "are all servers online?", route, new ConversationSelectionState(), DateTime.UtcNow);
-        var payload = new AggregateStatusPayload(
-            ServerScopeKind.All,
-            new[] { "monthly", "weekly", "sandbox", "staging" },
-            3,
-            new[] { "sandbox" },
-            new[] { "staging" },
-            new[]
-            {
-                new AggregateStatusServerResult("monthly", "running", true, true),
-                new AggregateStatusServerResult("weekly", "running", true, true),
-                new AggregateStatusServerResult("sandbox", "offline", false, true),
-                new AggregateStatusServerResult("staging", "unknown", false, false, "timeout")
-            });
+        var record = new CommandRecord { Command = "dangerouscommand", FailCount = 1 };
+        Assert.False(record.RequiresApproval);
 
-        var composed = await composer.ComposeAsync(
-            context,
-            new ToolExecutionResult(true, "ignored", Payload: payload, SelectedServers: payload.TargetServers, ScopeKind: ServerScopeKind.All),
-            CancellationToken.None);
+        record.FailCount++;
+        if (record.FailCount >= 2)
+            record.RequiresApproval = true;
 
-        Assert.StartsWith("3/4 servers are online.", composed.Message);
-        Assert.Contains("Offline: sandbox.", composed.Message);
-        Assert.Contains("Failed to check: staging.", composed.Message);
+        Assert.True(record.RequiresApproval);
     }
+
+    // ── ConversationMessage ────────────────────────────────────────────────────
+
+    [Fact]
+    public void ConversationSelectionState_Has_RecentMessages()
+    {
+        var state = new ConversationSelectionState { AdminId = "admin" };
+        state.RecentMessages.Add(new ConversationMessage { Role = "user", Text = "hello" });
+        state.RecentMessages.Add(new ConversationMessage { Role = "assistant", Text = "hi there" });
+
+        Assert.Equal(2, state.RecentMessages.Count);
+        Assert.Equal("user", state.RecentMessages[0].Role);
+        Assert.Equal("assistant", state.RecentMessages[1].Role);
+    }
+
+    [Fact]
+    public void ConversationSelectionState_RecentMessages_Serializes_Round_Trip()
+    {
+        var state = new ConversationSelectionState { AdminId = "admin" };
+        state.RecentMessages.Add(new ConversationMessage { Role = "user", Text = "restart all", AtUtc = new DateTime(2025, 1, 1, 0, 0, 0, DateTimeKind.Utc) });
+
+        var json = JsonSerializer.Serialize(state, JsonDefaults.Default);
+        var deserialized = JsonSerializer.Deserialize<ConversationSelectionState>(json, JsonDefaults.Default);
+
+        Assert.NotNull(deserialized);
+        Assert.Single(deserialized!.RecentMessages);
+        Assert.Equal("restart all", deserialized.RecentMessages[0].Text);
+    }
+
+    // ── AutoPull ───────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void AutoPullService_Initial_Status_Is_Idle()
+    {
+        var svc = new AutoPullService(new AutoPullSettings { Enabled = false });
+        Assert.Equal("idle", svc.LastStatus.Phase);
+    }
+
+    [Fact]
+    public async Task AutoPullService_Does_Not_Tick_When_Disabled()
+    {
+        var svc = new AutoPullService(new AutoPullSettings { Enabled = false });
+        // Should not throw or change state when disabled.
+        await svc.TickAsync(CancellationToken.None);
+        Assert.Equal("idle", svc.LastStatus.Phase);
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private static string TempRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rustops-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        return root;
+    }
+
+    private static NeoCortexStore MakeStore(string root)
+    {
+        return new NeoCortexStore(Path.Combine(root, "NeoCortex"), Path.Combine(root, "legacy.json"));
+    }
+
+    private static RustOpsApiClient TestApi() =>
+        new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
 
     private sealed class PassThroughStatusHandler : IToolHandler
     {

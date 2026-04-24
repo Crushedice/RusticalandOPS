@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "agent/**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # ── Restore all projects ──────────────────────────────────────────────────
+      - name: Restore
+        run: dotnet restore
+
+      # ── Build ─────────────────────────────────────────────────────────────────
+      - name: Build – API
+        run: dotnet build api/rustmgrapi.csproj --no-restore -c Release
+
+      - name: Build – Agent
+        run: dotnet build agent/RustOpsAgent/RustOpsAgent.csproj --no-restore -c Release
+
+      - name: Build – SteamBot
+        run: dotnet build SteamBot/OpsSteamBot/OpsSteamBot.csproj --no-restore -c Release
+
+      # ── Test ──────────────────────────────────────────────────────────────────
+      - name: Test – Agent unit tests
+        run: >
+          dotnet test agent/RustOpsAgent.Tests/RustOpsAgent.Tests.csproj
+          --no-restore
+          --logger "console;verbosity=normal"
+          --results-directory ./test-results
+          -- RunConfiguration.FailFast=false
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ./test-results
+          retention-days: 7
+
+  lint-bash:
+    name: Lint – rustmgr.sh
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Shellcheck rustmgr.sh
+        run: shellcheck rustmgr.sh

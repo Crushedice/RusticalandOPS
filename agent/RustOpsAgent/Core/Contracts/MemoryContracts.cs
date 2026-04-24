@@ -84,6 +84,21 @@ internal sealed class EvolutionReviewResult
     public List<EvolutionIncidentRecord> RecentlyResolved { get; set; } = new();
 }
 
+internal sealed class CommandPolicyState
+{
+    [JsonPropertyName("commands")] public Dictionary<string, CommandRecord> Commands { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+internal sealed class CommandRecord
+{
+    [JsonPropertyName("command")] public string Command { get; set; } = string.Empty;
+    [JsonPropertyName("successCount")] public int SuccessCount { get; set; }
+    [JsonPropertyName("failCount")] public int FailCount { get; set; }
+    [JsonPropertyName("autoAllowed")] public bool AutoAllowed { get; set; }
+    [JsonPropertyName("requiresApproval")] public bool RequiresApproval { get; set; }
+    [JsonPropertyName("lastUsedUtc")] public DateTime LastUsedUtc { get; set; } = DateTime.UtcNow;
+}
+
 internal interface IEvolutionStore
 {
     Task RecordIncidentAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken);

@@ -25,16 +25,6 @@ internal sealed class ActionExecutor : IActionExecutor
                 ScopeKind: context.Route.Slots.ScopeKind);
         }
 
-        if (context.Route.Intent == AdminIntentType.FileEdit)
-        {
-            return new ToolExecutionResult(
-                false,
-                "File edit requests are not implemented yet. They need a dedicated evolution/GitOps workflow instead of chat routing.",
-                context.SelectionState.LastServerName,
-                false,
-                "not_implemented");
-        }
-
         var handler = _registry.ResolveSingle(context);
         if (handler is null)
         {
@@ -46,12 +36,12 @@ internal sealed class ActionExecutor : IActionExecutor
 
     private static bool IsBlockingClarification(AdminIntentRoute route)
     {
-        if (route.Intent is AdminIntentType.ServerControl or AdminIntentType.RconCommand or AdminIntentType.PlayerLookup or AdminIntentType.FileEdit)
+        if (route.Intent is AdminIntentType.ServerControl or AdminIntentType.RconCommand or AdminIntentType.PlayerLookup)
         {
             return true;
         }
 
-        if (route.Intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting)
+        if (route.Intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting or AdminIntentType.FileEdit)
         {
             return false;
         }

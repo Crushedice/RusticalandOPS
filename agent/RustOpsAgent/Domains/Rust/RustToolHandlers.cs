@@ -234,10 +234,14 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 internal sealed class RustRconToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
+    private readonly NeoCortexStore _memory;
+    private readonly Core.Contracts.CommandExecutionSettings _cmdSettings;
 
-    public RustRconToolHandler(RustOpsApiClient api)
+    public RustRconToolHandler(RustOpsApiClient api, NeoCortexStore? memory = null, Core.Contracts.CommandExecutionSettings? cmdSettings = null)
     {
         _api = api;
+        _memory = memory ?? new NeoCortexStore("data/NeoCortex", "data/agent-state.json");
+        _cmdSettings = cmdSettings ?? new Core.Contracts.CommandExecutionSettings();
     }
 
     public string Name => "rust.rcon.command";
@@ -252,59 +256,128 @@ internal sealed class RustRconToolHandler : IToolHandler
             return new ToolExecutionResult(
                 false,
                 RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.RconCommand, knownServers, allowAllServers: false),
-                null,
-                false,
-                "clarification_required",
+                null, false, "clarification_required",
                 SelectedServers: context.SelectionState.LastResolvedServers,
                 ScopeKind: ServerScopeKind.Unspecified);
         }
 
         var command = context.Route.Slots.CommandText;
         if (string.IsNullOrWhiteSpace(command))
-        {
             command = ExtractCommand(context.Message);
-        }
 
         if (string.IsNullOrWhiteSpace(command))
+            return new ToolExecutionResult(false, "Which command should I run? Quote it or say 'run status'.", server, false, "clarification_required");
+
+        // Normalize: take only the first token for policy checks (e.g. "oxide.reload MyPlugin" → "oxide.reload")
+        var commandRoot = command.Split(' ', 2)[0].ToLowerInvariant();
+        var policyCheck = CheckCommandPolicy(commandRoot);
+        if (policyCheck is not null)
+            return new ToolExecutionResult(false, policyCheck, server, false, "policy_blocked");
+
+        string reply;
+        bool succeeded;
+        try
         {
-            return new ToolExecutionResult(false, "Command text is required.", server, false, "clarification_required");
+            var directReply = await RustDirectRconHelper.TryExecuteAsync(server, command, cancellationToken);
+            if (!string.IsNullOrWhiteSpace(directReply))
+            {
+                reply = $"RCON {server}: {TruncateOutput(directReply)}";
+                succeeded = true;
+            }
+            else
+            {
+                using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command/exec", new { command }, cancellationToken);
+                var root = response.RootElement;
+                var apiReply = root.TryGetProperty("directReply", out var replyNode) ? replyNode.ToString() : "sent";
+                reply = $"RCON {server}: {TruncateOutput(apiReply)}";
+                succeeded = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            reply = $"Command failed on {server}: {ex.Message}";
+            succeeded = false;
         }
 
-        var directReply = await RustDirectRconHelper.TryExecuteAsync(server, command, cancellationToken);
-        if (!string.IsNullOrWhiteSpace(directReply))
+        RecordCommandOutcome(commandRoot, succeeded);
+        return new ToolExecutionResult(succeeded, reply, server, succeeded);
+    }
+
+    private string? CheckCommandPolicy(string commandRoot)
+    {
+        if (_cmdSettings.FreeMode)
+            return null;
+
+        var policy = _memory.LoadCommandPolicy();
+
+        if (policy.Commands.TryGetValue(commandRoot, out var record))
         {
-            return new ToolExecutionResult(true, $"RCON on {server}: {directReply}", server, true);
+            if (record.RequiresApproval)
+                return $"'{commandRoot}' has caused failures before and requires explicit admin approval to run.";
+            if (record.AutoAllowed)
+                return null;
         }
 
-        using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command/exec", new { command }, cancellationToken);
-        var root = response.RootElement;
-        var apiReply = root.TryGetProperty("directReply", out var replyNode) ? replyNode.ToString() : "command sent";
-        return new ToolExecutionResult(true, $"RCON on {server}: {apiReply}", server, true, Payload: root.ToString());
+        // Check static allowList
+        if (_cmdSettings.AllowList.Any(prefix => commandRoot.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+            return null;
+
+        return $"'{commandRoot}' is not on the allowed list. Run it via direct RCON, or say 'allow {commandRoot}' to add it.";
+    }
+
+    private void RecordCommandOutcome(string commandRoot, bool succeeded)
+    {
+        try
+        {
+            var policy = _memory.LoadCommandPolicy();
+            if (!policy.Commands.TryGetValue(commandRoot, out var record))
+            {
+                record = new CommandRecord { Command = commandRoot };
+                policy.Commands[commandRoot] = record;
+            }
+
+            record.LastUsedUtc = DateTime.UtcNow;
+            if (succeeded)
+            {
+                record.SuccessCount++;
+                if (record.SuccessCount >= _cmdSettings.AutoAllowAfterSuccesses && !record.RequiresApproval)
+                    record.AutoAllowed = true;
+            }
+            else
+            {
+                record.FailCount++;
+                if (record.FailCount >= _cmdSettings.RequireApprovalAfterFailures)
+                    record.RequiresApproval = true;
+            }
+
+            _memory.SaveCommandPolicy(policy);
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureException(ex, "Failed to record command policy outcome.", "agent.policy");
+        }
+    }
+
+    private static string TruncateOutput(string output, int maxChars = 800)
+    {
+        output = output.Trim();
+        return output.Length > maxChars ? output[..maxChars] + "…" : output;
     }
 
     private static string ExtractCommand(string message)
     {
         var quoted = Regex.Match(message, "\"(?<cmd>.+?)\"");
         if (quoted.Success)
-        {
             return quoted.Groups["cmd"].Value.Trim();
-        }
 
         var lowered = message.ToLowerInvariant();
-        var markers = new[] { "command", "rcon", "run", "execute", "send" };
-        foreach (var marker in markers)
+        foreach (var marker in new[] { "command", "rcon", "run", "execute", "send" })
         {
             var idx = lowered.IndexOf(marker, StringComparison.Ordinal);
-            if (idx < 0)
-            {
-                continue;
-            }
-
+            if (idx < 0) continue;
             var candidate = message[(idx + marker.Length)..].Trim(' ', ':', '"', '\'', '.');
             if (!string.IsNullOrWhiteSpace(candidate))
-            {
                 return candidate;
-            }
         }
 
         return string.Empty;
@@ -468,11 +541,13 @@ internal sealed class RustLogsToolHandler : IToolHandler
 internal sealed class RustPluginToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
-    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(12) };
+    private readonly Core.Contracts.PluginUpdateSettings _settings;
+    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
 
-    public RustPluginToolHandler(RustOpsApiClient api)
+    public RustPluginToolHandler(RustOpsApiClient api, Core.Contracts.PluginUpdateSettings? settings = null)
     {
         _api = api;
+        _settings = settings ?? new Core.Contracts.PluginUpdateSettings();
     }
 
     public string Name => "rust.plugins.verify";
@@ -496,64 +571,123 @@ internal sealed class RustPluginToolHandler : IToolHandler
 
         using var validate = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/oxide/validate", cancellationToken);
 
+        var wantsInstall = context.Message.Contains("install", StringComparison.OrdinalIgnoreCase)
+            || context.Message.Contains("update", StringComparison.OrdinalIgnoreCase)
+            || context.Message.Contains("download", StringComparison.OrdinalIgnoreCase);
+
         var updateMessages = new List<string>();
+        var pendingDownloads = new List<(string slug, string latestVersion, string downloadUrl)>();
+
         if (validate.RootElement.TryGetProperty("plugins", out var plugins) && plugins.ValueKind == JsonValueKind.Array)
         {
-            foreach (var plugin in plugins.EnumerateArray().Take(12))
+            foreach (var plugin in plugins.EnumerateArray().Take(20))
             {
                 var pluginName = plugin.TryGetProperty("pluginName", out var nameNode) ? nameNode.GetString() : null;
                 var pluginSlug = plugin.TryGetProperty("pluginSlug", out var slugNode) ? slugNode.GetString() : null;
                 var pluginVersion = plugin.TryGetProperty("pluginVersion", out var versionNode) ? versionNode.GetString() : null;
                 var query = !string.IsNullOrWhiteSpace(pluginSlug) ? pluginSlug : pluginName;
                 if (string.IsNullOrWhiteSpace(query))
-                {
                     continue;
-                }
 
                 var escaped = Uri.EscapeDataString(query);
-                var url = $"https://umod.org/plugins/search.json?query={escaped}&page=1&sort=title&sortdir=asc&filter=rust";
+                var searchUrl = string.Format(_settings.SearchUrlTemplate, escaped, _settings.SearchFilter);
                 try
                 {
-                    using var stream = await _http.GetStreamAsync(url, cancellationToken);
+                    using var stream = await _http.GetStreamAsync(searchUrl, cancellationToken);
                     using var responseDoc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-                    if (!responseDoc.RootElement.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array || data.GetArrayLength() == 0)
+                    if (!responseDoc.RootElement.TryGetProperty("data", out var data)
+                        || data.ValueKind != JsonValueKind.Array
+                        || data.GetArrayLength() == 0)
                     {
-                        updateMessages.Add($"{query}: non-uMod or not found (informational)");
+                        updateMessages.Add($"{query}: not on uMod");
                         continue;
                     }
 
-                    var latest = data[0].TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+                    var entry = data[0];
+                    var latest = entry.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+                    var downloadUrl = entry.TryGetProperty("download_url", out var dlNode) ? dlNode.GetString() : null;
+
                     if (string.IsNullOrWhiteSpace(latest) || string.Equals(latest, pluginVersion, StringComparison.OrdinalIgnoreCase))
                     {
-                        updateMessages.Add($"{query}: up to date");
+                        updateMessages.Add($"{query}: up to date ({pluginVersion ?? "?"})");
                     }
                     else
                     {
-                        updateMessages.Add($"{query}: update {pluginVersion ?? "unknown"} -> {latest}");
+                        updateMessages.Add($"{query}: {pluginVersion ?? "?"} → {latest}");
+                        if (!string.IsNullOrWhiteSpace(downloadUrl))
+                            pendingDownloads.Add((query, latest, downloadUrl));
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
-                    updateMessages.Add($"{query}: update check unavailable");
+                    updateMessages.Add($"{query}: check failed ({ex.GetType().Name})");
                 }
             }
         }
 
         var summary = updateMessages.Count > 0
-            ? string.Join(" | ", updateMessages.Take(8))
-            : "No plugin update metadata available.";
+            ? string.Join(" | ", updateMessages)
+            : "No plugin metadata available.";
 
-        return new ToolExecutionResult(true, $"Plugin validation for {server} complete. {summary}", server, false);
+        // Download and stage updates if enabled and admin asked for it
+        if (wantsInstall && _settings.DownloadEnabled && pendingDownloads.Count > 0)
+        {
+            var staged = await StageDownloadsAsync(server, pendingDownloads, cancellationToken);
+            return new ToolExecutionResult(true,
+                $"Plugin check for {server}: {summary}\n{staged}",
+                server, false);
+        }
+
+        var actionHint = pendingDownloads.Count > 0 && _settings.DownloadEnabled
+            ? $" ({pendingDownloads.Count} update(s) available — say 'install updates' to apply)"
+            : string.Empty;
+
+        return new ToolExecutionResult(true, $"Plugin check for {server}: {summary}{actionHint}", server, false);
+    }
+
+    private async Task<string> StageDownloadsAsync(
+        string server,
+        IReadOnlyList<(string slug, string version, string url)> downloads,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(_settings.StagingPath);
+        var staged = new List<string>();
+        var failed = new List<string>();
+
+        foreach (var (slug, version, url) in downloads)
+        {
+            try
+            {
+                var fileName = $"{slug}.cs";
+                var dest = Path.Combine(_settings.StagingPath, fileName);
+                var bytes = await _http.GetByteArrayAsync(url, cancellationToken);
+                await File.WriteAllBytesAsync(dest, bytes, cancellationToken);
+                staged.Add($"{slug} v{version}");
+                Console.WriteLine($"[plugins] Staged {fileName} ({bytes.Length} bytes)");
+            }
+            catch (Exception ex)
+            {
+                failed.Add(slug);
+                Console.WriteLine($"[plugins] Download failed for {slug}: {ex.Message}");
+            }
+        }
+
+        var result = staged.Count > 0 ? $"Staged: {string.Join(", ", staged)}." : string.Empty;
+        if (failed.Count > 0)
+            result += $" Failed: {string.Join(", ", failed)}.";
+        return result.Trim();
     }
 }
 
 internal sealed class RustNetworkToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
+    private readonly IReadOnlyList<string> _trackedInterfaces;
 
-    public RustNetworkToolHandler(RustOpsApiClient api)
+    public RustNetworkToolHandler(RustOpsApiClient api, IReadOnlyList<string>? trackedInterfaces = null)
     {
         _api = api;
+        _trackedInterfaces = trackedInterfaces ?? new[] { "eth0", "wt1", "wg1" };
     }
 
     public string Name => "rust.network.inspect";
@@ -569,10 +703,8 @@ internal sealed class RustNetworkToolHandler : IToolHandler
             foreach (var item in interfaces.EnumerateArray())
             {
                 var name = item.TryGetProperty("name", out var n) ? n.GetString() : null;
-                if (name is not ("eth0" or "wt1" or "wg1"))
-                {
+                if (name is null || !_trackedInterfaces.Contains(name, StringComparer.OrdinalIgnoreCase))
                     continue;
-                }
 
                 var rx = item.TryGetProperty("rxRateMiBps", out var rxNode) ? rxNode.ToString() : "0";
                 var tx = item.TryGetProperty("txRateMiBps", out var txNode) ? txNode.ToString() : "0";
@@ -580,8 +712,9 @@ internal sealed class RustNetworkToolHandler : IToolHandler
             }
         }
 
+        var ifaceList = string.Join(", ", _trackedInterfaces);
         var message = selected.Count == 0
-            ? "No matching interfaces (eth0, wt1, wg1) were available in current network sample."
+            ? $"No tracked interfaces ({ifaceList}) found in current network sample."
             : string.Join(" | ", selected);
 
         return new ToolExecutionResult(true, message);

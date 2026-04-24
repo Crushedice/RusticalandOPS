@@ -13,6 +13,7 @@ internal sealed class NeoCortexStore : IEvolutionStore
     private readonly string _logsPath;
     private readonly string _evolutionPath;
     private readonly string _policyPath;
+    private readonly string _commandPolicyPath;
     private readonly string _cachePath;
     private readonly string _migrationMarkerPath;
 
@@ -25,6 +26,7 @@ internal sealed class NeoCortexStore : IEvolutionStore
         _logsPath = Path.Combine(root, "logs", "log-knowledge.json");
         _evolutionPath = Path.Combine(root, "evolution", "incidents.jsonl");
         _policyPath = Path.Combine(root, "policy", "ignore-feedback.json");
+        _commandPolicyPath = Path.Combine(root, "policy", "command-policy.json");
         _cachePath = Path.Combine(root, "cache", "domain-cache.json");
         _migrationMarkerPath = Path.Combine(root, ".migration-complete");
 
@@ -137,17 +139,27 @@ internal sealed class NeoCortexStore : IEvolutionStore
     public SelectionSessionState LoadSelection() => LoadJson(_selectionPath, new SelectionSessionState());
     public LogKnowledgeState LoadLogs() => LoadJson(_logsPath, new LogKnowledgeState());
     public IgnoreFeedbackState LoadIgnoreFeedback() => LoadJson(_policyPath, new IgnoreFeedbackState());
+    public CommandPolicyState LoadCommandPolicy() => LoadJson(_commandPolicyPath, new CommandPolicyState());
     public DomainCacheState LoadCache() => LoadJson(_cachePath, new DomainCacheState());
 
     public void SaveOperations(ActiveOperationalState state) => SaveJson(_operationsPath, state);
     public void SaveSelection(SelectionSessionState state) => SaveJson(_selectionPath, state);
     public void SaveLogs(LogKnowledgeState state) => SaveJson(_logsPath, state);
     public void SaveIgnoreFeedback(IgnoreFeedbackState state) => SaveJson(_policyPath, state);
+    public void SaveCommandPolicy(CommandPolicyState state) => SaveJson(_commandPolicyPath, state);
     public void SaveCache(DomainCacheState state) => SaveJson(_cachePath, state);
+
+    // Compact (non-indented) options for JSONL — one object per line is required.
+    private static readonly JsonSerializerOptions JsonlOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = false
+    };
 
     public async Task RecordIncidentAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken)
     {
-        var line = JsonSerializer.Serialize(incident, JsonDefaults.Default) + Environment.NewLine;
+        var line = JsonSerializer.Serialize(incident, JsonlOptions) + Environment.NewLine;
         await File.AppendAllTextAsync(_evolutionPath, line, Encoding.UTF8, cancellationToken);
     }
 

@@ -457,7 +457,7 @@ app.MapGet("/host/network/interfaces", async () =>
     {
         var payload = TryExtractJson(result.StdOut);
         return payload is not null
-            ? Results.Text(payload, "application/json")
+            ? Results.Content(payload, "application/json")
             : Results.Ok(new { raw = result.StdOut });
     }
 
@@ -1029,7 +1029,8 @@ app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
     if (!result.Ok) return Results.BadRequest(result);
 
     var n = Math.Max(1, lines.GetValueOrDefault(defaultConsoleLines));
-    return Results.Text(TailLines(result.StdOut ?? string.Empty, n), "text/plain; charset=utf-8");
+    var content = TailLines(result.StdOut ?? string.Empty, n);
+    return Results.Ok(new { server, lines = n, content });
 });
 
 // -- Agent convenience: structured recent log lines ----------------------------
@@ -1037,7 +1038,7 @@ app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
 // agent ask "what happened in the last N minutes" without sending the full log.
 // Lines that don't start with a recognised timestamp are attached to the
 // previous entry as continuation text (stack traces etc).
-app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, string? since) =>
+app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, string? since, int? offset) =>
 {
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -1053,9 +1054,16 @@ app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, stri
     if (!string.IsNullOrWhiteSpace(since) && DateTime.TryParse(since, out var sinceUtc))
         entries = entries.Where(e => e.Timestamp == null || e.Timestamp >= sinceUtc).ToList();
 
+    var skip  = Math.Max(0, offset.GetValueOrDefault(0));
+    var total = entries.Count;
+    if (skip > 0)
+        entries = entries.Skip(skip).ToList();
+
     return Results.Ok(new
     {
         server,
+        total,
+        offset = skip,
         count  = entries.Count,
         entries
     });
@@ -1098,7 +1106,8 @@ app.MapGet("/servers/{server}/commands", async (string server, int? lines) =>
     var result = await ExecRustMgrAsync("commands", server, n.ToString());
     if (!result.Ok) return Results.BadRequest(result);
 
-    return Results.Text(result.StdOut ?? string.Empty, "text/plain; charset=utf-8");
+    var content = result.StdOut ?? string.Empty;
+    return Results.Ok(new { server, lines = n, content });
 });
 
 // -- Agent convenience: command trace as structured JSON -----------------------
@@ -1144,7 +1153,7 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse serverinfo response."))
-            : Results.Text(payload, "application/json");
+            : Results.Content(payload, "application/json");
     }
     catch (Exception ex)
     {
@@ -1152,7 +1161,7 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
         var fallback = await ExecRustMgrAsync("query", server, "serverinfo");
         var payload = TryExtractJson(fallback.StdOut);
         return fallback.Ok && payload is not null
-            ? Results.Text(payload, "application/json")
+            ? Results.Content(payload, "application/json")
             : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
@@ -1179,7 +1188,7 @@ app.MapGet("/servers/{server}/players", async (string server) =>
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse playerlist response."))
-            : Results.Text(payload, "application/json");
+            : Results.Content(payload, "application/json");
     }
     catch (Exception ex)
     {
@@ -1187,7 +1196,7 @@ app.MapGet("/servers/{server}/players", async (string server) =>
         var fallback = await ExecRustMgrAsync("query", server, "playerlist");
         var payload = TryExtractJson(fallback.StdOut);
         return fallback.Ok && payload is not null
-            ? Results.Text(payload, "application/json")
+            ? Results.Content(payload, "application/json")
             : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
@@ -1214,7 +1223,7 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse bans response."))
-            : Results.Text(payload, "application/json");
+            : Results.Content(payload, "application/json");
     }
     catch (Exception ex)
     {
@@ -1222,7 +1231,7 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
         var fallback = await ExecRustMgrAsync("query", server, "bans");
         var payload = TryExtractJson(fallback.StdOut);
         return fallback.Ok && payload is not null
-            ? Results.Text(payload, "application/json")
+            ? Results.Content(payload, "application/json")
             : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });

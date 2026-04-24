@@ -106,7 +106,15 @@ internal sealed class ConversationSelectionState
     [JsonPropertyName("lastTimeRange")] public string? LastTimeRange { get; set; }
     [JsonPropertyName("lastUserMessageSummary")] public string? LastUserMessageSummary { get; set; }
     [JsonPropertyName("pendingClarification")] public ConversationPendingClarification? PendingClarification { get; set; }
+    [JsonPropertyName("recentMessages")] public List<ConversationMessage> RecentMessages { get; set; } = new();
     [JsonPropertyName("updatedAtUtc")] public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
+}
+
+internal sealed class ConversationMessage
+{
+    [JsonPropertyName("role")] public string Role { get; set; } = "user";
+    [JsonPropertyName("text")] public string Text { get; set; } = string.Empty;
+    [JsonPropertyName("atUtc")] public DateTime AtUtc { get; set; } = DateTime.UtcNow;
 }
 
 internal sealed class ConversationPendingClarification
