@@ -62,6 +62,13 @@ internal sealed class IntegrationSettings
         LogsEndpointPath = "/api/v2/audit/logs",
         StatusEndpointPath = "/api/v2/account"
     };
+    [JsonPropertyName("itGlue")] public ApiConnectorSettings ItGlue { get; set; } = new()
+    {
+        Enabled = false,
+        Name = "itglue",
+        LogsEndpointPath = "/api/v2/logs",
+        StatusEndpointPath = "/api/v2/account"
+    };
 }
 
 internal sealed class ApiConnectorSettings

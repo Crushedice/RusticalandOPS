@@ -118,6 +118,14 @@
       "accessToken": "${OPS_DATTO_RMM_ACCESS_TOKEN}",
       "logsEndpointPath": "/api/v2/audit/logs",
       "statusEndpointPath": "/api/v2/account"
+    },
+    "itGlue": {
+      "enabled": false,
+      "name": "itglue",
+      "baseUrl": "${OPS_ITGLUE_BASE_URL}",
+      "apiKey": "${OPS_ITGLUE_API_KEY}",
+      "logsEndpointPath": "/api/v2/logs",
+      "statusEndpointPath": "/api/v2/account"
     }
   },
   "llm": {
