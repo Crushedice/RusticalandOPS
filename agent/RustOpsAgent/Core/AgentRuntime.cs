@@ -26,6 +26,8 @@ internal sealed class AgentRuntime
     private readonly Dictionary<string, string> _observationFingerprints = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _appliedAffinityPids = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _compileErrorCounts = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, bool> _serverInitialized = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _remoteServers = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _adminLocks = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastObservationAtUtc = DateTime.MinValue;
     private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
@@ -345,8 +347,22 @@ internal sealed class AgentRuntime
 
             // If there's an outstanding clarification and the classifier didn't find a new intent,
             // re-route to the handler that originally asked the question so it can process the answer.
+            // BUT: skip this if the message contains explicit intent signals (pull, git, rebuild, etc.)
+            // indicating a new request, not a clarification answer.
             var pending = state.PendingClarification;
+            var messageLowered = item.Message.ToLowerInvariant();
+            var hasExplicitNewIntent = messageLowered.Contains("pull", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("git", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("rebuild", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("restart", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("start ", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("stop", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("kill", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("update", StringComparison.Ordinal) ||
+                                       messageLowered.Contains("wipe", StringComparison.Ordinal);
+
             if (pending is not null &&
+                !hasExplicitNewIntent &&
                 (route.Intent == AdminIntentType.Clarification || route.Intent == AdminIntentType.Chat) &&
                 Enum.TryParse<AdminIntentType>(pending.Intent, true, out var pendingIntent) &&
                 pendingIntent != AdminIntentType.Clarification)
@@ -607,10 +623,33 @@ internal sealed class AgentRuntime
         try
         {
             using var list = await _api.GetAsync("/servers", cancellationToken);
+            _remoteServers.Clear();
             servers = list.RootElement.ValueKind == JsonValueKind.Array
                 ? list.RootElement.EnumerateArray()
-                    .Where(node => node.ValueKind == JsonValueKind.String)
-                    .Select(node => node.GetString())
+                    .Select(node =>
+                    {
+                        // API returns either string (legacy) or {name, configExists, remote} objects
+                        string? name = null;
+                        bool isRemote = false;
+                        if (node.ValueKind == JsonValueKind.String)
+                        {
+                            name = node.GetString();
+                        }
+                        else if (node.ValueKind == JsonValueKind.Object)
+                        {
+                            if (node.TryGetProperty("name", out var nameNode))
+                                name = nameNode.GetString();
+                            if (node.TryGetProperty("remote", out var remoteNode) && remoteNode.ValueKind == JsonValueKind.True)
+                                isRemote = true;
+                        }
+                        if (!string.IsNullOrWhiteSpace(name))
+                        {
+                            if (isRemote)
+                                _remoteServers.Add(name!);
+                            return name;
+                        }
+                        return null;
+                    })
                     .Where(name => !string.IsNullOrWhiteSpace(name))
                     .Select(name => name!)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -635,7 +674,8 @@ internal sealed class AgentRuntime
 
             try
             {
-                await ObserveServerHealthAsync(server, cancellationToken);
+                if (!_remoteServers.Contains(server))
+                    await ObserveServerHealthAsync(server, cancellationToken);
                 await ObserveServerLogsAsync(server, cancellationToken);
             }
             catch (Exception ex)
@@ -740,6 +780,10 @@ internal sealed class AgentRuntime
         if (string.IsNullOrWhiteSpace(playerName) || string.IsNullOrWhiteSpace(chatMessage))
             return null;
 
+        // Reject obviously non-player entries: names with commas (plugin lists), newlines, or excessive length
+        if (playerName.Contains(',') || playerName.Contains('\n') || playerName.Length > 60)
+            return null;
+
         return (playerName, chatMessage);
     }
 
@@ -778,7 +822,24 @@ internal sealed class AgentRuntime
                 if (string.IsNullOrWhiteSpace(line))
                     continue;
 
+                // Skip all noise before the server fully initializes.
+                if (line.Contains("SteamServer Initialized", StringComparison.OrdinalIgnoreCase))
+                {
+                    _serverInitialized[server] = true;
+                    Console.WriteLine($"[observe] {server}: SteamServer initialized — log monitoring active.");
+                    continue; // skip the init line itself; it's just a marker
+                }
+                if (!_serverInitialized.TryGetValue(server, out var initialized) || !initialized)
+                    continue;
+
+                // Detect server restart: Unity/Steam init lines only appear at the start of a new boot.
                 var lowered = line.ToLowerInvariant();
+                if (initialized && (lowered.Contains("initializing steam") || lowered.StartsWith("oxide version")))
+                {
+                    _serverInitialized[server] = false;
+                    Console.WriteLine($"[observe] {server}: Server restart detected — waiting for SteamServer Initialized.");
+                    continue;
+                }
 
                 // --- Player chat stream ---
                 var parsed = TryParseChatLine(line);

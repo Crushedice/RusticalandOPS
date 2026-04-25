@@ -1,4 +1,5 @@
 using RustOpsAgent.Core.Contracts;
+using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.Memory;
 
 namespace RustOpsAgent.Domains.Rust;
@@ -6,22 +7,48 @@ namespace RustOpsAgent.Domains.Rust;
 internal sealed class RustChatToolHandler : IToolHandler
 {
     private readonly NeoCortexStore _memory;
+    private readonly AutoPullService? _autoPull;
 
-    public RustChatToolHandler(NeoCortexStore memory)
+    public RustChatToolHandler(NeoCortexStore memory, AutoPullService? autoPull = null)
     {
         _memory = memory;
+        _autoPull = autoPull;
     }
 
     public string Name => "rust.chat.reply";
     public IReadOnlyCollection<AdminIntentType> EligibleIntents => new[] { AdminIntentType.Chat, AdminIntentType.Clarification };
 
-    public Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
         if (context.Route.Intent == AdminIntentType.Clarification)
         {
             var question = context.Route.ClarificationQuestion
                 ?? "Could you clarify what you need? Which server and what action?";
-            return Task.FromResult(new ToolExecutionResult(true, question, context.SelectionState.LastServerName));
+            return new ToolExecutionResult(true, question, context.SelectionState.LastServerName);
+        }
+
+        // Detect and handle git pull/rebuild operations
+        var messageLowered = context.Message.ToLowerInvariant();
+        if (IsGitPullRebuildRequest(messageLowered) && _autoPull != null)
+        {
+            try
+            {
+                var status = await _autoPull.TriggerAsync(cancellationToken);
+                var resultMessage = $"Pull/rebuild: {status.Phase}. {status.Output}";
+                return new ToolExecutionResult(
+                    status.Phase != "error",
+                    resultMessage,
+                    null,
+                    Payload: new { autoPullPhase = status.Phase, autoPullOutput = status.Output, autoPullError = status.Error });
+            }
+            catch (Exception ex)
+            {
+                return new ToolExecutionResult(
+                    false,
+                    $"Pull/rebuild failed: {ex.Message}",
+                    null,
+                    Payload: new { autoPullError = ex.Message });
+            }
         }
 
         object? payload = null;
@@ -64,12 +91,17 @@ internal sealed class RustChatToolHandler : IToolHandler
             // Compose with no payload — LLM will still answer.
         }
 
-        return Task.FromResult(new ToolExecutionResult(
+        return new ToolExecutionResult(
             true,
             "Ready.",
-            context.SelectionState.LastServerName,
-            Payload: payload));
+            null,  // Chat operations are not server-specific
+            Payload: payload);
     }
+
+    private static bool IsGitPullRebuildRequest(string loweredMessage) =>
+        (loweredMessage.Contains("pull", StringComparison.Ordinal) && loweredMessage.Contains("main", StringComparison.Ordinal)) ||
+        (loweredMessage.Contains("git", StringComparison.Ordinal) && loweredMessage.Contains("pull", StringComparison.Ordinal)) ||
+        (loweredMessage.Contains("rebuild", StringComparison.Ordinal) && (loweredMessage.Contains("pull", StringComparison.Ordinal) || loweredMessage.Contains("code", StringComparison.Ordinal) || loweredMessage.Contains("agent", StringComparison.Ordinal)));
 
     private static string FormatAge(DateTime ts)
     {

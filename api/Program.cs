@@ -605,8 +605,89 @@ app.MapGet("/host/network/interfaces", async () =>
 
 app.MapGet("/host/network/summary", () => Results.Ok(BuildHostNetworkSummary()));
 
+// -- Remote Server Helpers -------------------------------------------------------
+List<RemoteServerEntry> LoadRemoteServers()
+{
+    var path = Path.Combine(configDir, "remote-servers.json");
+    if (!File.Exists(path))
+        return new();
+    try
+    {
+        var json = File.ReadAllText(path);
+        var doc = JsonDocument.Parse(json);
+        if (doc.RootElement.TryGetProperty("servers", out var serversArr) &&
+            serversArr.ValueKind == JsonValueKind.Array)
+        {
+            var servers = new List<RemoteServerEntry>();
+            foreach (var entry in serversArr.EnumerateArray())
+            {
+                var name = entry.TryGetProperty("name", out var n) ? n.GetString() : null;
+                var displayName = entry.TryGetProperty("displayName", out var d) ? d.GetString() : null;
+                var rconIp = entry.TryGetProperty("rconIp", out var ip) ? ip.GetString() : null;
+                var rconPort = entry.TryGetProperty("rconPort", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
+                var rconPassword = entry.TryGetProperty("rconPassword", out var pwd) ? pwd.GetString() : null;
+                var gamePort = entry.TryGetProperty("gamePort", out var gp) && gp.ValueKind == JsonValueKind.Number ? gp.GetInt32() : 0;
+                if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(rconIp) &&
+                    rconPort > 0 && !string.IsNullOrWhiteSpace(rconPassword))
+                {
+                    servers.Add(new RemoteServerEntry(
+                        name, displayName ?? name, rconIp, rconPort, rconPassword, gamePort));
+                }
+            }
+            return servers;
+        }
+    }
+    catch { }
+    return new();
+}
+
+void SaveRemoteServers(List<RemoteServerEntry> servers)
+{
+    var path = Path.Combine(configDir, "remote-servers.json");
+    var doc = new JsonObject
+    {
+        ["servers"] = JsonValue.Create(servers.Select(s => new JsonObject
+        {
+            ["name"] = s.Name,
+            ["displayName"] = s.DisplayName,
+            ["rconIp"] = s.RconIp,
+            ["rconPort"] = s.RconPort,
+            ["rconPassword"] = s.RconPassword,
+            ["gamePort"] = s.GamePort
+        }).ToList())
+    };
+    File.WriteAllText(path, JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true }));
+}
+
+void WriteRemoteServerStubConfig(RemoteServerEntry server)
+{
+    var path = Path.Combine(configDir, $"{server.Name}.json");
+    var config = new JsonObject
+    {
+        ["name"] = server.Name,
+        ["remote"] = true,
+        ["rcon.ip"] = server.RconIp,
+        ["rcon.port"] = server.RconPort,
+        ["rcon.password"] = server.RconPassword
+    };
+    File.WriteAllText(path, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
+}
+
+void DeleteRemoteServerStubConfig(string name)
+{
+    var path = Path.Combine(configDir, $"{name}.json");
+    if (File.Exists(path))
+        File.Delete(path);
+}
+
+bool IsRemoteServerName(string name)
+{
+    var remoteServers = LoadRemoteServers();
+    return remoteServers.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+}
+
 // -- Server list ---------------------------------------------------------------
-// Calls rustmgr list as the authoritative source, then cross-checks config dir.
+// Calls rustmgr list as the authoritative source, then includes remote servers.
 app.MapGet("/servers", async () =>
 {
     var result = await ExecRustMgrAsync("list");
@@ -617,11 +698,115 @@ app.MapGet("/servers", async () =>
         .Where(n => !string.IsNullOrWhiteSpace(n))
         .ToList();
 
-    return Results.Ok(names.Select(name => new
+    var localServers = names.Select(name => new
     {
         name,
-        configExists = File.Exists(Path.Combine(configDir, $"{name}.json"))
+        configExists = File.Exists(Path.Combine(configDir, $"{name}.json")),
+        remote = false
+    }).Cast<object>().ToList();
+
+    // Add remote servers
+    var remoteServers = LoadRemoteServers();
+    var remoteServerObjs = remoteServers.Select(s => new
+    {
+        name = s.Name,
+        configExists = true,
+        remote = true
+    }).Cast<object>().ToList();
+
+    localServers.AddRange(remoteServerObjs);
+    return Results.Ok(localServers);
+});
+
+// -- Remote Server CRUD ----------------------------------------------------------
+app.MapGet("/servers/remote/list", () =>
+{
+    var remoteServers = LoadRemoteServers();
+    return Results.Ok(remoteServers.Select(s => new
+    {
+        name = s.Name,
+        displayName = s.DisplayName,
+        rconIp = s.RconIp,
+        rconPort = s.RconPort,
+        gamePort = s.GamePort
     }));
+});
+
+app.MapPost("/servers/remote", (RemoteServerEntry server) =>
+{
+    if (string.IsNullOrWhiteSpace(server.Name))
+        return Results.BadRequest(new ApiError("invalid_name", "Server name is required"));
+
+    var remoteServers = LoadRemoteServers();
+    if (remoteServers.Any(s => s.Name.Equals(server.Name, StringComparison.OrdinalIgnoreCase)))
+        return Results.BadRequest(new ApiError("duplicate_name", "A remote server with this name already exists"));
+
+    if (File.Exists(Path.Combine(configDir, $"{server.Name}.json")))
+        return Results.BadRequest(new ApiError("local_exists", "A local server with this name already exists"));
+
+    remoteServers.Add(server);
+    SaveRemoteServers(remoteServers);
+    WriteRemoteServerStubConfig(server);
+
+    return Results.Created($"/servers/{server.Name}", new { name = server.Name, remote = true });
+});
+
+app.MapPut("/servers/remote/{name}", (string name, RemoteServerEntry updated) =>
+{
+    if (!name.Equals(updated.Name, StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new ApiError("name_mismatch", "Server name in URL and body must match"));
+
+    var remoteServers = LoadRemoteServers();
+    var idx = remoteServers.FindIndex(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    if (idx < 0)
+        return Results.NotFound();
+
+    remoteServers[idx] = updated;
+    SaveRemoteServers(remoteServers);
+    WriteRemoteServerStubConfig(updated);
+
+    return Results.Ok(new { name = updated.Name, remote = true });
+});
+
+app.MapDelete("/servers/remote/{name}", (string name) =>
+{
+    var remoteServers = LoadRemoteServers();
+    var idx = remoteServers.FindIndex(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    if (idx < 0)
+        return Results.NotFound();
+
+    remoteServers.RemoveAt(idx);
+    SaveRemoteServers(remoteServers);
+    DeleteRemoteServerStubConfig(name);
+
+    return Results.NoContent();
+});
+
+app.MapPost("/servers/remote/{name}/test", async (string name) =>
+{
+    var remoteServers = LoadRemoteServers();
+    var server = remoteServers.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    if (server == null)
+        return Results.NotFound();
+
+    try
+    {
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await using var rcon = new RustRcon(server.RconIp, (ushort)server.RconPort, server.RconPassword);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await rcon.ConnectAsync(cts.Token);
+        var reply = await rcon.SendAndReceiveAsync("status", cts.Token);
+        sw.Stop();
+        return Results.Ok(new { ok = true, latencyMs = sw.ElapsedMilliseconds });
+    }
+    catch (OperationCanceledException)
+    {
+        return Results.BadRequest(new ApiError("timeout", "RCON connection timeout after 5 seconds"));
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("connection_failed", $"Failed to connect to RCON: {ex.Message}"));
+    }
 });
 
 // -- Agent convenience: all servers with status in one call --------------------
@@ -661,6 +846,18 @@ app.MapGet("/servers/{server}/status", async (string server) =>
 // The agent calls this instead of assembling several calls itself.
 app.MapGet("/servers/{server}/health", async (string server) =>
 {
+    // Check if this is a remote server first
+    if (IsRemoteServerName(server))
+    {
+        return Results.Ok(new
+        {
+            name = server,
+            state = "rcon-only",
+            remote = true,
+            checkedAt = DateTime.UtcNow
+        });
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -703,6 +900,9 @@ app.MapGet("/servers/{server}/health", async (string server) =>
 // -- Start ---------------------------------------------------------------------
 app.MapPost("/servers/{server}/start", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Start/stop operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -716,6 +916,9 @@ app.MapPost("/servers/{server}/start", async (string server) =>
 // -- Stop ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/stop", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Start/stop operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -726,6 +929,9 @@ app.MapPost("/servers/{server}/stop", async (string server) =>
 // -- Restart -------------------------------------------------------------------
 app.MapPost("/servers/{server}/restart", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Start/stop/restart operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -739,6 +945,9 @@ app.MapPost("/servers/{server}/restart", async (string server) =>
 // -- Kill ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/kill", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -749,6 +958,9 @@ app.MapPost("/servers/{server}/kill", async (string server) =>
 // -- Update (SteamCMD) ---------------------------------------------------------
 app.MapPost("/servers/{server}/update", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Update operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -759,6 +971,9 @@ app.MapPost("/servers/{server}/update", async (string server) =>
 // -- uMod update ---------------------------------------------------------------
 app.MapPost("/servers/{server}/umod", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -769,6 +984,9 @@ app.MapPost("/servers/{server}/umod", async (string server) =>
 // -- Sync config ---------------------------------------------------------------
 app.MapPost("/servers/{server}/sync-config", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -781,6 +999,9 @@ app.MapPost("/servers/{server}/sync-config", async (string server) =>
 // the script; the API just proxies it.
 app.MapPost("/servers/{server}/wipe", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Wipe operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -3491,10 +3712,10 @@ static string BuildDashboardHtml() => """
       const today = new Date().toDateString();
       const todayMsgs = messages.filter(m => m.capturedAtUtc && new Date(m.capturedAtUtc).toDateString() === today);
 
-      // Word frequency (excluding common stopwords)
+      // Word frequency (excluding common stopwords) — today only
       const stopwords = new Set(['the','and','to','a','in','i','you','is','it','of','for','on','that','this','was','are','with','he','she','they','we','be','at','by','not','my','have','had','has','do','me','can','get','just','so','go','up','got','did','yeah','ok','im','its','but','no','yes','hey','lol','gg','wtf','idk']);
       const freq = {};
-      for (const m of messages) { for (const [w] of ((m.message||'').toLowerCase().matchAll(/\b[a-z]{3,}\b/g))) { if (!stopwords.has(w)) freq[w] = (freq[w]||0) + 1; } }
+      for (const m of todayMsgs) { for (const [w] of ((m.message||'').toLowerCase().matchAll(/\b[a-z]{3,}\b/g))) { if (!stopwords.has(w)) freq[w] = (freq[w]||0) + 1; } }
       const topWords = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,8);
 
       // Fun word counts for today
@@ -4507,6 +4728,8 @@ public sealed class ServerConfig
 }
 
 public sealed record RconConnectionInfo(string Host, ushort Port, string Password, bool WebRconEnabled);
+
+public sealed record RemoteServerEntry(string Name, string DisplayName, string RconIp, int RconPort, string RconPassword, int GamePort = 0);
 
 internal sealed record IncidentFeedbackEntry(string? Verdict, string? Note, DateTime? AnsweredAtUtc);
 

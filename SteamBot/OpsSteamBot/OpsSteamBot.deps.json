@@ -1,0 +1,126 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0/linux-x64",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {},
+    ".NETCoreApp,Version=v8.0/linux-x64": {
+      "OpsSteamBot/1.0.0": {
+        "dependencies": {
+          "Sentry": "6.1.0",
+          "SteamKit2": "3.3.1"
+        },
+        "runtime": {
+          "OpsSteamBot.dll": {}
+        }
+      },
+      "protobuf-net/3.2.56": {
+        "dependencies": {
+          "protobuf-net.Core": "3.2.56"
+        },
+        "runtime": {
+          "lib/net8.0/protobuf-net.dll": {
+            "assemblyVersion": "3.0.0.0",
+            "fileVersion": "3.2.56.57311"
+          }
+        }
+      },
+      "protobuf-net.Core/3.2.56": {
+        "runtime": {
+          "lib/net8.0/protobuf-net.Core.dll": {
+            "assemblyVersion": "3.0.0.0",
+            "fileVersion": "3.2.56.57311"
+          }
+        }
+      },
+      "Sentry/6.1.0": {
+        "runtime": {
+          "lib/net8.0/Sentry.dll": {
+            "assemblyVersion": "6.1.0.0",
+            "fileVersion": "6.1.0.0"
+          }
+        }
+      },
+      "SteamKit2/3.3.1": {
+        "dependencies": {
+          "System.IO.Hashing": "9.0.8",
+          "ZstdSharp.Port": "0.8.6",
+          "protobuf-net": "3.2.56"
+        },
+        "runtime": {
+          "lib/net8.0/SteamKit2.dll": {
+            "assemblyVersion": "3.3.1.0",
+            "fileVersion": "3.3.1.0"
+          }
+        }
+      },
+      "System.IO.Hashing/9.0.8": {
+        "runtime": {
+          "lib/net8.0/System.IO.Hashing.dll": {
+            "assemblyVersion": "9.0.0.8",
+            "fileVersion": "9.0.825.36511"
+          }
+        }
+      },
+      "ZstdSharp.Port/0.8.6": {
+        "runtime": {
+          "lib/net8.0/ZstdSharp.dll": {
+            "assemblyVersion": "0.8.6.0",
+            "fileVersion": "0.8.6.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "OpsSteamBot/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "protobuf-net/3.2.56": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-4IPJeTYAMNewlN8MDaFkcmR/9hLhJeo9eARnTh104zh7mf+vXT2gu5MUfUnkSQU+CH578Q6vcdU7LQDQPG6eaw==",
+      "path": "protobuf-net/3.2.56",
+      "hashPath": "protobuf-net.3.2.56.nupkg.sha512"
+    },
+    "protobuf-net.Core/3.2.56": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-d6QOukTpDzs7zZv9tPnBZMtvHDNeHJQXUhMx54g4urUQsXK3oo9U70H9HvklYq7hlQ4A7AHJl7EVEqyCXXIl8Q==",
+      "path": "protobuf-net.core/3.2.56",
+      "hashPath": "protobuf-net.core.3.2.56.nupkg.sha512"
+    },
+    "Sentry/6.1.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-8d0ql+JAjVMo3WG+MHj62oh3jZVZrwWa/ExVcT0NIRcf6Qsig7wsagwaumWvlXj9F850V+YSyNHWyNNrAipFeA==",
+      "path": "sentry/6.1.0",
+      "hashPath": "sentry.6.1.0.nupkg.sha512"
+    },
+    "SteamKit2/3.3.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-fXsZZoNPITnBfENq7NTs9rHelJ/iht4I70/MK/tZjX86fN/REz1zburS2LCwFYZ8e48m6K7VAT+4vUUqya3/3g==",
+      "path": "steamkit2/3.3.1",
+      "hashPath": "steamkit2.3.3.1.nupkg.sha512"
+    },
+    "System.IO.Hashing/9.0.8": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-5TJUS9EIYrp0VEcm06EPYxXmLmsVUakewFnM/CAxQfvlasI9fGkTKM9afSf2dodZcMCzFna/o7Fn+gYRt3uTiA==",
+      "path": "system.io.hashing/9.0.8",
+      "hashPath": "system.io.hashing.9.0.8.nupkg.sha512"
+    },
+    "ZstdSharp.Port/0.8.6": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-iP4jVLQoQmUjMU88g1WObiNr6YKZGvh4aOXn3yOJsHqZsflwRsxZPcIBvNXgjXO3vQKSLctXGLTpcBPLnWPS8A==",
+      "path": "zstdsharp.port/0.8.6",
+      "hashPath": "zstdsharp.port.0.8.6.nupkg.sha512"
+    }
+  }
+}

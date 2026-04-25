@@ -1178,6 +1178,9 @@ internal static class RustDirectRconHelper
 
         using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
         var root = cfg.RootElement;
+        var host = root.TryGetProperty("rcon.ip", out var ipNode) && ipNode.ValueKind == JsonValueKind.String
+            ? ipNode.GetString() ?? "127.0.0.1"
+            : "127.0.0.1";
         var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
             ? portNode.GetInt32()
             : 0;
@@ -1191,6 +1194,6 @@ internal static class RustDirectRconHelper
         }
 
         var encodedPassword = Uri.EscapeDataString(password);
-        return (new Uri($"ws://127.0.0.1:{port}/{encodedPassword}"), password);
+        return (new Uri($"ws://{host}:{port}/{encodedPassword}"), password);
     }
 }

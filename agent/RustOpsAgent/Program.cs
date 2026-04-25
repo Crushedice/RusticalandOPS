@@ -150,7 +150,7 @@ var handlers = new List<IToolHandler>
     new RustPluginToolHandler(apiClient, config.PluginUpdates),
     new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
     new RustFileEditToolHandler(apiClient, gitOps, config.GitOps),
-    new RustChatToolHandler(neoCortex)
+    new RustChatToolHandler(neoCortex, autoPull)
 };
 
 var registry = new ToolRegistry(handlers);
