@@ -130,6 +130,27 @@ regex_escape() {
     printf '%s' "$1" | sed -e 's/[][(){}.^$+*?|\\/]/\\&/g'
 }
 
+additional_arg_value() {
+    local additional_args="$1"
+    local key="$2"
+    local escaped_key
+    escaped_key="$(regex_escape "$key")"
+
+    local quoted_pattern="(^|[[:space:]])\\+${escaped_key}[[:space:]]+\"([^\"]+)\""
+    if [[ "$additional_args" =~ $quoted_pattern ]]; then
+        echo "${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    local unquoted_pattern="(^|[[:space:]])\\+${escaped_key}[[:space:]]+([^[:space:]]+)"
+    if [[ "$additional_args" =~ $unquoted_pattern ]]; then
+        echo "${BASH_REMATCH[2]}"
+        return 0
+    fi
+
+    echo ""
+}
+
 server_identity() {
     local server="$1"
     local cfg
@@ -1062,32 +1083,39 @@ rcon_send() {
     local command="$2"
     local return_output="${3:-0}"
 
-    local cfg rcon_port rcon_password
+    local cfg additional_args rcon_port rcon_password rcon_host
     cfg="$(server_config_path "$server")"
     if [[ ! -f "$cfg" ]]; then
         return 1
     fi
 
+    additional_args="$(json_get_or_empty "$cfg" '.additionalArgs')"
     rcon_port="$(json_get_or_empty "$cfg" '.["rcon.port"]')"
     rcon_password="$(json_get_or_empty "$cfg" '.["rcon.password"]')"
+    rcon_host="$(json_get_or_empty "$cfg" '.["rcon.ip"]')"
+    [[ -n "$rcon_host" ]] || rcon_host="$(additional_arg_value "$additional_args" "rcon.ip")"
+    [[ -n "$rcon_host" ]] || rcon_host="$(json_get_or_empty "$cfg" '.["server.ip"]')"
+    [[ -n "$rcon_host" ]] || rcon_host="$(additional_arg_value "$additional_args" "server.ip")"
+    [[ -n "$rcon_host" ]] || rcon_host="127.0.0.1"
 
     if [[ -z "$rcon_port" || -z "$rcon_password" ]]; then
         return 1
     fi
 
-    python3 - "$rcon_port" "$rcon_password" "$command" "$return_output" <<'PY'
+    python3 - "$rcon_host" "$rcon_port" "$rcon_password" "$command" "$return_output" <<'PY'
 import sys, socket, base64, json, os
 
-port = int(sys.argv[1])
-password = sys.argv[2]
-command = sys.argv[3]
-return_output = sys.argv[4] == "1"
+host = sys.argv[1]
+port = int(sys.argv[2])
+password = sys.argv[3]
+command = sys.argv[4]
+return_output = sys.argv[5] == "1"
 
 # Use a proper random WebSocket key (RFC 6455 §4.1)
 raw_key = os.urandom(16)
 key = base64.b64encode(raw_key).decode('utf-8')
 req = (f"GET /{password} HTTP/1.1\r\n"
-       f"Host: 127.0.0.1:{port}\r\n"
+       f"Host: {host}:{port}\r\n"
        f"Upgrade: websocket\r\n"
        f"Connection: Upgrade\r\n"
        f"Sec-WebSocket-Key: {key}\r\n"
@@ -1098,7 +1126,7 @@ connect_timeout = 8.0 if return_output else 4.0
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(connect_timeout)
 try:
-    s.connect(("127.0.0.1", port))
+    s.connect((host, port))
     s.sendall(req.encode('utf-8'))
     resp = b""
     while b"\r\n\r\n" not in resp:

@@ -38,7 +38,7 @@ internal sealed class AutoPullService
         try
         {
             var gitEnv = BuildGitEnv();
-            var pullOut = await RunAsync("git", $"pull {_settings.RemoteName} {_settings.BranchName}", _settings.RepoPath, gitEnv, cancellationToken);
+            var pullOut = await PullWithFallbackAsync(gitEnv, cancellationToken);
             output.AppendLine(pullOut);
             Console.WriteLine($"[autopull] git pull: {pullOut.Trim()}");
 
@@ -79,6 +79,56 @@ internal sealed class AutoPullService
         return _lastStatus;
     }
 
+    private async Task<string> PullWithFallbackAsync(Dictionary<string, string>? gitEnv, CancellationToken cancellationToken)
+    {
+        // Prefer upstream tracking config first so autopull works regardless of branch naming.
+        // This avoids hard dependency on autoPull.branchName and respects the checked-out branch.
+        try
+        {
+            return await RunAsync("git", "pull --ff-only", _settings.RepoPath, gitEnv, cancellationToken);
+        }
+        catch (InvalidOperationException ex) when (IsNoTrackingInfoError(ex.Message) || IsMissingRemoteRefError(ex.Message))
+        {
+            var fallbackLines = new List<string>
+            {
+                $"[autopull] Upstream pull unavailable ({TrimMessage(ex.Message)}). Trying explicit remote branch fallback."
+            };
+            Console.WriteLine(fallbackLines[0]);
+
+            var remoteHeadBranch = await TryResolveRemoteHeadBranchAsync(gitEnv, cancellationToken);
+            var candidates = new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(remoteHeadBranch))
+            {
+                candidates.Add(remoteHeadBranch!);
+            }
+
+            if (!string.IsNullOrWhiteSpace(_settings.BranchName) &&
+                !candidates.Contains(_settings.BranchName, StringComparer.OrdinalIgnoreCase))
+            {
+                candidates.Add(_settings.BranchName);
+            }
+
+            foreach (var branch in candidates)
+            {
+                try
+                {
+                    var fallbackArgs = $"pull --ff-only {_settings.RemoteName} {branch}";
+                    var fallbackOut = await RunAsync("git", fallbackArgs, _settings.RepoPath, gitEnv, cancellationToken);
+                    fallbackLines.Add($"[autopull] Fell back to remote '{_settings.RemoteName}/{branch}'.");
+                    fallbackLines.Add(fallbackOut);
+                    return string.Join(Environment.NewLine, fallbackLines);
+                }
+                catch (Exception fallbackEx)
+                {
+                    fallbackLines.Add($"[autopull] Fallback to '{_settings.RemoteName}/{branch}' failed: {TrimMessage(fallbackEx.Message)}");
+                }
+            }
+
+            throw new InvalidOperationException(string.Join(Environment.NewLine, fallbackLines));
+        }
+    }
+
     private Dictionary<string, string>? BuildGitEnv()
     {
         if (string.IsNullOrWhiteSpace(_settings.GithubToken))
@@ -98,7 +148,76 @@ internal sealed class AutoPullService
         };
     }
 
+    private async Task<string?> TryResolveRemoteHeadBranchAsync(Dictionary<string, string>? gitEnv, CancellationToken cancellationToken)
+    {
+        var symbolic = await RunAllowFailureAsync(
+            "git",
+            $"symbolic-ref --quiet --short refs/remotes/{_settings.RemoteName}/HEAD",
+            _settings.RepoPath,
+            gitEnv,
+            cancellationToken);
+        if (symbolic.ExitCode == 0 && !string.IsNullOrWhiteSpace(symbolic.StdOut))
+        {
+            var trimmed = symbolic.StdOut.Trim();
+            var prefix = _settings.RemoteName + "/";
+            if (trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return trimmed[prefix.Length..];
+            }
+        }
+
+        var remoteShow = await RunAllowFailureAsync(
+            "git",
+            $"remote show {_settings.RemoteName}",
+            _settings.RepoPath,
+            gitEnv,
+            cancellationToken);
+        if (remoteShow.ExitCode == 0)
+        {
+            var line = remoteShow.StdOut
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault(item => item.StartsWith("HEAD branch:", StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                var branch = line.Split(':', 2)[1].Trim();
+                return string.IsNullOrWhiteSpace(branch) ? null : branch;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsMissingRemoteRefError(string message) =>
+        message.Contains("couldn't find remote ref", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("fatal: couldn't find remote ref", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsNoTrackingInfoError(string message) =>
+        message.Contains("no tracking information", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("has no tracking information", StringComparison.OrdinalIgnoreCase) ||
+        message.Contains("There is no tracking information for the current branch", StringComparison.OrdinalIgnoreCase);
+
+    private static string TrimMessage(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return "unknown error";
+
+        var singleLine = message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return singleLine.Length <= 300 ? singleLine : singleLine[..300] + "...";
+    }
+
     private static async Task<string> RunAsync(string fileName, string arguments, string workingDirectory, Dictionary<string, string>? env, CancellationToken cancellationToken)
+    {
+        var result = await RunAllowFailureAsync(fileName, arguments, workingDirectory, env, cancellationToken);
+        if (result.ExitCode != 0)
+        {
+            var stderr = string.IsNullOrWhiteSpace(result.StdErr) ? result.StdOut : result.StdErr;
+            throw new InvalidOperationException($"{fileName} {arguments} exited {result.ExitCode}: {stderr.Trim()}");
+        }
+
+        return string.IsNullOrWhiteSpace(result.StdOut) ? result.StdErr.Trim() : result.StdOut.Trim();
+    }
+
+    private static async Task<ProcessRunResult> RunAllowFailureAsync(string fileName, string arguments, string workingDirectory, Dictionary<string, string>? env, CancellationToken cancellationToken)
     {
         var psi = new ProcessStartInfo
         {
@@ -125,13 +244,10 @@ internal sealed class AutoPullService
         var stdOut = await stdOutTask;
         var stdErr = await stdErrTask;
 
-        if (process.ExitCode != 0)
-        {
-            throw new InvalidOperationException($"{fileName} {arguments} exited {process.ExitCode}: {stdErr.Trim()}");
-        }
-
-        return string.IsNullOrWhiteSpace(stdOut) ? stdErr.Trim() : stdOut.Trim();
+        return new ProcessRunResult(process.ExitCode, stdOut.Trim(), stdErr.Trim());
     }
+
+    private sealed record ProcessRunResult(int ExitCode, string StdOut, string StdErr);
 }
 
 internal sealed record AutoPullStatus(

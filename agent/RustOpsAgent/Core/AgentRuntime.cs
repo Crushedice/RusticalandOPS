@@ -1,4 +1,5 @@
 using Microsoft.SemanticKernel;
+using Sentry;
 using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
@@ -38,6 +39,8 @@ internal sealed class AgentRuntime
     private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
     private DateTime _lastSentimentAnalysisAtUtc = DateTime.MinValue;
     private DateTime _lastClassifierEvolutionAtUtc = DateTime.MinValue;
+    private DateTime _deepLlmUnauthorizedMutedUntilUtc = DateTime.MinValue;
+    private DateTime _lastDeepLlmUnauthorizedNoticeUtc = DateTime.MinValue;
     private double? _lastKnownSentimentScore;
     private volatile bool _stop;
 
@@ -1176,7 +1179,7 @@ internal sealed class AgentRuntime
         if (chat.RecentMessages.Count < 5)
             return;
 
-        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        if (!CanUseDeepLlm("sentiment"))
             return;
 
         var recent = chat.RecentMessages.TakeLast(50).ToList();
@@ -1203,7 +1206,7 @@ Recent player chat (newest last):
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(TimeSpan.FromSeconds(180));
 
-            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cts.Token);
+            var response = await _deepKernel!.InvokePromptAsync(prompt, cancellationToken: cts.Token);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null) return;
@@ -1248,6 +1251,8 @@ Recent player chat (newest last):
         }
         catch (Exception ex)
         {
+            if (HandleDeepLlmUnauthorized(ex, "sentiment", "Player sentiment analysis"))
+                return;
             Console.WriteLine($"[sentiment] Analysis failed: {ex.Message}");
         }
     }
@@ -1320,7 +1325,7 @@ Recent player chat (newest last):
         CancellationToken cancellationToken)
     {
         var fallbackSummary = $"{server} is {state}. Recent errors: {string.Join(" | ", recentErrors)}";
-        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        if (!CanUseDeepLlm("observe", emitSkipLog: false))
         {
             return new ObservationAnalysis(
                 fallbackSummary,
@@ -1329,7 +1334,7 @@ Recent player chat (newest last):
                 "Review recent errors and server health details.",
                 false,
                 false,
-                _deepKernel is null ? "template_no_deepKernel" : "template_llm_disabled");
+                "template_llm_unavailable");
         }
 
         var prompt = $$"""
@@ -1352,7 +1357,7 @@ RecentErrors:
 
         try
         {
-            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var response = await _deepKernel!.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (string.IsNullOrWhiteSpace(json))
@@ -1385,6 +1390,18 @@ RecentErrors:
         }
         catch (Exception ex)
         {
+            if (HandleDeepLlmUnauthorized(ex, "observe", "Health observation analysis"))
+            {
+                return new ObservationAnalysis(
+                    fallbackSummary,
+                    "health_observation",
+                    "health_issue_detected",
+                    "Review recent errors and server health details.",
+                    true,
+                    false,
+                    "llm_unauthorized");
+            }
+
             return new ObservationAnalysis(
                 fallbackSummary,
                 "health_observation",
@@ -1406,6 +1423,56 @@ RecentErrors:
         }
 
         return raw[start..(end + 1)];
+    }
+
+    private bool CanUseDeepLlm(string scope, bool emitSkipLog = true)
+    {
+        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+            return false;
+
+        var nowUtc = DateTime.UtcNow;
+        if (nowUtc < _deepLlmUnauthorizedMutedUntilUtc)
+        {
+            if (emitSkipLog && nowUtc - _lastDeepLlmUnauthorizedNoticeUtc >= TimeSpan.FromMinutes(5))
+            {
+                _lastDeepLlmUnauthorizedNoticeUtc = nowUtc;
+                Console.WriteLine($"[{scope}] Deep LLM temporarily disabled after 401 Unauthorized. Retry after {_deepLlmUnauthorizedMutedUntilUtc:O}.");
+            }
+
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool HandleDeepLlmUnauthorized(Exception ex, string scope, string operation)
+    {
+        if (!IsUnauthorizedLlmException(ex))
+            return false;
+
+        _deepLlmUnauthorizedMutedUntilUtc = DateTime.UtcNow.AddMinutes(30);
+        _lastDeepLlmUnauthorizedNoticeUtc = DateTime.UtcNow;
+        Console.WriteLine($"[{scope}] Deep LLM returned 401 Unauthorized. Pausing deep LLM tasks for 30 minutes; verify llm.apiKey/baseUrl/model.");
+        RustOpsSentry.CaptureMessage(
+            "Deep LLM request unauthorized; pausing deep LLM tasks.",
+            "agent.llm",
+            SentryLevel.Warning,
+            extras: new Dictionary<string, object?>
+            {
+                ["scope"] = scope,
+                ["operation"] = operation,
+                ["resumeAtUtc"] = _deepLlmUnauthorizedMutedUntilUtc.ToString("O"),
+                ["error"] = ex.Message
+            });
+        return true;
+    }
+
+    private static bool IsUnauthorizedLlmException(Exception ex)
+    {
+        var text = ex.ToString();
+        return text.Contains("401 (Unauthorized)", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("Status: 401", StringComparison.OrdinalIgnoreCase) ||
+               text.Contains("unauthorized", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string SanitizeToken(string? value, string fallback)
@@ -1455,7 +1522,7 @@ RecentErrors:
             return;
         }
 
-        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        if (!CanUseDeepLlm("evolution"))
         {
             Console.WriteLine("[evolution] Deep LLM unavailable — skipping classifier evolution.");
             return;
@@ -1493,7 +1560,7 @@ Admin corrections:
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(TimeSpan.FromSeconds(180));
 
-            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cts.Token);
+            var response = await _deepKernel!.InvokePromptAsync(prompt, cancellationToken: cts.Token);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null)
@@ -1549,6 +1616,12 @@ Admin corrections:
         }
         catch (Exception ex)
         {
+            if (HandleDeepLlmUnauthorized(ex, "evolution", "Classifier evolution"))
+            {
+                RecordLlmInteraction("classifier-evolution", true, false, $"{pending.Count} correction(s)", "401 unauthorized", "deep-llm-unauthorized");
+                return;
+            }
+
             Console.WriteLine($"[evolution] Classifier evolution failed: {ex.Message}");
             RustOpsSentry.CaptureException(ex, "Classifier evolution LLM failed.", "agent.evolution");
         }
@@ -1590,7 +1663,7 @@ Admin corrections:
 
         Console.WriteLine($"[review] {review.OpenIncidents.Count} open incident(s) — analysing with LLM.");
 
-        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        if (!CanUseDeepLlm("review"))
         {
             Console.WriteLine("[review] LLM disabled — skipping trend analysis.");
             return;
@@ -1622,7 +1695,7 @@ Open incidents (newest first):
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             cts.CancelAfter(TimeSpan.FromSeconds(180));
 
-            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cts.Token);
+            var response = await _deepKernel!.InvokePromptAsync(prompt, cancellationToken: cts.Token);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null)
@@ -1661,6 +1734,9 @@ Open incidents (newest first):
         }
         catch (Exception ex)
         {
+            if (HandleDeepLlmUnauthorized(ex, "review", "Incident trend analysis"))
+                return;
+
             Console.WriteLine($"[review] LLM trend analysis failed: {ex.Message}");
             RustOpsSentry.CaptureException(ex, "Incident review LLM analysis failed.", "agent.review");
         }

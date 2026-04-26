@@ -177,6 +177,9 @@ internal static class ConfigLoader
         config.AutoPull.RemoteName =
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_REMOTE")
             ?? RustOpsEnv.ResolvePlaceholders(config.AutoPull.RemoteName);
+        config.AutoPull.BranchName =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_AUTO_PULL_BRANCH", "RUSTOPS_GITOPS_BASE_BRANCH")
+            ?? RustOpsEnv.ResolvePlaceholders(config.AutoPull.BranchName);
         config.AutoPull.BuildEnabled =
             RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_AUTO_PULL_REBUILD", config.AutoPull.BuildEnabled);
         config.AutoPull.RestartEnabled =

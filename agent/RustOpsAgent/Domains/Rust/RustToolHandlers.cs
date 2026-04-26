@@ -474,17 +474,19 @@ internal sealed class RustRconToolHandler : IToolHandler
         try
         {
             var directReply = await RustDirectRconHelper.TryExecuteAsync(server, command, cancellationToken);
-            if (!string.IsNullOrWhiteSpace(directReply))
+            // null  = RCON unavailable (no config or connection failure) → fall back to API
+            // ""    = RCON connected and executed; many Rust commands (say, kick) return empty — this is NOT a failure
+            if (directReply is not null)
             {
-                reply = $"RCON {server}: {TruncateOutput(directReply)}";
+                reply = string.IsNullOrWhiteSpace(directReply)
+                    ? $"RCON {server}: command sent (server returned no output, which is normal for broadcast commands)."
+                    : $"RCON {server}: {TruncateOutput(directReply)}";
                 succeeded = true;
             }
             else
             {
                 using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command/exec", new { command }, cancellationToken);
-                var root = response.RootElement;
-                var apiReply = root.TryGetProperty("directReply", out var replyNode) ? replyNode.ToString() : "sent";
-                reply = $"RCON {server}: {TruncateOutput(apiReply)}";
+                reply = BuildApiFallbackReply(server, response.RootElement);
                 succeeded = true;
             }
         }
@@ -557,6 +559,88 @@ internal sealed class RustRconToolHandler : IToolHandler
     {
         output = output.Trim();
         return output.Length > maxChars ? output[..maxChars] + "…" : output;
+    }
+
+    internal static string BuildApiFallbackReply(string server, JsonElement root)
+    {
+        var apiReply = root.TryGetProperty("directReply", out var replyNode) && replyNode.ValueKind != JsonValueKind.Null
+            ? replyNode.ToString()
+            : string.Empty;
+        if (!string.IsNullOrWhiteSpace(apiReply))
+        {
+            return $"RCON {server}: {TruncateOutput(apiReply)}";
+        }
+
+        var command = root.TryGetProperty("command", out var commandNode) && commandNode.ValueKind == JsonValueKind.String
+            ? commandNode.GetString()
+            : null;
+        var outputSummary = ExtractApiOutputSummary(root, command);
+        return string.IsNullOrWhiteSpace(outputSummary)
+            ? $"RCON {server}: command sent via API (no direct reply)."
+            : $"RCON {server}: {TruncateOutput(outputSummary, 1200)}";
+    }
+
+    private static string? ExtractApiOutputSummary(JsonElement root, string? command)
+    {
+        if (!root.TryGetProperty("output", out var outputNode) || outputNode.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        if (!outputNode.TryGetProperty("messages", out var messagesNode) || messagesNode.ValueKind != JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        var normalizedCommand = NormalizeWhitespace(command);
+        var lines = messagesNode
+            .EnumerateArray()
+            .Select(message => message.ToString()?.Trim())
+            .Where(message => !string.IsNullOrWhiteSpace(message))
+            .Where(message => !LooksLikeRconCommandEcho(message!, normalizedCommand))
+            .Take(6)
+            .Cast<string>()
+            .ToList();
+
+        return lines.Count == 0 ? null : string.Join('\n', lines);
+    }
+
+    private static bool LooksLikeRconCommandEcho(string message, string? normalizedCommand)
+    {
+        if (string.IsNullOrWhiteSpace(normalizedCommand))
+            return false;
+
+        var normalizedMessage = NormalizeWhitespace(message);
+        if (string.IsNullOrWhiteSpace(normalizedMessage))
+            return false;
+
+        if (string.Equals(normalizedMessage, normalizedCommand, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (normalizedMessage.Contains("send(rcon):", StringComparison.OrdinalIgnoreCase))
+        {
+            return normalizedMessage.EndsWith(normalizedCommand, StringComparison.OrdinalIgnoreCase);
+        }
+
+        var rconMarker = "[rcon]";
+        var markerIndex = normalizedMessage.IndexOf(rconMarker, StringComparison.OrdinalIgnoreCase);
+        if (markerIndex < 0)
+            return false;
+
+        var colonIndex = normalizedMessage.IndexOf(':', markerIndex + rconMarker.Length);
+        if (colonIndex < 0 || colonIndex + 1 >= normalizedMessage.Length)
+            return false;
+
+        var trailing = NormalizeWhitespace(normalizedMessage[(colonIndex + 1)..]);
+        return string.Equals(trailing, normalizedCommand, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? NormalizeWhitespace(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        return Regex.Replace(value.Trim(), @"\s+", " ");
     }
 
     private static string ExtractCommand(string message)
@@ -1126,16 +1210,9 @@ internal static class RustDirectRconHelper
         }
         catch (Exception ex)
         {
-            RustOpsSentry.CaptureMessage(
-                $"Direct RCON failed for '{server}'.",
-                "agent.rcon",
-                SentryLevel.Warning,
-                extras: new Dictionary<string, object?>
-                {
-                    ["server"] = server,
-                    ["command"] = command,
-                    ["exception"] = ex.Message
-                });
+            RustOpsSentry.AddBreadcrumb(
+                $"Direct RCON failed for '{server}', falling back to API. command={command} error={ex.Message}",
+                "agent.rcon");
             return null;
         }
     }
@@ -1169,7 +1246,13 @@ internal static class RustDirectRconHelper
 
     private static (Uri Uri, string Password)? LoadConnection(string server)
     {
-        var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
+        var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG");
+        if (string.IsNullOrWhiteSpace(configRoot))
+        {
+            configRoot = Environment.OSVersion.Platform == PlatformID.Win32NT
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "rustmgr", "config")
+                : "/opt/rust-manager/config";
+        }
         var configPath = Path.Combine(configRoot, $"{server}.json");
         if (!File.Exists(configPath))
         {
@@ -1177,23 +1260,69 @@ internal static class RustDirectRconHelper
         }
 
         using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
-        var root = cfg.RootElement;
-        var host = root.TryGetProperty("rcon.ip", out var ipNode) && ipNode.ValueKind == JsonValueKind.String
-            ? ipNode.GetString() ?? "127.0.0.1"
-            : "127.0.0.1";
-        var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
-            ? portNode.GetInt32()
-            : 0;
-        var password = root.TryGetProperty("rcon.password", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
-            ? passwordNode.GetString()
-            : null;
+        return LoadConnectionFromConfig(cfg.RootElement);
+    }
 
-        if (port <= 0 || string.IsNullOrWhiteSpace(password))
+    internal static (Uri Uri, string Password)? LoadConnectionFromConfig(JsonElement root)
+    {
+        var additionalArgs = ReadConfigValue(root, "additionalArgs");
+        var host =
+            ReadConfigValue(root, "rcon.ip") ??
+            ReadArgValue(additionalArgs, "rcon.ip") ??
+            ReadConfigValue(root, "server.ip") ??
+            ReadArgValue(additionalArgs, "server.ip") ??
+            "127.0.0.1";
+
+        var webValue =
+            ReadConfigValue(root, "rcon.web") ??
+            ReadArgValue(additionalArgs, "rcon.web");
+        var webEnabled = string.IsNullOrWhiteSpace(webValue) ||
+            (webValue == "1" ||
+            webValue.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+            webValue.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+            webValue.Equals("on", StringComparison.OrdinalIgnoreCase));
+        if (!webEnabled)
+        {
+            return null;
+        }
+
+        var portText = ReadConfigValue(root, "rcon.port");
+        var password = ReadConfigValue(root, "rcon.password");
+        if (!int.TryParse(portText, out var port) || port <= 0 || port > 65535 || string.IsNullOrWhiteSpace(password))
         {
             return null;
         }
 
         var encodedPassword = Uri.EscapeDataString(password);
-        return (new Uri($"ws://{host}:{port}/{encodedPassword}"), password);
+        return (new Uri($"ws://{host.Trim().Trim('\"')}:{port}/{encodedPassword}"), password);
+    }
+
+    private static string? ReadConfigValue(JsonElement root, string key)
+    {
+        if (!root.TryGetProperty(key, out var node))
+        {
+            return null;
+        }
+
+        return node.ValueKind switch
+        {
+            JsonValueKind.String => node.GetString(),
+            JsonValueKind.Number => node.GetRawText(),
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => node.ToString()
+        };
+    }
+
+    private static string? ReadArgValue(string? additionalArgs, string key)
+    {
+        if (string.IsNullOrWhiteSpace(additionalArgs))
+        {
+            return null;
+        }
+
+        var pattern = $@"(?:^|\s)\+{Regex.Escape(key)}\s+(?:""(?<v>[^""]+)""|(?<v>\S+))";
+        var match = Regex.Match(additionalArgs, pattern, RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups["v"].Value : null;
     }
 }

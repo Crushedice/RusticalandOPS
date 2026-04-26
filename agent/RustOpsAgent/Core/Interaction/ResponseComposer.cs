@@ -38,6 +38,19 @@ internal sealed class ResponseComposer : IResponseComposer
                 aggregateMessage);
         }
 
+        // Bypass LLM for confirmed direct actions (MutatedState=true) — the tool message is
+        // authoritative and a small local model hallucinates "already ongoing" style responses
+        // when conversation history contains a prior action of the same type.
+        if (result.MutatedState)
+        {
+            return new ComposedReply(
+                result.Message,
+                "response-compose-direct",
+                false, false,
+                "template_direct_action",
+                result.Message.Length > 180 ? result.Message[..180] : result.Message);
+        }
+
         if (_kernel is null || !_settings.Enabled)
         {
             var fallback = ComposeFallback(result);
