@@ -15,7 +15,7 @@
   },
   "memory": {
     "statePath": "${RUSTOPS_AGENT_STATE_PATH}",
-    "neoCortexRoot": "data/NeoCortex"
+    "neoCortexRoot": "${RUSTOPS_AGENT_NEOCORTEX_ROOT}"
   },
   "inbox": {
     "feedbackInboxPath": "${RUSTOPS_FEEDBACK_INBOX_PATH}",
@@ -78,15 +78,18 @@
     "stagingPath": "data/plugin-staging"
   },
   "autoPull": {
-    "enabled": false,
+    "enabled": true,
     "intervalMinutes": 60,
-    "repoPath": "/opt/rust-manager/src",
-    "remoteName": "origin",
-    "branchName": "main",
-    "buildEnabled": false,
+    "repoPath": "${RUSTOPS_GITOPS_REPO_PATH}",
+    "remoteName": "${RUSTOPS_GITOPS_REMOTE}",
+    "branchName": "agent",
+    "buildEnabled": true,
     "buildScript": "Agent-Build.sh",
-    "restartEnabled": false,
+    "restartEnabled": true,
     "serviceName": "rustopsagent"
+  },
+  "gitOps": {
+    "githubToken": "${GITHUB_TOKEN}"
   },
   "network": {
     "trackedInterfaces": ["eth0", "wt1", "wg1"]

@@ -62,7 +62,7 @@ Set at minimum:
 
 Recommended:
 
-- create `/opt/rust-manager/config/rustops.env` from `rustops.env.example`
+- create `/opt/rust-manager/config.env` from `config.env.example`
 - let the API, agent, and Steam adapter all read their shared values from that one file
 
 ## 5. Agent config
@@ -98,7 +98,7 @@ Check:
 - admin Steam IDs are correct
 - API URL/key match the API
 - if you keep paths in JSON, they must use Linux separators or absolute Linux paths
-- preferred: keep the shared agent data paths in `/opt/rust-manager/config/rustops.env`
+- preferred: keep the shared agent data paths in `/opt/rust-manager/config.env`
 
 ## 7. Published file check
 

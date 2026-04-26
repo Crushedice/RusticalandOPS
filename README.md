@@ -210,9 +210,9 @@ Key sections:
 }
 ```
 
-### Environment — `rustops.env`
+### Environment — `config.env`
 
-Secrets and overrides loaded at startup from `/etc/rustops.env` (or `rustops.env` next to the binary):
+Secrets and overrides loaded at startup from `/opt/rust-manager/config.env` (or `config.env` next to the binary):
 
 ```
 RUSTOPS_API_KEY=...

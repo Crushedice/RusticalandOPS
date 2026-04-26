@@ -17,7 +17,7 @@ This process is the always-running orchestrator:
 
 1. Copy `agentsettings.example.json` to `agentsettings.json`.
 2. Optional: copy `agent-log-rules.example.json` to `agent-log-rules.json` and add ignore/incident phrases for your server console noise.
-3. Copy `rustops.env.example` to `rustops.env` and fill in the shared values.
+3. Copy `config.env.example` to `config.env` (at the repo root) and fill in the shared values.
 4. Point it at the running API if you are not using the shared env file.
 5. Start the daemon:
 
@@ -41,7 +41,7 @@ dotnet run --project H:\RUSTICALANDPROJECTS\AIProject\agent\RustOpsAgent\RustOps
 - can run a bounded self-repair loop that detects recurring runtime gaps and writes corrective artifacts in `data/self-repair`
 - can optionally rewrite project files inside `selfRepair.scopeRootPath` (for Linux deploys this is intended to be `/opt/rust-manager`)
 - can update runtime log-rule patterns and reply-style guidance through LLM tool calls inside agent scope
-- reads shared settings from `rustops.env`, `config/rustops.env`, or `RUSTOPS_ENV_FILE` when present
+- reads shared settings from `config.env` (repo root) or `RUSTOPS_ENV_FILE` when present
 - normalizes mixed Windows/Linux path separators before resolving inbox and outbox folders
 
 ## Inbox files

@@ -14,8 +14,8 @@ Steam adapter for `RustOpsAgent`.
 ## Setup
 
 1. Copy `botsettings.example.json` to `botsettings.json`.
-2. Copy `rustops.env.example` to `rustops.env` and fill in the shared values.
-3. Prefer leaving agent inbox and outbox paths in `rustops.env`; only keep bot-specific overrides in `botsettings.json`.
+2. Copy `config.env.example` to `config.env` (at the repo root) and fill in the shared values.
+3. Prefer leaving agent inbox and outbox paths in `config.env`; only keep bot-specific overrides in `botsettings.json`.
 4. Start the API and `RustOpsAgent`.
 5. Run the bot:
 
@@ -25,7 +25,7 @@ dotnet run --project H:\RUSTICALANDPROJECTS\AIProject\SteamBot\OpsSteamBot\OpsSt
 
 If Steam asks for a guard code, the bot will prompt in the console during login.
 
-The bot also reads shared settings from `rustops.env`, `config/rustops.env`, or `RUSTOPS_ENV_FILE` when present.
+The bot also reads shared settings from `config.env` (repo root) or `RUSTOPS_ENV_FILE` when present.
 Mixed path separators in config values are normalized at startup, so the published Linux deployment no longer breaks when an older config still contains `..\\..\\agent\\...`.
 
 ## Direct control commands

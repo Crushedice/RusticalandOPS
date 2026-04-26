@@ -51,11 +51,11 @@ Edit `rustmgrapi.service` and set:
 
 Or place the shared values in:
 
-- `/opt/rust-manager/config/rustops.env`
+- `/opt/rust-manager/config.env`
 
 Prefer putting the shared API values and agent inbox/outbox paths in:
 
-- `/opt/rust-manager/config/rustops.env`
+- `/opt/rust-manager/config.env`
 
 The deployment-facing example configs already point at those env vars, so you do not need to hardcode Linux paths into both JSON files.
 
@@ -69,7 +69,7 @@ These help the Steam adapter behave the same way under `systemd` as it does duri
 
 ## Manual dry-run before systemd
 
-The API, agent, and Steam adapter will all try to read a shared `rustops.env` file from the current working tree or `/opt/rust-manager/config/rustops.env`.
+The API, agent, and Steam adapter will all try to read a shared `config.env` file from the current working tree or `/opt/rust-manager/config.env`.
 
 If you want to test the published files first, run:
 
