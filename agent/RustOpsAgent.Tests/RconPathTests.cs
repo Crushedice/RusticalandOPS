@@ -134,4 +134,12 @@ public class RconPathTests
         Assert.Contains("command sent via API", reply, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("[rcon]", reply, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public void ExtractCommandFromMessage_Does_Not_Match_Rcon_Substring_Inside_Serverconfig()
+    {
+        var command = RustRconToolHandler.ExtractCommandFromMessage("show me the serverconfig for cotton");
+
+        Assert.Equal(string.Empty, command);
+    }
 }

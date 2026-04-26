@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Sentry;
 using SteamKit2;
 
@@ -605,11 +606,65 @@ internal sealed class OpsSteamBot
 
     private static IEnumerable<string> ChunkMessage(string text)
     {
-        const int limit = 350;
-        var normalized = text.Replace("\r", string.Empty);
+        var normalized = text.Replace("\r\n", "\n").Replace('\r', '\n');
+        var cursor = 0;
+        var matches = Regex.Matches(normalized, @"```(?:[a-zA-Z0-9_-]+)?\n(?<code>[\s\S]*?)```");
+        foreach (Match match in matches)
+        {
+            if (match.Index > cursor)
+            {
+                var plain = normalized[cursor..match.Index];
+                foreach (var chunk in ChunkPlainText(plain))
+                    yield return chunk;
+            }
+
+            var code = match.Groups["code"].Value.Trim('\n');
+            foreach (var chunk in ChunkCodeText(code))
+                yield return chunk;
+
+            cursor = match.Index + match.Length;
+        }
+
+        if (cursor < normalized.Length)
+        {
+            var tail = normalized[cursor..];
+            foreach (var chunk in ChunkPlainText(tail))
+                yield return chunk;
+        }
+    }
+
+    private static IEnumerable<string> ChunkPlainText(string text)
+    {
+        foreach (var chunk in ChunkByLines(text, 350))
+        {
+            if (!string.IsNullOrWhiteSpace(chunk))
+                yield return chunk;
+        }
+    }
+
+    private static IEnumerable<string> ChunkCodeText(string code)
+    {
+        const string prefix = "/code ";
+        var payloadLimit = 350 - prefix.Length;
+        foreach (var chunk in ChunkByLines(code, payloadLimit))
+        {
+            if (string.IsNullOrWhiteSpace(chunk))
+                continue;
+            yield return prefix + chunk;
+        }
+    }
+
+    private static IEnumerable<string> ChunkByLines(string text, int limit)
+    {
+        if (limit <= 0 || string.IsNullOrWhiteSpace(text))
+            yield break;
+
+        var normalized = text.Replace("\r", string.Empty).Trim('\n');
+        if (string.IsNullOrWhiteSpace(normalized))
+            yield break;
+
         var lines = normalized.Split('\n');
         var buffer = new StringBuilder();
-
         foreach (var line in lines)
         {
             var candidate = buffer.Length == 0 ? line : $"{buffer}\n{line}";

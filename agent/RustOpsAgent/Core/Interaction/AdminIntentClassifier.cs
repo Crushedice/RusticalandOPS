@@ -40,7 +40,7 @@ intent enum:
 chat, server_control, player_lookup, rcon_command, file_edit, status_check, troubleshooting, clarification, server_management
 
 targetRef enum:
-rust.server.control, rust.player.lookup, rust.rcon.command, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply, rust.server.management
+rust.server.control, rust.player.lookup, rust.rcon.command, rust.file.edit, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply, rust.server.management
 
 slots object keys:
 serverName, serverNames, scopeKind, playerName, commandText, timeRange, severity
@@ -55,6 +55,7 @@ Rules:
 - "compile errors", "compile", "compilation", "plugin errors", "cs errors", "plugin issues", "oxide issues", "umod issues" → intent=troubleshooting, targetRef=rust.plugins.verify. NEVER treat "compile" as a server name.
 - Words like "issue", "issues", "problem", "problems" when paired with "plugin", "oxide", or "umod" → intent=troubleshooting, targetRef=rust.plugins.verify.
 - When the request is to execute/run/send an RCON command or any raw server command (e.g. "run say Hello", "execute status", "rcon say X") → intent=rcon_command, targetRef=rust.rcon.command, put the command text in slots.commandText. NEVER use server_control for this.
+- Requests to show/read/view/open server config JSON (e.g. "show serverconfig for cotton", "open cotton config", "read cotton.json") or change config keys/values (e.g. "set server.maxplayers to 200 on cotton") → intent=file_edit, targetRef=rust.file.edit.
 - server_control is ONLY for lifecycle actions: start, stop, restart, kill, update, wipe on RUST GAME SERVERS.
 - When the request is to add, register, remove, delete, or edit a server connection (remote or local) — e.g. "add remote server", "register server at 1.2.3.4", "remove Cotton from the list", "provision a new server", "update rcon credentials for X" → intent=server_management, targetRef=rust.server.management. Put the server name in slots.serverName and the RCON IP in slots.commandText if provided.
 - CRITICAL: Requests about git operations, pulling code, rebuilding the agent, or building the codebase (e.g. "pull from main", "can you rebuild?", "git pull", "build the agent") are ALWAYS → intent=chat, targetRef=rust.chat.reply. These are about the AGENT SOFTWARE, not the Rust game servers. NEVER classify these as server_control or troubleshooting. The agent does not control game server builds — it only manages their lifecycle (start/stop/restart/wipe).
@@ -255,6 +256,8 @@ Admin message:
             lowered.Contains("new server") || lowered.Contains("update rcon") || lowered.Contains("edit server") ||
             lowered.Contains("rcon credential") || lowered.Contains("connect server"))
             return AdminIntentType.ServerManagement;
+        if (LooksLikeFileOrConfigIntent(lowered))
+            return AdminIntentType.FileEdit;
         if (lowered.Contains("pull") || lowered.Contains("git") || lowered.Contains("rebuild") || lowered.Contains("build"))
             return AdminIntentType.Chat;
         if (lowered.Contains("network") || lowered.Contains("throughput") || lowered.Contains("latency") || lowered.Contains("eth0") || lowered.Contains("wg1") || lowered.Contains("wt1"))
@@ -299,7 +302,9 @@ Admin message:
         loweredMessage.Contains("rebuild", StringComparison.Ordinal) ||
         loweredMessage.Contains("build", StringComparison.Ordinal) ||
         loweredMessage.Contains("git", StringComparison.Ordinal) ||
-        loweredMessage.Contains("compile", StringComparison.Ordinal);
+        loweredMessage.Contains("compile", StringComparison.Ordinal) ||
+        loweredMessage.Contains("serverconfig", StringComparison.Ordinal) ||
+        loweredMessage.Contains("server config", StringComparison.Ordinal);
 
     private static bool IsCorrectionFollowUp(string loweredMessage) =>
         loweredMessage.StartsWith("no ", StringComparison.Ordinal) ||
@@ -361,6 +366,7 @@ Admin message:
             AdminIntentType.ServerControl => "rust.server.control",
             AdminIntentType.PlayerLookup => "rust.player.lookup",
             AdminIntentType.RconCommand => "rust.rcon.command",
+            AdminIntentType.FileEdit => "rust.file.edit",
             AdminIntentType.ServerManagement => "rust.server.management",
             AdminIntentType.Chat or AdminIntentType.Clarification => "rust.chat.reply",
             AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting => InferDiagnosticsTarget(loweredMessage),
@@ -404,10 +410,35 @@ Admin message:
             "server_control" => "rust.server.control",
             "player_lookup" => "rust.player.lookup",
             "rcon_command" => "rust.rcon.command",
+            "file_edit" or "file" or "config" => "rust.file.edit",
             "server_management" or "server.management" => "rust.server.management",
             "chat" or "clarification" => "rust.chat.reply",
             _ => targetRef
         };
+    }
+
+    private static bool LooksLikeFileOrConfigIntent(string lowered)
+    {
+        var mentionsConfig = lowered.Contains("config", StringComparison.Ordinal) ||
+                             lowered.Contains("serverconfig", StringComparison.Ordinal) ||
+                             lowered.Contains(".json", StringComparison.Ordinal) ||
+                             lowered.Contains(".cfg", StringComparison.Ordinal);
+
+        var readVerb = lowered.Contains("show", StringComparison.Ordinal) ||
+                       lowered.Contains("read", StringComparison.Ordinal) ||
+                       lowered.Contains("view", StringComparison.Ordinal) ||
+                       lowered.Contains("open", StringComparison.Ordinal) ||
+                       lowered.Contains("display", StringComparison.Ordinal) ||
+                       lowered.Contains("contents", StringComparison.Ordinal) ||
+                       lowered.Contains("print", StringComparison.Ordinal);
+
+        var editVerb = lowered.Contains("set ", StringComparison.Ordinal) ||
+                       lowered.Contains("change ", StringComparison.Ordinal) ||
+                       lowered.Contains("update ", StringComparison.Ordinal) ||
+                       lowered.Contains("edit ", StringComparison.Ordinal) ||
+                       lowered.Contains("modify ", StringComparison.Ordinal);
+
+        return mentionsConfig && (readVerb || editVerb);
     }
 
     private static ServerScopeKind ParseScopeKind(string? value) => value?.Trim().ToLowerInvariant() switch

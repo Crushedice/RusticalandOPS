@@ -458,7 +458,7 @@ internal sealed class RustRconToolHandler : IToolHandler
 
         var command = context.Route.Slots.CommandText;
         if (string.IsNullOrWhiteSpace(command))
-            command = ExtractCommand(context.Message);
+            command = ExtractCommandFromMessage(context.Message);
 
         if (string.IsNullOrWhiteSpace(command))
             return new ToolExecutionResult(false, "Which command should I run? Quote it or say 'run status'.", server, false, "clarification_required");
@@ -644,7 +644,7 @@ internal sealed class RustRconToolHandler : IToolHandler
         return Regex.Replace(value.Trim(), @"\s+", " ");
     }
 
-    private static string ExtractCommand(string message)
+    internal static string ExtractCommandFromMessage(string message)
     {
         var quoted = Regex.Match(message, "\"(?<cmd>.+?)\"");
         if (quoted.Success)
@@ -653,8 +653,11 @@ internal sealed class RustRconToolHandler : IToolHandler
         var lowered = message.ToLowerInvariant();
         foreach (var marker in new[] { "command", "rcon", "run", "execute", "send" })
         {
-            var idx = lowered.IndexOf(marker, StringComparison.Ordinal);
-            if (idx < 0) continue;
+            var markerMatch = Regex.Match(lowered, $@"\b{Regex.Escape(marker)}\b");
+            if (!markerMatch.Success)
+                continue;
+
+            var idx = markerMatch.Index;
             var candidate = message[(idx + marker.Length)..].Trim(' ', ':', '"', '\'', '.');
             if (!string.IsNullOrWhiteSpace(candidate))
                 return candidate;

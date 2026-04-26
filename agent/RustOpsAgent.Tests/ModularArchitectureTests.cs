@@ -173,6 +173,22 @@ public class ModularArchitectureTests
         Assert.Equal("rust.network.inspect", selected!.Name);
     }
 
+    [Fact]
+    public async Task IntentClassifier_Routes_ServerConfig_Read_To_FileEdit()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+        var route = await classifier.ClassifyAsync(
+            "show me the serverconfig for cotton server",
+            state,
+            new[] { "cotton", "monthly" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.FileEdit, route.Intent);
+        Assert.Equal("rust.file.edit", route.TargetRef);
+        Assert.Equal("cotton", route.Slots.ServerName, StringComparer.OrdinalIgnoreCase);
+    }
+
     // ── ConfigLoader ───────────────────────────────────────────────────────────
 
     [Fact]
