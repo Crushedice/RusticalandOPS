@@ -1,13 +1,13 @@
 # Incident Trend Review — 2026-04-27
 
 ## Summary
-Discord API connectivity failures are the most frequent issue, consistently leading to 503 errors, plugin crashes, and notification delivery failures.
+The majority of recent incidents stem from recurrent Discord API connectivity failures, leading to timeouts, service unavailability responses, and plugin crashes, with a secondary issue of insecure reporting connections.
 
 ## Top Pattern
 discord_api_connectivity_failure
 
 ## Proposed Mitigation
-Add exponential backoff with a maximum retry count to all Discord API requests and wrap them in a circuit breaker to isolate downstream failures.
+Implement an exponential backoff retry strategy for all Discord API calls and add a local fallback queue to buffer messages during outages.
 
 ## Config Suggestion
-Configure the Rustcord plugin to use a 10‑second timeout, enable exponential backoff, and set a retry limit of 5 attempts before failing.
+Add `retry_policy = { max_attempts = 5, backoff_ms = 200 }` and enforce TLS in the reporting server configuration.
