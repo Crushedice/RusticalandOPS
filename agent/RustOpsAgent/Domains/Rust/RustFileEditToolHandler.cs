@@ -236,9 +236,12 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             using var doc = JsonDocument.Parse(raw);
             var pretty = JsonSerializer.Serialize(doc.RootElement, new JsonSerializerOptions { WriteIndented = true });
             var serverRoot = BuildExpectedServerRootPath(canonicalServer);
+            var header = $"{canonicalServer} server config ({configPath}). Server runtime root: {serverRoot}";
+            var fullMessage = $"{header}\n\n```json\n{pretty}\n```";
+
             return new ToolExecutionResult(
                 true,
-                $"{canonicalServer} server config ({configPath}). Server runtime root: {serverRoot}\n```json\n{pretty}\n```",
+                fullMessage,
                 canonicalServer,
                 true,
                 Payload: pretty);

@@ -1,5 +1,6 @@
 ﻿using Microsoft.SemanticKernel;
 using Sentry;
+using System.Text;
 using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
@@ -1903,22 +1904,59 @@ Open incidents (newest first):
 
     private void WriteOutbox(string adminId, string message, string? actionId, string? serverName)
     {
-        var payload = new AdapterMessage
-        {
-            Id = Guid.NewGuid().ToString("N"),
-            AdminId = adminId,
-            Kind = "chat-reply",
-            Audience = "admins",
-            TargetAdminId = adminId,
-            ServerName = serverName ?? string.Empty,
-            ActionId = actionId,
-            Message = message,
-            CreatedAtUtc = DateTime.UtcNow
-        };
-
         Directory.CreateDirectory(_config.Outbox.MessageOutboxPath);
-        var path = Path.Combine(_config.Outbox.MessageOutboxPath, $"{payload.CreatedAtUtc:yyyyMMddHHmmssfff}-chat-reply-{payload.Id}.json");
-        File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonDefaults.Default));
+        var chunks = ChunkMessage(message, 3500);
+        var baseTime = DateTime.UtcNow;
+
+        foreach (var (index, chunk) in chunks.Select((c, i) => (i, c)))
+        {
+            var payload = new AdapterMessage
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                AdminId = adminId,
+                Kind = "chat-reply",
+                Audience = "admins",
+                TargetAdminId = adminId,
+                ServerName = serverName ?? string.Empty,
+                ActionId = actionId,
+                Message = chunk,
+                CreatedAtUtc = baseTime.AddMilliseconds(index * 100)
+            };
+
+            var path = Path.Combine(_config.Outbox.MessageOutboxPath, $"{payload.CreatedAtUtc:yyyyMMddHHmmssfff}-chat-reply-{payload.Id}.json");
+            File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonDefaults.Default));
+        }
+    }
+
+    private static IEnumerable<string> ChunkMessage(string text, int limitChars = 3500)
+    {
+        if (text.Length <= limitChars)
+        {
+            yield return text;
+            yield break;
+        }
+
+        var normalized = text.Replace("\r", string.Empty);
+        var lines = normalized.Split('\n');
+        var buffer = new StringBuilder();
+
+        foreach (var line in lines)
+        {
+            var candidate = buffer.Length == 0 ? line : $"{buffer}\n{line}";
+            if (candidate.Length <= limitChars)
+            {
+                buffer = new StringBuilder(candidate);
+            }
+            else
+            {
+                if (buffer.Length > 0)
+                    yield return buffer.ToString();
+                buffer = new StringBuilder(line);
+            }
+        }
+
+        if (buffer.Length > 0)
+            yield return buffer.ToString();
     }
 
     private void BroadcastOutbox(string message, string? serverName)
