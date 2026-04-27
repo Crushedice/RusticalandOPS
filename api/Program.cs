@@ -1248,8 +1248,9 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
         return Results.BadRequest(new ApiError("invalid_request", "Command is required."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
     var command = request.Command.Trim();
     if (command.Length > 256)
@@ -1257,7 +1258,6 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
     if (command.Contains('\n') || command.Contains('\r'))
         return Results.BadRequest(new ApiError("invalid_request", "Command must be a single line."));
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1308,25 +1308,25 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
         return Results.BadRequest(new ApiError("invalid_request", "Command is required."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
-    var normalized = NormalizeConfig(server, cfg);
+    var normalized = cfg is not null ? NormalizeConfig(server, cfg) : null;
     var command = request.Command.Trim();
     if (command.Length > 256)
         return Results.BadRequest(new ApiError("invalid_request", "Command length exceeds 256 characters."));
     if (command.Contains('\n') || command.Contains('\r'))
         return Results.BadRequest(new ApiError("invalid_request", "Command must be a single line."));
 
-    var logPath = GetServerLogPath(normalized);
-    var startOffset = File.Exists(logPath)
+    var logPath = normalized is not null ? GetServerLogPath(normalized) : null;
+    var startOffset = logPath is not null && File.Exists(logPath)
         ? new FileInfo(logPath).Length
         : 0L;
     var waitMs = Math.Clamp(request.WaitMs <= 0 ? 2500 : request.WaitMs, 200, 20_000);
     var maxBytes = Math.Clamp(request.MaxBytes <= 0 ? 128 * 1024 : request.MaxBytes, 4 * 1024, 512 * 1024);
     var maxLines = Math.Clamp(request.MaxLines <= 0 ? 120 : request.MaxLines, 1, 600);
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1346,7 +1346,9 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
             return Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
         }
 
-        var fallbackOutput = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
+        var fallbackOutput = logPath is not null
+            ? await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines)
+            : new CommandOutputCapture();
         return Results.Ok(new
         {
             ok = true,
@@ -1362,7 +1364,9 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
         });
     }
 
-    var output = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
+    var output = logPath is not null
+        ? await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines)
+        : new CommandOutputCapture();
     if (!string.IsNullOrWhiteSpace(directReply))
     {
         output.Messages.Insert(0, directReply.Trim());
@@ -1502,10 +1506,10 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1537,10 +1541,10 @@ app.MapGet("/servers/{server}/players", async (string server) =>
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1572,10 +1576,10 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1610,10 +1614,10 @@ app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest re
         return Results.BadRequest(new ApiError("invalid_request", "SteamId is required."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1650,10 +1654,10 @@ app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest req
         return Results.BadRequest(new ApiError("invalid_request", "SteamId is required."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1690,10 +1694,10 @@ app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest r
         return Results.BadRequest(new ApiError("invalid_request", "SteamId is required."));
 
     var cfg = LoadServerConfig(server);
-    if (cfg is null)
-        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+    var endpoint = TryResolveRconConnectionInfo(server, cfg);
+    if (endpoint is null)
+        return Results.NotFound(new ApiError("not_found", $"Could not resolve RCON connection for '{server}'."));
 
-    var endpoint = ResolveRconConnectionInfo(server, cfg);
     if (!endpoint.WebRconEnabled)
         return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
 
@@ -1718,6 +1722,31 @@ app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest r
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
+
+RconConnectionInfo? TryResolveRconConnectionInfo(string server, ServerConfig? cfg)
+{
+    // For remote servers, use the remote server entry instead of the local config
+    if (cfg is null && IsRemoteServerName(server))
+    {
+        var remoteServers = LoadRemoteServers();
+        var remote = remoteServers.FirstOrDefault(s => s.Name.Equals(server, StringComparison.OrdinalIgnoreCase));
+        if (remote is not null)
+        {
+            var password = remote.RconPassword?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(password))
+                return null;
+            return new RconConnectionInfo(remote.RconIp.Trim(), (ushort)remote.RconPort, password, true);
+        }
+    }
+
+    // For local servers, use the provided config
+    if (cfg is not null)
+    {
+        return ResolveRconConnectionInfo(server, cfg);
+    }
+
+    return null;
+}
 
 app.Run();
 }
