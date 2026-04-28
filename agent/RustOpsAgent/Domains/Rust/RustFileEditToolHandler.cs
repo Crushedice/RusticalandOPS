@@ -396,6 +396,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             return new ToolExecutionResult(false, $"Could not parse config for '{server}'.", server, false, "parse_error");
 
         var configDirs = ResolveOxideConfigDirectories(serverConfig);
+        Console.WriteLine($"[plugin-config] Resolved {configDirs.Count} oxide config directories for '{server}': {string.Join(", ", configDirs)}");
         if (configDirs.Count == 0)
         {
             return new ToolExecutionResult(
@@ -686,7 +687,11 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
         var serverDir = ReadJsonString(serverConfig, "serverDir");
         if (!string.IsNullOrWhiteSpace(serverDir))
-            dirs.Add(Path.Combine(serverDir, "oxide", "config"));
+        {
+            var oxideDir = Path.Combine(serverDir, "oxide", "config");
+            dirs.Add(oxideDir);
+            Console.WriteLine($"[oxide-dirs] Added from serverDir: {oxideDir}");
+        }
 
         var logFile = ReadJsonString(serverConfig, "logFile");
         if (!string.IsNullOrWhiteSpace(logFile))
@@ -699,10 +704,16 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
             var logDir = Path.GetDirectoryName(logPath);
             if (!string.IsNullOrWhiteSpace(logDir))
-                dirs.Add(Path.Combine(logDir, "oxide", "config"));
+            {
+                var oxideDir = Path.Combine(logDir, "oxide", "config");
+                dirs.Add(oxideDir);
+                Console.WriteLine($"[oxide-dirs] Added from logFile: {oxideDir}");
+            }
         }
 
-        return dirs.Where(Directory.Exists).ToList();
+        var filtered = dirs.Where(Directory.Exists).ToList();
+        Console.WriteLine($"[oxide-dirs] After filtering: {(filtered.Count == 0 ? "NONE" : string.Join(", ", filtered))}");
+        return filtered;
     }
 
     private static string? ReadJsonString(JsonObject obj, string key)
@@ -729,23 +740,31 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
     private static string? ResolvePluginConfigPath(IReadOnlyList<string> configDirs, string pluginName)
     {
+        Console.WriteLine($"[plugin-config] Looking for plugin '{pluginName}' in {configDirs.Count} directories");
         foreach (var dir in configDirs.Where(Directory.Exists))
         {
+            Console.WriteLine($"[plugin-config]   Checking directory: {dir}");
             var direct = Path.Combine(dir, $"{pluginName}.json");
+            Console.WriteLine($"[plugin-config]     Direct path: {direct} - {(File.Exists(direct) ? "EXISTS" : "not found")}");
             if (File.Exists(direct))
                 return direct;
 
-            var match = Directory
-                .EnumerateFiles(dir, "*.json", SearchOption.AllDirectories)
+            var jsonFiles = Directory.EnumerateFiles(dir, "*.json", SearchOption.AllDirectories).ToList();
+            Console.WriteLine($"[plugin-config]     Found {jsonFiles.Count} .json files in directory");
+            var match = jsonFiles
                 .FirstOrDefault(path =>
                     string.Equals(
                         Path.GetFileNameWithoutExtension(path),
                         pluginName,
                         StringComparison.OrdinalIgnoreCase));
             if (!string.IsNullOrWhiteSpace(match))
+            {
+                Console.WriteLine($"[plugin-config]     Found match: {match}");
                 return match;
+            }
         }
 
+        Console.WriteLine($"[plugin-config] Plugin '{pluginName}' not found in any config directory");
         return null;
     }
 
