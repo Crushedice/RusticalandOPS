@@ -42,7 +42,6 @@ internal sealed class AgentRuntime
     private DateTime _lastClassifierEvolutionAtUtc = DateTime.MinValue;
     private DateTime _deepLlmUnauthorizedMutedUntilUtc = DateTime.MinValue;
     private DateTime _lastDeepLlmUnauthorizedNoticeUtc = DateTime.MinValue;
-    private double? _lastKnownSentimentScore;
     private volatile bool _stop;
 
     public AgentRuntime(
@@ -1233,17 +1232,6 @@ Recent player chat (newest last):
 
             Console.WriteLine($"[sentiment] Score={chat.SentimentScore:F1} Label={chat.SentimentLabel} — {chat.SentimentSummary}");
 
-            // Notify admins when sentiment drops below threshold or drops significantly from last reading
-            var score = chat.SentimentScore ?? 5.0;
-            var threshold = _config.ConsoleMonitor.SentimentAlertThreshold;
-            var dropped = _lastKnownSentimentScore.HasValue && _lastKnownSentimentScore.Value >= threshold && score < threshold;
-            if (score < threshold && (dropped || !_lastKnownSentimentScore.HasValue))
-            {
-                var themes = chat.KeyThemes.Count > 0 ? $" Themes: {string.Join(", ", chat.KeyThemes.Take(3))}." : string.Empty;
-                BroadcastOutbox($"[Player Sentiment] Score dropped to {score:F1}/10 ({chat.SentimentLabel}). {chat.SentimentSummary}{themes}", null);
-                Console.WriteLine($"[sentiment] ALERT: score {score:F1} below threshold {threshold}. Notified admins.");
-            }
-            _lastKnownSentimentScore = score;
             RecordLlmInteraction("player-sentiment", true, true, $"{recent.Count} chat messages", chat.SentimentSummary, "llm");
         }
         catch (OperationCanceledException)
@@ -1417,13 +1405,24 @@ RecentErrors:
     private static string? TryExtractJson(string raw)
     {
         var start = raw.IndexOf('{');
-        var end = raw.LastIndexOf('}');
-        if (start < 0 || end <= start)
+        if (start < 0) return null;
+
+        int depth = 0;
+        bool inString = false;
+        bool escaped = false;
+
+        for (int i = start; i < raw.Length; i++)
         {
-            return null;
+            char c = raw[i];
+            if (escaped) { escaped = false; continue; }
+            if (c == '\\' && inString) { escaped = true; continue; }
+            if (c == '"') { inString = !inString; continue; }
+            if (inString) continue;
+            if (c == '{') depth++;
+            else if (c == '}') { depth--; if (depth == 0) return raw[start..(i + 1)]; }
         }
 
-        return raw[start..(end + 1)];
+        return null;
     }
 
     private bool CanUseDeepLlm(string scope, bool emitSkipLog = true)
@@ -1772,9 +1771,7 @@ Open incidents (newest first):
             await File.WriteAllTextAsync(reviewPath, reviewNote, cancellationToken);
 
             await _gitOps.CommitAsync($"agent: incident review {DateTime.UtcNow:yyyyMMdd} pattern={pattern}", cancellationToken);
-            await _gitOps.PushAsync(branch, cancellationToken);
-            await _gitOps.CreatePrAsync(branch, $"[agent] Incident review: {pattern}", reviewNote, cancellationToken);
-            Console.WriteLine($"[review] PR proposed for pattern '{pattern}' on branch {branch}.");
+            Console.WriteLine($"[review] Review committed locally for pattern '{pattern}' on branch {branch}.");
         }
         catch (Exception ex)
         {
@@ -1792,8 +1789,6 @@ Open incidents (newest first):
             var title = $"[agent] Incident: {incident.Classification}";
             var body = $"Request: {incident.Request}\nFailure: {incident.FailureReason}\nMissing: {incident.MissingCapability}\nPrevention: {incident.RecurrencePrevention}";
             await _gitOps.CommitAsync($"incident: record {incident.Id}", cancellationToken);
-            await _gitOps.PushAsync(branch, cancellationToken);
-            await _gitOps.CreatePrAsync(branch, title, body, cancellationToken);
         }
         catch (Exception ex)
         {

@@ -17,7 +17,7 @@ internal sealed class GitOpsService : IGitOpsService
     {
         const string branch = "agent-updates";
         await RunGitAsync($"checkout -B {branch}", cancellationToken);
-        await RunGitAsync($"pull --rebase {_settings.RemoteName} main", cancellationToken);
+        await RunGitAsync($"pull --rebase --autostash {_settings.RemoteName} main", cancellationToken);
         return branch;
     }
 
