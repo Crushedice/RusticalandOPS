@@ -13,10 +13,12 @@ namespace RustOpsAgent.Domains.Rust;
 internal sealed class RustStatusToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
+    private readonly ISemanticMemoryService? _semanticMemory;
 
-    public RustStatusToolHandler(RustOpsApiClient api)
+    public RustStatusToolHandler(RustOpsApiClient api, ISemanticMemoryService? semanticMemory = null)
     {
         _api = api;
+        _semanticMemory = semanticMemory;
     }
 
     public string Name => "rust.status.check";
@@ -65,6 +67,16 @@ internal sealed class RustStatusToolHandler : IToolHandler
             var singleMessage = single.RecentErrors is { Count: > 0 }
                 ? $"{single.Server} is {single.State}. Recent errors: {string.Join(" | ", single.RecentErrors.Take(3))}"
                 : $"{single.Server} is {single.State}. No recent errors were reported.";
+
+            if (_semanticMemory is not null && (single.RecentErrors is { Count: > 0 } || !single.Online))
+            {
+                _ = _semanticMemory.RecordServerFactAsync(
+                    single.Server,
+                    $"Status check: {single.Server} is {single.State}",
+                    singleMessage,
+                    new[] { "status", single.State, single.Online ? "online" : "offline" },
+                    CancellationToken.None);
+            }
 
             return new ToolExecutionResult(
                 true,
@@ -170,11 +182,13 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 
     private readonly RustOpsApiClient _api;
     private readonly Action<string, string, string?>? _notifyAdmin; // (adminId, message, serverName)
+    private readonly ISemanticMemoryService? _semanticMemory;
 
-    public RustServerControlToolHandler(RustOpsApiClient api, Action<string, string, string?>? notifyAdmin = null)
+    public RustServerControlToolHandler(RustOpsApiClient api, Action<string, string, string?>? notifyAdmin = null, ISemanticMemoryService? semanticMemory = null)
     {
         _api = api;
         _notifyAdmin = notifyAdmin;
+        _semanticMemory = semanticMemory;
     }
 
     public string Name => "rust.server.control";
@@ -225,7 +239,17 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         }
 
         using var response = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(server)), new { }, cancellationToken);
-        return new ToolExecutionResult(true, $"Executed {endpoint.Split('/').Last()} for {server}.", server, true, Payload: response.RootElement.ToString());
+        var action = endpoint.Split('/').Last();
+        if (_semanticMemory is not null)
+        {
+            _ = _semanticMemory.RecordServerFactAsync(
+                server,
+                $"Server lifecycle: {action} executed on {server}",
+                $"Admin triggered '{action}' on server '{server}'. Result: success.",
+                new[] { "lifecycle", action, server.ToLowerInvariant() },
+                CancellationToken.None);
+        }
+        return new ToolExecutionResult(true, $"Executed {action} for {server}.", server, true, Payload: response.RootElement.ToString());
     }
 
     private async Task<ToolExecutionResult> HandleRestartAsync(ToolExecutionContext context, string server, CancellationToken cancellationToken)
@@ -259,6 +283,15 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         }
 
         var method = rconSent ? $"RCON restart {seconds}s countdown" : "API restart (immediate)";
+        if (_semanticMemory is not null)
+        {
+            _ = _semanticMemory.RecordServerFactAsync(
+                server,
+                $"Server restart initiated on {server} ({method})",
+                $"Restart triggered by admin. Method: {method}. Countdown: {seconds}s.",
+                new[] { "lifecycle", "restart", server.ToLowerInvariant() },
+                CancellationToken.None);
+        }
         var adminId = context.AdminId;
         var notifyAdmin = _notifyAdmin;
         var api = _api;
@@ -415,17 +448,20 @@ internal sealed class RustRconToolHandler : IToolHandler
     private readonly NeoCortexStore _memory;
     private readonly Core.Contracts.CommandExecutionSettings _cmdSettings;
     private readonly ServerKnowledgeCatalog _knowledge;
+    private readonly ISemanticMemoryService? _semanticMemory;
 
     public RustRconToolHandler(
         RustOpsApiClient api,
         NeoCortexStore? memory = null,
         Core.Contracts.CommandExecutionSettings? cmdSettings = null,
-        ServerKnowledgeCatalog? knowledge = null)
+        ServerKnowledgeCatalog? knowledge = null,
+        ISemanticMemoryService? semanticMemory = null)
     {
         _api = api;
         _memory = memory ?? new NeoCortexStore("data/NeoCortex", "data/agent-state.json");
         _cmdSettings = cmdSettings ?? new Core.Contracts.CommandExecutionSettings();
         _knowledge = knowledge ?? new ServerKnowledgeCatalog();
+        _semanticMemory = semanticMemory;
     }
 
     public string Name => "rust.rcon.command";
@@ -529,10 +565,28 @@ internal sealed class RustRconToolHandler : IToolHandler
         if (succeeded && knowledgeIntent.Operation == KnowledgeOperation.GetVariable && !string.IsNullOrWhiteSpace(knowledgeIntent.EntryName))
         {
             reply = $"Current `{knowledgeIntent.EntryName}` on {server}: {reply}";
+            if (_semanticMemory is not null)
+            {
+                _ = _semanticMemory.RecordServerFactAsync(
+                    server,
+                    $"Convar read: {knowledgeIntent.EntryName} on {server}",
+                    reply,
+                    new[] { "convar", "read", knowledgeIntent.EntryName!.ToLowerInvariant(), server.ToLowerInvariant() },
+                    CancellationToken.None);
+            }
         }
         else if (succeeded && knowledgeIntent.Operation == KnowledgeOperation.SetVariable && !string.IsNullOrWhiteSpace(knowledgeIntent.EntryName))
         {
             reply = $"Updated `{knowledgeIntent.EntryName}` on {server}. {reply}";
+            if (_semanticMemory is not null)
+            {
+                _ = _semanticMemory.RecordServerFactAsync(
+                    server,
+                    $"Convar set: {knowledgeIntent.EntryName} on {server} = {knowledgeIntent.Value}",
+                    reply,
+                    new[] { "convar", "set", knowledgeIntent.EntryName!.ToLowerInvariant(), server.ToLowerInvariant() },
+                    CancellationToken.None);
+            }
         }
 
         RecordCommandOutcome(commandRoot, succeeded);
@@ -903,11 +957,13 @@ internal sealed class RustLogsToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
     private readonly NeoCortexStore _memory;
+    private readonly ISemanticMemoryService? _semanticMemory;
 
-    public RustLogsToolHandler(RustOpsApiClient api, NeoCortexStore memory)
+    public RustLogsToolHandler(RustOpsApiClient api, NeoCortexStore memory, ISemanticMemoryService? semanticMemory = null)
     {
         _api = api;
         _memory = memory;
+        _semanticMemory = semanticMemory;
     }
 
     public string Name => "rust.logs.inspect";
@@ -974,6 +1030,16 @@ internal sealed class RustLogsToolHandler : IToolHandler
             ? $"High-importance log lines for {server}: {string.Join(" | ", high)}"
             : $"No high-importance log lines detected for {server}.";
 
+        if (_semanticMemory is not null && high.Count > 0)
+        {
+            _ = _semanticMemory.RecordServerFactAsync(
+                server,
+                $"Log inspection: {high.Count} high-importance line(s) on {server}",
+                message,
+                new[] { "logs", "high-importance", server.ToLowerInvariant() },
+                CancellationToken.None);
+        }
+
         return new ToolExecutionResult(true, message, server, false);
     }
 
@@ -997,10 +1063,13 @@ internal sealed class RustPluginToolHandler : IToolHandler
         DefaultRequestHeaders = { { "User-Agent", "RustOpsAgent/1.0 (server-ops-bot)" } }
     };
 
-    public RustPluginToolHandler(RustOpsApiClient api, Core.Contracts.PluginUpdateSettings? settings = null)
+    private readonly ISemanticMemoryService? _semanticMemory;
+
+    public RustPluginToolHandler(RustOpsApiClient api, Core.Contracts.PluginUpdateSettings? settings = null, ISemanticMemoryService? semanticMemory = null)
     {
         _api = api;
         _settings = settings ?? new Core.Contracts.PluginUpdateSettings();
+        _semanticMemory = semanticMemory;
     }
 
     public string Name => "rust.plugins.verify";
@@ -1035,9 +1104,17 @@ internal sealed class RustPluginToolHandler : IToolHandler
                 var failed = lines.Where(l => l.Contains("failed to compile", StringComparison.OrdinalIgnoreCase)).ToList();
                 if (failed.Count > 0)
                 {
-                    return new ToolExecutionResult(true,
-                        $"[{server}] {failed.Count} plugin(s) failed to compile:\n{string.Join('\n', failed)}",
-                        server, false);
+                    var failureMessage = $"[{server}] {failed.Count} plugin(s) failed to compile:\n{string.Join('\n', failed)}";
+                    if (_semanticMemory is not null)
+                    {
+                        _ = _semanticMemory.RecordServerFactAsync(
+                            server,
+                            $"Plugin compile failure on {server}: {failed.Count} plugin(s)",
+                            failureMessage,
+                            new[] { "plugins", "compile-failure", server.ToLowerInvariant() },
+                            CancellationToken.None);
+                    }
+                    return new ToolExecutionResult(true, failureMessage, server, false);
                 }
 
                 var totalLoaded = lines.Count(l => l.TrimStart().StartsWith('[') || Regex.IsMatch(l, @"^\s*\w.*\(\d+ms\)"));

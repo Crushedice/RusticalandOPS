@@ -44,6 +44,10 @@ internal sealed class AgentRuntime
     private DateTime _deepLlmUnauthorizedMutedUntilUtc = DateTime.MinValue;
     private DateTime _lastDeepLlmUnauthorizedNoticeUtc = DateTime.MinValue;
     private volatile bool _stop;
+    private readonly Dictionary<string, DateTime> _standInLastProcessedAtUtc = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTime> _standInCooldownByServer = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _standInResponsesThisMinute = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _standInRateLimitWindowStart = DateTime.MinValue;
 
     public AgentRuntime(
         AgentConfig config,
@@ -101,6 +105,7 @@ internal sealed class AgentRuntime
                 await SafeExecuteAsync(() => ObserveServersAsync(cancellationToken), "server-observation", cancellationToken);
                 await SafeExecuteAsync(() => ReviewIncidentsAsync(cancellationToken), "incident-review", cancellationToken);
                 await SafeExecuteAsync(() => AnalyzePlayerSentimentAsync(cancellationToken), "sentiment-analysis", cancellationToken);
+                await SafeExecuteAsync(() => ProcessPlayerChatForStandInAsync(cancellationToken), "stand-in-admin", cancellationToken);
                 await SafeExecuteAsync(() => EvolveClassifierAsync(cancellationToken), "classifier-evolution", cancellationToken);
 
                 _legacyState.Save();
@@ -950,6 +955,8 @@ internal sealed class AgentRuntime
             consoleChanged = true; // new server entry — persist so dashboard sees it immediately
         }
 
+        var newHighImportanceLines = new List<string>();
+
         if (root.TryGetProperty("entries", out var entriesNode) && entriesNode.ValueKind == JsonValueKind.Array)
         {
             foreach (var entry in entriesNode.EnumerateArray())
@@ -1090,6 +1097,8 @@ internal sealed class AgentRuntime
                     Importance = importance,
                     CapturedAtUtc = DateTime.UtcNow
                 });
+                if (importance >= 3)
+                    newHighImportanceLines.Add(line);
                 logChanged = true;
             }
         }
@@ -1161,6 +1170,18 @@ internal sealed class AgentRuntime
             Console.WriteLine($"[observe] {server}: {newHighImportance.Count} high-importance log line(s): {string.Join(" | ", newHighImportance.Select(l => l.Length > 80 ? l[..80] + "..." : l))}");
         }
 
+        // Write newly observed high-importance lines to semantic memory.
+        if (_config.Memory.WriteEnabled)
+        {
+            foreach (var logLine in newHighImportanceLines)
+            {
+                var summary = $"[{server}] {TrimSingleLine(logLine, 80)}";
+                var detail = $"Server: {server}\nLog: {logLine}";
+                _ = _semanticMemory.RecordServerFactAsync(server, summary, detail,
+                    new[] { "log", "high-importance", server.ToLowerInvariant() }, CancellationToken.None);
+            }
+        }
+
         knowledge.RecentEntries = knowledge.RecentEntries.TakeLast(400).ToList();
         _neoCortex.SaveLogs(knowledge);
     }
@@ -1184,6 +1205,132 @@ internal sealed class AgentRuntime
         normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\d{2}:\d{2}:\d{2}", "<time>");
         normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\b\d+\b", "<n>");
         return normalized.Length > 200 ? normalized[..200] : normalized;
+    }
+
+    private async Task ProcessPlayerChatForStandInAsync(CancellationToken cancellationToken)
+    {
+        if (!_config.StandInAdmin.Enabled || _deepKernel is null || !_config.Llm.Enabled)
+            return;
+
+        var chat = _neoCortex.LoadPlayerChat();
+        if (chat.RecentMessages.Count == 0)
+            return;
+
+        var now = DateTime.UtcNow;
+        if ((now - _standInRateLimitWindowStart).TotalMinutes >= 1)
+        {
+            _standInRateLimitWindowStart = now;
+            _standInResponsesThisMinute.Clear();
+        }
+
+        var agentName = _config.StandInAdmin.AgentNameInGame;
+
+        var serverGroups = chat.RecentMessages
+            .GroupBy(m => m.ServerName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        foreach (var group in serverGroups)
+        {
+            var server = group.Key;
+
+            if (_config.StandInAdmin.AllowedServers.Count > 0 &&
+                !_config.StandInAdmin.AllowedServers.Any(s => string.Equals(s, server, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            _standInResponsesThisMinute.TryGetValue(server, out var responsesThisMinute);
+            if (responsesThisMinute >= _config.StandInAdmin.MaxResponsesPerMinute)
+                continue;
+
+            _standInLastProcessedAtUtc.TryGetValue(server, out var lastProcessed);
+            var pending = group
+                .Where(m => m.CapturedAtUtc > lastProcessed)
+                .OrderBy(m => m.CapturedAtUtc)
+                .ToList();
+
+            if (pending.Count == 0)
+                continue;
+
+            _standInLastProcessedAtUtc[server] = pending.Last().CapturedAtUtc;
+
+            if (_standInCooldownByServer.TryGetValue(server, out var cooldownUntil) && now < cooldownUntil)
+                continue;
+
+            foreach (var msg in pending)
+            {
+                if (string.Equals(msg.PlayerName, agentName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var shouldRespond =
+                    (_config.StandInAdmin.RespondToMentions &&
+                        msg.Message.Contains(agentName, StringComparison.OrdinalIgnoreCase)) ||
+                    (_config.StandInAdmin.RespondToQuestions &&
+                        msg.Message.TrimEnd().EndsWith('?') && msg.Message.Length > 10);
+
+                if (!shouldRespond)
+                    continue;
+
+                _standInResponsesThisMinute.TryGetValue(server, out var rateCount);
+                if (rateCount >= _config.StandInAdmin.MaxResponsesPerMinute)
+                    break;
+
+                try
+                {
+                    var memoryContext = string.Empty;
+                    if (_config.Memory.SearchEnabled)
+                    {
+                        var memResults = await _semanticMemory.SearchAsync(msg.Message, 4, cancellationToken);
+                        if (memResults.Count > 0)
+                            memoryContext = "\nRelevant server context:\n" + string.Join("\n", memResults.Select(r => $"- {r.MemoryRecord.Summary}"));
+                    }
+
+                    var systemPrompt = _config.StandInAdmin.SystemPrompt
+                        ?? $"You are {agentName}, the automated admin assistant for this Rust game server. Answer briefly and helpfully. Never impersonate other players. If you don't know, say so. Keep responses under 140 characters.";
+
+                    var prompt = $"{systemPrompt}{memoryContext}\n\nPlayer '{msg.PlayerName}' says: {msg.Message}\n\nReply as {agentName} (max 140 chars, no quotes):";
+
+                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    cts.CancelAfter(TimeSpan.FromSeconds(30));
+
+                    var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cts.Token);
+                    var reply = (response.GetValue<string>() ?? string.Empty).Trim()
+                        .Replace('\n', ' ').Replace('\r', ' ');
+                    if (reply.Length > 140)
+                        reply = reply[..137] + "...";
+
+                    if (string.IsNullOrWhiteSpace(reply))
+                        continue;
+
+                    var sayCommand = $"say [{agentName}] {reply}";
+                    using var sayResponse = await _api.PostAsync(
+                        $"/servers/{Uri.EscapeDataString(server)}/command/exec",
+                        new { command = sayCommand },
+                        cancellationToken);
+
+                    Console.WriteLine($"[stand-in] {server}: Responded to {msg.PlayerName}: {reply}");
+                    _standInResponsesThisMinute[server] = rateCount + 1;
+                    _standInCooldownByServer[server] = now.AddSeconds(_config.StandInAdmin.ResponseCooldownSeconds);
+
+                    if (_config.Memory.WriteEnabled)
+                    {
+                        var summary = $"[{server}] Stand-in admin responded to {msg.PlayerName}";
+                        var detail = $"Server: {server}\nPlayer: {msg.PlayerName}\nMessage: {msg.Message}\nReply: {reply}";
+                        _ = _semanticMemory.RecordServerFactAsync(server, summary, detail,
+                            new[] { "stand-in-admin", "player-interaction", server.ToLowerInvariant(), msg.PlayerName.ToLowerInvariant() },
+                            CancellationToken.None);
+                    }
+
+                    break; // one response per tick per server
+                }
+                catch (OperationCanceledException)
+                {
+                    Console.WriteLine($"[stand-in] {server}: Response timed out.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[stand-in] {server}: Failed to respond to {msg.PlayerName}: {ex.Message}");
+                }
+            }
+        }
     }
 
     private async Task AnalyzePlayerSentimentAsync(CancellationToken cancellationToken)
@@ -1251,6 +1398,16 @@ Recent player chat (newest last):
 
             chat.AnalysedAtUtc = DateTime.UtcNow;
             _neoCortex.SavePlayerChat(chat);
+
+            if (_config.Memory.WriteEnabled && chat.SentimentSummary is not null)
+            {
+                var themes = chat.KeyThemes.Count > 0 ? string.Join(", ", chat.KeyThemes) : "none";
+                var feedback = chat.ConstructiveFeedback.Count > 0 ? string.Join("; ", chat.ConstructiveFeedback) : "none";
+                var sentimentSummary = $"Player sentiment: {chat.SentimentLabel} ({chat.SentimentScore:F1}/10) — {TrimSingleLine(chat.SentimentSummary, 80)}";
+                var sentimentDetail = $"Score: {chat.SentimentScore:F1}/10\nLabel: {chat.SentimentLabel}\nSummary: {chat.SentimentSummary}\nThemes: {themes}\nFeedback: {feedback}";
+                var sentimentTags = new List<string> { "sentiment", "player-chat", chat.SentimentLabel ?? "unknown" };
+                _ = _semanticMemory.RecordReflectionAsync(sentimentSummary, sentimentDetail, sentimentTags, CancellationToken.None);
+            }
 
             Console.WriteLine($"[sentiment] Score={chat.SentimentScore:F1} Label={chat.SentimentLabel} — {chat.SentimentSummary}");
 

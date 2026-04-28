@@ -12,6 +12,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
     private readonly RustOpsApiClient _api;
     private readonly IGitOpsService _gitOps;
     private readonly GitOpsSettings _gitOpsSettings;
+    private readonly ISemanticMemoryService? _semanticMemory;
 
     private static readonly string[] AllowedExtensions = { ".cfg", ".json", ".txt", ".ini", ".env" };
 
@@ -45,11 +46,12 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         "plugin", "oxide"
     };
 
-    public RustFileEditToolHandler(RustOpsApiClient api, IGitOpsService gitOps, GitOpsSettings gitOpsSettings)
+    public RustFileEditToolHandler(RustOpsApiClient api, IGitOpsService gitOps, GitOpsSettings gitOpsSettings, ISemanticMemoryService? semanticMemory = null)
     {
         _api = api;
         _gitOps = gitOps;
         _gitOpsSettings = gitOpsSettings;
+        _semanticMemory = semanticMemory;
     }
 
     public string Name => "rust.file.edit";
@@ -272,6 +274,16 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             var prettyUpdated = configNode.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
             await File.WriteAllTextAsync(configPath, prettyUpdated, cancellationToken);
 
+            if (_semanticMemory is not null)
+            {
+                _ = _semanticMemory.RecordServerFactAsync(
+                    canonicalServer,
+                    $"Config change: {canonicalServer} {mutation.Key} set to {mutation.DisplayValue}",
+                    $"Server config key '{mutation.Key}' changed to '{mutation.DisplayValue}' on '{canonicalServer}'. File: {configPath}",
+                    new[] { "config", "mutation", mutation.Key.ToLowerInvariant(), canonicalServer.ToLowerInvariant() },
+                    CancellationToken.None);
+            }
+
             return new ToolExecutionResult(
                 true,
                 $"Updated {canonicalServer} config at {configPath}: set `{mutation.Key}` to `{mutation.DisplayValue}`. Server runtime root: {BuildExpectedServerRootPath(canonicalServer)}\n```json\n{prettyUpdated}\n```",
@@ -436,9 +448,21 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             ApplyConfigMutation(pluginConfig, mutation.Key, mutation.ValueNode);
             var prettyUpdated = pluginConfig.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
             await File.WriteAllTextAsync(pluginPath, prettyUpdated, cancellationToken);
+
+            var pluginConfigName = Path.GetFileNameWithoutExtension(pluginPath);
+            if (_semanticMemory is not null)
+            {
+                _ = _semanticMemory.RecordServerFactAsync(
+                    server,
+                    $"Plugin config change: {pluginConfigName} {mutation.Key} set to {mutation.DisplayValue} on {server}",
+                    $"Plugin config '{pluginConfigName}' key '{mutation.Key}' changed to '{mutation.DisplayValue}' on '{server}'. File: {pluginPath}",
+                    new[] { "config", "plugin-config", mutation.Key.ToLowerInvariant(), pluginConfigName.ToLowerInvariant(), server.ToLowerInvariant() },
+                    CancellationToken.None);
+            }
+
             return new ToolExecutionResult(
                 true,
-                $"Updated plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server}: set `{mutation.Key}` to `{mutation.DisplayValue}`.\n```json\n{prettyUpdated}\n```",
+                $"Updated plugin config `{pluginConfigName}` on {server}: set `{mutation.Key}` to `{mutation.DisplayValue}`.\n```json\n{prettyUpdated}\n```",
                 server, true,
                 Payload: prettyUpdated);
         }

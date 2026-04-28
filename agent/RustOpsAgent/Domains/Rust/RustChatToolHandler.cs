@@ -9,12 +9,14 @@ internal sealed class RustChatToolHandler : IToolHandler
     private readonly NeoCortexStore _memory;
     private readonly ISemanticMemoryService _semanticMemory;
     private readonly AutoPullService? _autoPull;
+    private readonly ServerKnowledgeCatalog _knowledge;
 
-    public RustChatToolHandler(NeoCortexStore memory, ISemanticMemoryService semanticMemory, AutoPullService? autoPull = null)
+    public RustChatToolHandler(NeoCortexStore memory, ISemanticMemoryService semanticMemory, AutoPullService? autoPull = null, ServerKnowledgeCatalog? knowledge = null)
     {
         _memory = memory;
         _semanticMemory = semanticMemory;
         _autoPull = autoPull;
+        _knowledge = knowledge ?? new ServerKnowledgeCatalog();
     }
 
     public string Name => "rust.chat.reply";
@@ -59,6 +61,13 @@ internal sealed class RustChatToolHandler : IToolHandler
             }
         }
 
+        // Detect mentioned server convars/commands and inject knowledge
+        var knowledgeMatch = _knowledge.FindMentionedEntry(context.Message);
+        if (knowledgeMatch is not null)
+        {
+            await TryInjectCatalogFactAsync(knowledgeMatch, cancellationToken);
+        }
+
         object? payload = null;
         try
         {
@@ -84,6 +93,8 @@ internal sealed class RustChatToolHandler : IToolHandler
             }
             catch { /* non-critical */ }
 
+            var knownConvarOrCommand = knowledgeMatch is not null ? $"{knowledgeMatch.EntryType}: {knowledgeMatch.Name}" : null;
+
             payload = new
             {
                 recentActions,
@@ -91,7 +102,8 @@ internal sealed class RustChatToolHandler : IToolHandler
                 openIncidents,
                 lastServer = context.SelectionState.LastServerName ?? "none",
                 lastIntent = context.SelectionState.LastIntent ?? "none",
-                llmEnabled = ops.RuntimeStatus?.LlmEnabled ?? false
+                llmEnabled = ops.RuntimeStatus?.LlmEnabled ?? false,
+                knownConvarOrCommand
             };
         }
         catch
@@ -228,5 +240,32 @@ internal sealed class RustChatToolHandler : IToolHandler
         if (age.TotalMinutes < 60) return $"{(int)age.TotalMinutes}m ago";
         if (age.TotalHours < 24) return $"{(int)age.TotalHours}h ago";
         return $"{(int)age.TotalDays}d ago";
+    }
+
+    private async Task TryInjectCatalogFactAsync(CatalogLookupMatch match, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(match.Description))
+        {
+            return;
+        }
+
+        try
+        {
+            var type = match.EntryType == CatalogEntryType.Variable ? "Server Variable" : "Server Command";
+            var summary = $"Server knowledge: {type} '{match.Name}'";
+            var text = $"Type: {type}\nName: {match.Name}\nDescription: {match.Description}";
+            var tags = new[] { "server-knowledge", match.EntryType.ToString().ToLowerInvariant(), match.Name.ToLowerInvariant() };
+
+            await _semanticMemory.RecordServerFactAsync(
+                "server-reference",
+                summary,
+                text,
+                tags,
+                cancellationToken);
+        }
+        catch
+        {
+            // Non-critical — continue if memory injection fails
+        }
     }
 }

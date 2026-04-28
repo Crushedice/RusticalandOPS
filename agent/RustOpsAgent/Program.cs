@@ -152,17 +152,21 @@ Action<string, string, string?> serverStatusNotifier = (adminId, message, server
         System.Text.Json.JsonSerializer.Serialize(payload, JsonDefaults.Default));
 };
 
+// Shared server knowledge catalog for convar/command lookups across chat and RCON handlers
+var serverKnowledge = new ServerKnowledgeCatalog();
+Console.WriteLine($"[agent] Server knowledge loaded: {serverKnowledge.GetSnapshot().Variables.Count} variables, {serverKnowledge.GetSnapshot().Commands.Count} commands");
+
 var handlers = new List<IToolHandler>
 {
-    new RustServerControlToolHandler(apiClient, serverStatusNotifier),
-    new RustStatusToolHandler(apiClient),
+    new RustServerControlToolHandler(apiClient, serverStatusNotifier, semanticMemory),
+    new RustStatusToolHandler(apiClient, semanticMemory),
     new RustPlayerLookupToolHandler(apiClient),
-    new RustRconToolHandler(apiClient, neoCortex, config.CommandExecution),
-    new RustLogsToolHandler(apiClient, neoCortex),
-    new RustPluginToolHandler(apiClient, config.PluginUpdates),
+    new RustRconToolHandler(apiClient, neoCortex, config.CommandExecution, serverKnowledge, semanticMemory),
+    new RustLogsToolHandler(apiClient, neoCortex, semanticMemory),
+    new RustPluginToolHandler(apiClient, config.PluginUpdates, semanticMemory),
     new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
-    new RustFileEditToolHandler(apiClient, gitOps, config.GitOps),
-    new RustChatToolHandler(neoCortex, semanticMemory, autoPull),
+    new RustFileEditToolHandler(apiClient, gitOps, config.GitOps, semanticMemory),
+    new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge),
     new RustServerManagementToolHandler(apiClient)
 };
 

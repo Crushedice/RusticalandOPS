@@ -19,6 +19,7 @@ internal sealed class AgentConfig
     [JsonPropertyName("commandExecution")] public CommandExecutionSettings CommandExecution { get; set; } = new();
     [JsonPropertyName("cpuAffinity")] public CpuAffinitySettings CpuAffinity { get; set; } = new();
     [JsonPropertyName("consoleMonitor")] public ConsoleMonitorSettings ConsoleMonitor { get; set; } = new();
+    [JsonPropertyName("standInAdmin")] public StandInAdminSettings StandInAdmin { get; set; } = new();
 }
 
 internal sealed class ApiSettings
@@ -145,6 +146,18 @@ internal sealed class ConsoleMonitorSettings
     [JsonPropertyName("maxChatMessages")] public int MaxChatMessages { get; set; } = 200;
     [JsonPropertyName("sentimentAlertThreshold")] public double SentimentAlertThreshold { get; set; } = 4.0;
     [JsonPropertyName("compileErrorSeedThreshold")] public int CompileErrorSeedThreshold { get; set; } = 5;
+}
+
+internal sealed class StandInAdminSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    [JsonPropertyName("agentNameInGame")] public string AgentNameInGame { get; set; } = "RustOps";
+    [JsonPropertyName("respondToMentions")] public bool RespondToMentions { get; set; } = true;
+    [JsonPropertyName("respondToQuestions")] public bool RespondToQuestions { get; set; } = true;
+    [JsonPropertyName("responseCooldownSeconds")] public int ResponseCooldownSeconds { get; set; } = 60;
+    [JsonPropertyName("maxResponsesPerMinute")] public int MaxResponsesPerMinute { get; set; } = 3;
+    [JsonPropertyName("allowedServers")] public List<string> AllowedServers { get; set; } = new();
+    [JsonPropertyName("systemPrompt")] public string? SystemPrompt { get; set; }
 }
 
 internal sealed class LlmSettings
