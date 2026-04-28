@@ -12,6 +12,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
     private readonly Kernel? _kernel;
     private readonly LlmSettings _settings;
     private readonly NeoCortexStore? _neoCortex;
+    private readonly ISemanticMemoryService? _semanticMemory;
 
     // Config file keys live in the rustmgr JSON config and are edited via file_edit.
     // Everything else that looks like a dotted identifier is a live RCON convar.
@@ -24,11 +25,16 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "serverdir", "logfile", "additionalargs"
     };
 
-    public AdminIntentClassifier(Kernel? kernel, LlmSettings? settings = null, NeoCortexStore? neoCortex = null)
+    public AdminIntentClassifier(
+        Kernel? kernel,
+        LlmSettings? settings = null,
+        NeoCortexStore? neoCortex = null,
+        ISemanticMemoryService? semanticMemory = null)
     {
         _kernel = kernel;
         _settings = settings ?? new LlmSettings();
         _neoCortex = neoCortex;
+        _semanticMemory = semanticMemory;
     }
 
     public async Task<AdminIntentRoute> ClassifyAsync(
@@ -37,10 +43,22 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         IReadOnlyList<string> knownServers,
         CancellationToken cancellationToken)
     {
-        if (_kernel is null)
-            return HeuristicFallback(message, state, knownServers, "heuristic_no_kernel", false, false);
+        var planningMemory = _semanticMemory is null
+            ? WorkflowMemoryContext.Empty
+            : await _semanticMemory.RecallForPlanningAsync(message, state, knownServers, cancellationToken);
+        if (planningMemory.RetrievalSkipped)
+        {
+            Console.WriteLine($"[memory] planning recall skipped: {planningMemory.SkipReason}");
+        }
+        else if (planningMemory.HasResults)
+        {
+            Console.WriteLine($"[memory] planning recall retrieved {planningMemory.Results.Count} record(s)");
+        }
 
-        var prompt = BuildPrompt(message, state, knownServers);
+        if (_kernel is null)
+            return HeuristicFallback(message, state, knownServers, planningMemory, "heuristic_no_kernel", false, false);
+
+        var prompt = BuildPrompt(message, state, knownServers, planningMemory);
 
         string raw;
         try
@@ -50,12 +68,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         }
         catch
         {
-            return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_error", true, false);
+            return HeuristicFallback(message, state, knownServers, planningMemory, "heuristic_after_llm_error", true, false);
         }
 
         var json = TryExtractJson(raw);
         if (json is null)
-            return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_parse_failure", true, false);
+            return HeuristicFallback(message, state, knownServers, planningMemory, "heuristic_after_llm_parse_failure", true, false);
 
         try
         {
@@ -156,13 +174,14 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
                 needsClarification,
                 clarification,
                 targetRef,
+                planningMemory,
                 "llm",
                 true,
                 true);
         }
         catch
         {
-            return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_json_error", true, false);
+            return HeuristicFallback(message, state, knownServers, planningMemory, "heuristic_after_llm_json_error", true, false);
         }
     }
 
@@ -221,6 +240,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "7. server_management for: add/register/remove/delete/provision a server, update RCON\n" +
         "   credentials, \"edit server connection\". serverName and commandText (=RCON IP) go in slots.\n\n" +
         "8. chat for: git operations, pull, rebuild, build, questions about the agent software itself.\n" +
+        "   Memory/admin commands such as \"memory stats\", \"memory search\", \"memory migrate\" are ALSO chat.\n" +
         "   CRITICAL: \"git pull\", \"rebuild the agent\", \"can you pull?\" -> ALWAYS intent=chat.\n\n" +
         "9. scopeKind=all when admin says \"all servers\", \"every server\", \"all N servers\".\n" +
         "   For general status/health questions with NO specific server name, default scopeKind=all.\n\n" +
@@ -245,10 +265,16 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"status\", slots.serverName=\"cotton\"\n\n" +
         "\"git pull\" / \"rebuild the agent\" / \"can you pull from main?\"\n" +
         "  -> intent=chat, targetRef=rust.chat.reply\n\n" +
+        "\"memory stats\" / \"memory search restart failure\"\n" +
+        "  -> intent=chat, targetRef=rust.chat.reply\n\n" +
         "\"add remote server MyServer at 1.2.3.4:28016 password abc\"\n" +
         "  -> intent=server_management, targetRef=rust.server.management, slots.serverName=\"MyServer\", slots.commandText=\"1.2.3.4\"\n";
 
-    private string BuildPrompt(string message, ConversationSelectionState state, IReadOnlyList<string> knownServers)
+    private string BuildPrompt(
+        string message,
+        ConversationSelectionState state,
+        IReadOnlyList<string> knownServers,
+        WorkflowMemoryContext planningMemory)
     {
         var sb = new StringBuilder();
 
@@ -274,6 +300,18 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         sb.AppendLine();
         sb.AppendLine($"Known servers: {string.Join(", ", knownServers)}");
         sb.AppendLine();
+        if (planningMemory.HasResults)
+        {
+            sb.AppendLine("══ RELEVANT MEMORY ══");
+            sb.AppendLine(planningMemory.CompactContext);
+            sb.AppendLine();
+        }
+        else if (planningMemory.RetrievalSkipped && !string.IsNullOrWhiteSpace(planningMemory.SkipReason))
+        {
+            sb.AppendLine($"Memory status: {planningMemory.SkipReason}");
+            sb.AppendLine();
+        }
+
         sb.Append($"Admin message: {message}");
 
         return sb.ToString();
@@ -283,6 +321,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         string message,
         ConversationSelectionState state,
         IReadOnlyList<string> knownServers,
+        WorkflowMemoryContext planningMemory,
         string source,
         bool llmAttempted,
         bool llmSucceeded)
@@ -316,6 +355,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             needsClarification,
             needsClarification ? BuildClarificationQuestion(intent, knownServers, null) : null,
             targetRef,
+            planningMemory,
             source,
             llmAttempted,
             llmSucceeded);
@@ -323,6 +363,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
 
     private static AdminIntentType InferHeuristicIntent(string lowered)
     {
+        if (lowered.StartsWith("memory ", StringComparison.Ordinal))
+            return AdminIntentType.Chat;
         if (lowered.Contains("add server") || lowered.Contains("add remote") || lowered.Contains("register server") ||
             lowered.Contains("remove server") || lowered.Contains("delete server") || lowered.Contains("provision server") ||
             lowered.Contains("new server") || lowered.Contains("update rcon") || lowered.Contains("edit server") ||
@@ -409,14 +451,16 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         return intent != AdminIntentType.Clarification || normalized.Contains("clarification", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool RequiresServerScope(AdminIntentType intent) =>
-        intent is
+    private static bool RequiresServerScope(AdminIntentType intent)
+    {
+        // FileEdit and ServerManagement handle their own scope internally.
+        return intent is
             AdminIntentType.ServerControl or
             AdminIntentType.PlayerLookup or
             AdminIntentType.RconCommand or
             AdminIntentType.StatusCheck or
             AdminIntentType.Troubleshooting;
-        // FileEdit and ServerManagement handle their own scope internally.
+    }
 
     private static string BuildClarificationQuestion(AdminIntentType intent, IReadOnlyList<string> knownServers, string? preferredQuestion)
     {

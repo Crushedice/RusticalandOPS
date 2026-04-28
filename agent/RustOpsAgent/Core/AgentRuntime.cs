@@ -20,6 +20,7 @@ internal sealed class AgentRuntime
     private readonly IResponseComposer _composer;
     private readonly NeoCortexStore _neoCortex;
     private readonly LegacyAgentStateStore _legacyState;
+    private readonly ISemanticMemoryService _semanticMemory;
     private readonly IGitOpsService _gitOps;
     private readonly AutoPullService _autoPull;
     private readonly RustOpsApiClient _api;
@@ -51,6 +52,7 @@ internal sealed class AgentRuntime
         IResponseComposer composer,
         NeoCortexStore neoCortex,
         LegacyAgentStateStore legacyState,
+        ISemanticMemoryService semanticMemory,
         IGitOpsService gitOps,
         AutoPullService autoPull,
         RustOpsApiClient api,
@@ -62,6 +64,7 @@ internal sealed class AgentRuntime
         _composer = composer;
         _neoCortex = neoCortex;
         _legacyState = legacyState;
+        _semanticMemory = semanticMemory;
         _gitOps = gitOps;
         _autoPull = autoPull;
         _api = api;
@@ -166,6 +169,10 @@ internal sealed class AgentRuntime
                 _legacyState.RecordFeedback(payload.AdminId, payload.ActionId, payload.Verdict, payload.Note, payload.ServerName);
 
                 var note = payload.Note ?? payload.Preference;
+                if (!string.IsNullOrWhiteSpace(note))
+                {
+                    await _semanticMemory.RecordUserInstructionAsync(payload.AdminId, payload.ServerName, note, cancellationToken);
+                }
 
                 // Allow admins to teach the log filter using partial-match directives.
                 if (!string.IsNullOrWhiteSpace(note) && note.StartsWith("ignore ", StringComparison.OrdinalIgnoreCase))
@@ -325,7 +332,7 @@ internal sealed class AgentRuntime
         }
     }
 
-    private async Task ProcessSingleChatMessageAsync(string file, ChatInboxItem? item, CancellationToken cancellationToken)
+    internal async Task ProcessSingleChatMessageAsync(string file, ChatInboxItem? item, CancellationToken cancellationToken)
     {
         try
         {
@@ -414,8 +421,17 @@ internal sealed class AgentRuntime
 
             Console.WriteLine($"[chat] {item.AdminId}: intent={route.Intent} target={route.TargetRef ?? "?"} llm={route.ClassifierSource}");
             RecordIntentRoutingInteraction(item.Message, route);
-            var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);
+            var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow, route.PlanningMemoryContext ?? WorkflowMemoryContext.Empty, null);
+            LogMemoryDebug("runtime execution recall invoked");
+            var executionMemory = await _semanticMemory.RecallForExecutionAsync(context, cancellationToken);
+            executionMemory = executionMemory with { RetrievalOrigin = "runtime" };
+            context = context with { ExecutionMemoryContext = executionMemory };
+            LogMemoryDebug(executionMemory.RetrievalSkipped
+                ? $"runtime execution recall skipped: {executionMemory.SkipReason}"
+                : $"runtime execution recall completed: {executionMemory.Results.Count} result(s)");
             var result = await _executor.ExecuteAsync(context, cancellationToken);
+            LogMemoryDebug("post-action writeback invoked");
+            await _semanticMemory.RecordActionOutcomeAsync(context, result, cancellationToken);
             var composedReply = await _composer.ComposeAsync(context, result, cancellationToken);
             Console.WriteLine($"[chat] compose source={composedReply.Source} llm_ok={composedReply.LlmSucceeded}");
             RecordLlmInteraction(
@@ -835,6 +851,12 @@ internal sealed class AgentRuntime
             analysis.Source);
         var summary = analysis.Summary;
         _legacyState.RecordIncident(server, "health_observation", summary);
+        await _semanticMemory.RecordServerFactAsync(
+            server,
+            $"{server} health observation: {summary}",
+            $"State: {state}\nRecentErrors: {string.Join(" | ", recentErrors)}\nClassification: {analysis.Classification}\nMitigation: {analysis.RecurrencePrevention}",
+            new[] { "health-observation", analysis.Classification, state },
+            cancellationToken);
         await _neoCortex.RecordIncidentAsync(new EvolutionIncidentRecord
         {
             Request = $"observe health {server}",
@@ -1672,6 +1694,20 @@ Admin corrections:
         var top = review.OpenIncidents.Take(10).ToList();
         var incidentSummary = string.Join("\n", top.Select((i, idx) =>
             $"{idx + 1}. [{i.Classification}] {i.Request} → {i.FailureReason}"));
+        var repeatedFailureContext = string.Empty;
+        try
+        {
+            var repeatedFailures = await _semanticMemory.ListRepeatedFailuresAsync(2, cancellationToken);
+            if (repeatedFailures.Count > 0)
+            {
+                repeatedFailureContext = string.Join("\n", repeatedFailures.Take(5).Select(group =>
+                    $"- {group.Count()}x {group.Key}: {group.First().Summary}"));
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[review] Repeated failure lookup skipped: {ex.Message}");
+        }
 
         var prompt = $$"""
 You are reviewing recurring operational failures for a Rust server agent.
@@ -1688,6 +1724,9 @@ Constraints:
 
 Open incidents (newest first):
 {{incidentSummary}}
+
+Repeated failure memory clusters:
+{{(string.IsNullOrWhiteSpace(repeatedFailureContext) ? "none" : repeatedFailureContext)}}
 """;
 
         try
@@ -1713,6 +1752,14 @@ Open incidents (newest first):
 
             Console.WriteLine($"[review] Trend: {summary}");
             Console.WriteLine($"[review] Pattern: {pattern} | Mitigation: {mitigation}");
+            if (!string.IsNullOrWhiteSpace(summary) || !string.IsNullOrWhiteSpace(mitigation))
+            {
+                await _semanticMemory.RecordReflectionAsync(
+                    summary ?? "Incident review reflection",
+                    $"Pattern: {pattern}\nMitigation: {mitigation}\nConfigSuggestion: {config}",
+                    new[] { "incident-review", pattern ?? "unknown" },
+                    cancellationToken);
+            }
 
             RecordLlmInteraction(
                 "incident-review",
@@ -2084,5 +2131,13 @@ Open incidents (newest first):
             "error" => $"Pull failed: {status.Error}",
             _ => "Pull cycle started."
         };
+    }
+
+    private void LogMemoryDebug(string message)
+    {
+        if (_config.Memory.DebugLoggingEnabled)
+        {
+            Console.WriteLine($"[memory] {message}");
+        }
     }
 }

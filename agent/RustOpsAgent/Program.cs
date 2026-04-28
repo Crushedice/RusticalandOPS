@@ -59,6 +59,18 @@ Console.WriteLine($"[agent] Paths: outbox={config.Outbox.MessageOutboxPath}");
 var neoCortex = new NeoCortexStore(config.Memory.NeoCortexRoot, config.Memory.StatePath);
 neoCortex.EnsureMigrated();
 var legacyState = new LegacyAgentStateStore(config.Memory.StatePath);
+var semanticStore = BuildMemoryStore(config.Memory);
+var embeddingProvider = BuildEmbeddingProvider(config.Memory);
+var semanticMemory = new SemanticMemoryService(
+    config.Memory,
+    semanticStore,
+    embeddingProvider,
+    config.Memory.StatePath,
+    config.Memory.NeoCortexRoot);
+if (await TryHandleMemoryMaintenanceAsync(startup, semanticMemory))
+{
+    return 0;
+}
 
 var kernel = BuildKernel(config.Llm);
 if (kernel is null)
@@ -103,7 +115,7 @@ else
 composeKernel ??= kernel;
 var effectiveComposeSettings = composeKernelConfigured ? config.LlmCompose : config.Llm;
 
-var classifier = new AdminIntentClassifier(kernel, config.Llm, neoCortex);
+var classifier = new AdminIntentClassifier(kernel, config.Llm, neoCortex, semanticMemory);
 using var apiClient = new RustOpsApiClient(config.Api);
 
 if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.OrdinalIgnoreCase))
@@ -150,15 +162,15 @@ var handlers = new List<IToolHandler>
     new RustPluginToolHandler(apiClient, config.PluginUpdates),
     new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
     new RustFileEditToolHandler(apiClient, gitOps, config.GitOps),
-    new RustChatToolHandler(neoCortex, autoPull),
+    new RustChatToolHandler(neoCortex, semanticMemory, autoPull),
     new RustServerManagementToolHandler(apiClient)
 };
 
 var registry = new ToolRegistry(handlers);
-var executor = new ActionExecutor(registry);
+var executor = new ActionExecutor(registry, semanticMemory);
 var composer = new ResponseComposer(composeKernel, effectiveComposeSettings);
 
-var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, autoPull, apiClient, deepKernel);
+var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel);
 
 Console.CancelKeyPress += (_, e) =>
 {
@@ -220,6 +232,70 @@ static Kernel? BuildKernel(LlmSettings settings)
     return builder.Build();
 }
 
+static IEmbeddingProvider? BuildEmbeddingProvider(MemorySettings settings)
+{
+    if (!settings.SearchEnabled && !settings.WriteEnabled)
+    {
+        return null;
+    }
+
+    if (!string.Equals(settings.Provider, "sqlite", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[memory] Unsupported provider '{settings.Provider}'. Semantic memory disabled.");
+        return null;
+    }
+
+    if (string.IsNullOrWhiteSpace(settings.Embedding.BaseUrl) ||
+        RustOpsEnv.HasUnresolvedPlaceholder(settings.Embedding.BaseUrl) ||
+        string.IsNullOrWhiteSpace(settings.Embedding.Model) ||
+        RustOpsEnv.HasUnresolvedPlaceholder(settings.Embedding.Model))
+    {
+        Console.WriteLine("[memory] Embedding provider not configured. Semantic retrieval/writes will be skipped.");
+        return null;
+    }
+
+    if (!string.Equals(settings.Embedding.Provider, "openai-compatible", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[memory] Unsupported embedding provider '{settings.Embedding.Provider}'. Semantic memory disabled.");
+        return null;
+    }
+
+    try
+    {
+        return new OpenAiCompatibleEmbeddingProvider(
+            settings.Embedding.BaseUrl,
+            settings.Embedding.Model,
+            settings.Embedding.ApiKey,
+            settings.Embedding.RequireApiKey,
+            settings.Embedding.TimeoutSeconds,
+            settings.Embedding.BatchSize);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[memory] Failed to initialize embedding provider: {ex.Message}");
+        return null;
+    }
+}
+
+static IInspectableMemoryStore BuildMemoryStore(MemorySettings settings)
+{
+    if (!string.Equals(settings.Provider, "sqlite", StringComparison.OrdinalIgnoreCase))
+    {
+        Console.WriteLine($"[memory] Unsupported provider '{settings.Provider}'. Using no-op memory store.");
+        return new NullMemoryStore();
+    }
+
+    try
+    {
+        return new SqliteMemoryStore(settings.DatabasePath, settings, settings.DebugLoggingEnabled ? message => Console.WriteLine($"[memory] {message}") : null);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[memory] Failed to initialize semantic store: {ex.Message}. Using no-op memory store.");
+        return new NullMemoryStore();
+    }
+}
+
 static AgentStartupOptions ParseStartupOptions(string[] args)
 {
     var startup = new AgentStartupOptions();
@@ -229,12 +305,81 @@ static AgentStartupOptions ParseStartupOptions(string[] args)
         {
             startup.ConfigPath = args[++i];
         }
+        else if (string.Equals(args[i], "--memory-migrate", StringComparison.OrdinalIgnoreCase))
+        {
+            startup.MemoryCommand = "migrate";
+        }
+        else if (string.Equals(args[i], "--memory-stats", StringComparison.OrdinalIgnoreCase))
+        {
+            startup.MemoryCommand = "stats";
+        }
+        else if (string.Equals(args[i], "--memory-prune", StringComparison.OrdinalIgnoreCase))
+        {
+            startup.MemoryCommand = "prune";
+        }
+        else if (string.Equals(args[i], "--memory-rebuild-embeddings", StringComparison.OrdinalIgnoreCase))
+        {
+            startup.MemoryCommand = "rebuild";
+        }
+        else if (string.Equals(args[i], "--memory-search", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+        {
+            startup.MemoryCommand = "search";
+            startup.MemorySearchQuery = args[++i];
+        }
+        else if (string.Equals(args[i], "--dry-run", StringComparison.OrdinalIgnoreCase))
+        {
+            startup.DryRun = true;
+        }
     }
 
     return startup;
 }
 
+static async Task<bool> TryHandleMemoryMaintenanceAsync(AgentStartupOptions startup, ISemanticMemoryService semanticMemory)
+{
+    if (string.IsNullOrWhiteSpace(startup.MemoryCommand))
+    {
+        return false;
+    }
+
+    switch (startup.MemoryCommand)
+    {
+        case "migrate":
+            var migration = await semanticMemory.MigrateLegacyMemoryAsync(startup.DryRun, CancellationToken.None);
+            Console.WriteLine($"[memory] Migration complete: {migration.ToSummary()}");
+            return true;
+        case "stats":
+            var stats = await semanticMemory.GetStatsAsync(CancellationToken.None);
+            Console.WriteLine($"[memory] total={stats.TotalRecords} active={stats.ActiveRecords} expired={stats.ExpiredRecords}");
+            foreach (var entry in stats.ByType.OrderByDescending(item => item.Value))
+            {
+                Console.WriteLine($"[memory] type {entry.Key}={entry.Value}");
+            }
+            return true;
+        case "prune":
+            var pruned = await semanticMemory.PruneAsync(CancellationToken.None);
+            Console.WriteLine($"[memory] Pruned {pruned} record(s).");
+            return true;
+        case "rebuild":
+            var rebuilt = await semanticMemory.RebuildEmbeddingsAsync(CancellationToken.None);
+            Console.WriteLine($"[memory] Rebuilt embeddings for {rebuilt} record(s).");
+            return true;
+        case "search":
+            var results = await semanticMemory.SearchAsync(startup.MemorySearchQuery ?? string.Empty, 8, CancellationToken.None);
+            foreach (var result in results)
+            {
+                Console.WriteLine($"[memory] {result.MemoryRecord.Id} [{result.MemoryRecord.Type}/{result.MemoryRecord.Scope}] {result.MemoryRecord.Summary} score={result.FinalScore:F2}");
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
 internal sealed class AgentStartupOptions
 {
     public string? ConfigPath { get; set; }
+    public string? MemoryCommand { get; set; }
+    public string? MemorySearchQuery { get; set; }
+    public bool DryRun { get; set; }
 }

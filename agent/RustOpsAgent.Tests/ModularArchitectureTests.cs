@@ -26,6 +26,19 @@ public class ModularArchitectureTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => service.PushAsync("main", CancellationToken.None));
     }
 
+    [Fact]
+    public void Program_Wires_Single_SemanticMemoryService_Into_Live_Pipeline()
+    {
+        var programPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "RustOpsAgent", "Program.cs"));
+        var source = File.ReadAllText(programPath);
+
+        Assert.Equal(1, CountOccurrences(source, "new SemanticMemoryService("));
+        Assert.Contains("new AdminIntentClassifier(kernel, config.Llm, neoCortex, semanticMemory);", source);
+        Assert.Contains("new ActionExecutor(registry, semanticMemory);", source);
+        Assert.Contains("new RustChatToolHandler(neoCortex, semanticMemory, autoPull),", source);
+        Assert.Contains("new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel);", source);
+    }
+
     // ── NeoCortex ──────────────────────────────────────────────────────────────
 
     [Fact]
@@ -133,7 +146,7 @@ public class ModularArchitectureTests
         {
             new RustServerControlToolHandler(api),
             new RustStatusToolHandler(api),
-            new RustChatToolHandler(neo)
+            new RustChatToolHandler(neo, MakeSemanticMemory(root: TempRoot()))
         };
 
         var registry = new ToolRegistry(handlers);
@@ -263,7 +276,7 @@ public class ModularArchitectureTests
         neo.EnsureMigrated();
         var gitOps = new GitOpsService(new GitOpsSettings { Enabled = false, RepoPath = root, PushBranchPrefix = "agent/" });
         var fileEditHandler = new RustFileEditToolHandler(api, gitOps, new GitOpsSettings { Enabled = false, RepoPath = root, PushBranchPrefix = "agent/" });
-        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler(neo), fileEditHandler });
+        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler(neo, MakeSemanticMemory(root)), fileEditHandler });
         var executor = new ActionExecutor(registry);
 
         var route = new AdminIntentRoute(
@@ -558,6 +571,35 @@ public class ModularArchitectureTests
         return new NeoCortexStore(Path.Combine(root, "NeoCortex"), Path.Combine(root, "legacy.json"));
     }
 
+    private static int CountOccurrences(string text, string value)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = text.IndexOf(value, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += value.Length;
+        }
+
+        return count;
+    }
+
+    private static SemanticMemoryService MakeSemanticMemory(string root)
+    {
+        var settings = new MemorySettings
+        {
+            DatabasePath = Path.Combine(root, "semantic.db"),
+            SearchEnabled = true,
+            WriteEnabled = true
+        };
+        return new SemanticMemoryService(
+            settings,
+            new SqliteMemoryStore(settings.DatabasePath),
+            new FakeEmbeddingProvider(),
+            Path.Combine(root, "legacy-state.json"),
+            Path.Combine(root, "NeoCortex"));
+    }
+
     private static RustOpsApiClient TestApi() =>
         new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
 
@@ -568,5 +610,29 @@ public class ModularArchitectureTests
 
         public Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken) =>
             Task.FromResult(new ToolExecutionResult(true, "status-handler-ran"));
+    }
+
+    private sealed class FakeEmbeddingProvider : IEmbeddingProvider
+    {
+        public string ModelName => "test-embedding";
+        public int? Dimensions => 4;
+
+        public Task<float[]> GenerateEmbeddingAsync(string text, CancellationToken cancellationToken) =>
+            Task.FromResult(Embed(text));
+
+        public Task<IReadOnlyList<float[]>> GenerateEmbeddingsAsync(IEnumerable<string> texts, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<float[]>>(texts.Select(Embed).ToList());
+
+        private static float[] Embed(string text)
+        {
+            var chars = (text ?? string.Empty).ToLowerInvariant().ToCharArray();
+            var vector = new float[4];
+            foreach (var ch in chars)
+            {
+                vector[ch % 4] += ch;
+            }
+
+            return vector;
+        }
     }
 }

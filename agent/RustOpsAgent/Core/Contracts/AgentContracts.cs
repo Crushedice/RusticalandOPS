@@ -41,6 +41,7 @@ internal sealed record AdminIntentRoute(
     bool NeedsClarification,
     string? ClarificationQuestion,
     string? TargetRef,
+    WorkflowMemoryContext? PlanningMemoryContext = null,
     string ClassifierSource = "heuristic",
     bool LlmAttempted = false,
     bool LlmSucceeded = false);
@@ -50,7 +51,9 @@ internal sealed record ToolExecutionContext(
     string Message,
     AdminIntentRoute Route,
     ConversationSelectionState SelectionState,
-    DateTime UtcNow);
+    DateTime UtcNow,
+    WorkflowMemoryContext? PlanningMemoryContext = null,
+    WorkflowMemoryContext? ExecutionMemoryContext = null);
 
 internal sealed record ToolExecutionResult(
     bool Success,

@@ -26,6 +26,34 @@ internal static class ConfigLoader
         config.Memory.NeoCortexRoot =
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_NEOCORTEX_ROOT")
             ?? config.Memory.NeoCortexRoot;
+        config.Memory.Provider =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MEMORY_PROVIDER")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Memory.Provider);
+        config.Memory.DatabasePath =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MEMORY_DATABASE_PATH")
+            ?? config.Memory.DatabasePath;
+        config.Memory.SearchEnabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_MEMORY_SEARCH_ENABLED", config.Memory.SearchEnabled);
+        config.Memory.WriteEnabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_MEMORY_WRITE_ENABLED", config.Memory.WriteEnabled);
+        config.Memory.DebugLoggingEnabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_MEMORY_DEBUG_LOGGING_ENABLED", config.Memory.DebugLoggingEnabled);
+        config.Memory.SimilarityThreshold =
+            RustOpsEnv.GetDouble("RUSTOPS_MEMORY_SIMILARITY_THRESHOLD", config.Memory.SimilarityThreshold);
+        config.Memory.MaxRetrievedMemoriesPerStep =
+            RustOpsEnv.GetInt32("RUSTOPS_MEMORY_MAX_RETRIEVED_PER_STEP", config.Memory.MaxRetrievedMemoriesPerStep);
+        config.Memory.MaxSearchCandidates =
+            RustOpsEnv.GetInt32("RUSTOPS_MEMORY_MAX_SEARCH_CANDIDATES", config.Memory.MaxSearchCandidates);
+        config.Memory.MaxInjectedMemoryCharacters =
+            RustOpsEnv.GetInt32("RUSTOPS_MEMORY_MAX_INJECTED_CHARACTERS", config.Memory.MaxInjectedMemoryCharacters);
+        config.Memory.MaxWritesPerWorkflowStep =
+            RustOpsEnv.GetInt32("RUSTOPS_MEMORY_MAX_WRITES_PER_STEP", config.Memory.MaxWritesPerWorkflowStep);
+        config.Memory.PruneLowImportanceThreshold =
+            RustOpsEnv.GetDouble("RUSTOPS_MEMORY_PRUNE_LOW_IMPORTANCE_THRESHOLD", config.Memory.PruneLowImportanceThreshold);
+        config.Memory.PruneLowConfidenceThreshold =
+            RustOpsEnv.GetDouble("RUSTOPS_MEMORY_PRUNE_LOW_CONFIDENCE_THRESHOLD", config.Memory.PruneLowConfidenceThreshold);
+        config.Memory.PruneOlderThanDays =
+            RustOpsEnv.GetInt32("RUSTOPS_MEMORY_PRUNE_OLDER_THAN_DAYS", config.Memory.PruneOlderThanDays);
         config.Inbox.FeedbackInboxPath =
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_FEEDBACK_INBOX_PATH")
             ?? config.Inbox.FeedbackInboxPath;
@@ -41,10 +69,33 @@ internal static class ConfigLoader
 
         config.Memory.StatePath = RustOpsEnv.ResolvePlaceholders(config.Memory.StatePath);
         config.Memory.NeoCortexRoot = RustOpsEnv.ResolvePlaceholders(config.Memory.NeoCortexRoot);
+        config.Memory.DatabasePath = RustOpsEnv.ResolvePlaceholders(config.Memory.DatabasePath);
         config.Inbox.FeedbackInboxPath = RustOpsEnv.ResolvePlaceholders(config.Inbox.FeedbackInboxPath);
         config.Inbox.DecisionInboxPath = RustOpsEnv.ResolvePlaceholders(config.Inbox.DecisionInboxPath);
         config.Inbox.ChatInboxPath = RustOpsEnv.ResolvePlaceholders(config.Inbox.ChatInboxPath);
         config.Outbox.MessageOutboxPath = RustOpsEnv.ResolvePlaceholders(config.Outbox.MessageOutboxPath);
+
+        config.Memory.Embedding.Provider =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_EMBEDDING_PROVIDER")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Memory.Embedding.Provider);
+        config.Memory.Embedding.BaseUrl =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_EMBEDDING_BASE_URL")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Memory.Embedding.BaseUrl);
+        config.Memory.Embedding.ApiKeyEnvVarName =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_EMBEDDING_API_KEY_ENV_VAR")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Memory.Embedding.ApiKeyEnvVarName);
+        config.Memory.Embedding.ApiKey =
+            RustOpsEnv.FirstNonEmptyEnvironment(config.Memory.Embedding.ApiKeyEnvVarName, "RUSTOPS_EMBEDDING_API_KEY")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Memory.Embedding.ApiKey ?? string.Empty);
+        config.Memory.Embedding.RequireApiKey =
+            RustOpsEnv.GetBoolean("RUSTOPS_EMBEDDING_REQUIRE_API_KEY", config.Memory.Embedding.RequireApiKey);
+        config.Memory.Embedding.Model =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_EMBEDDING_MODEL")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Memory.Embedding.Model);
+        config.Memory.Embedding.TimeoutSeconds =
+            RustOpsEnv.GetInt32("RUSTOPS_EMBEDDING_TIMEOUT_SECONDS", config.Memory.Embedding.TimeoutSeconds);
+        config.Memory.Embedding.BatchSize =
+            RustOpsEnv.GetInt32("RUSTOPS_EMBEDDING_BATCH_SIZE", config.Memory.Embedding.BatchSize);
 
         config.Llm.Provider =
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_PROVIDER", "RUSTOPS_OLLAMA_PROVIDER")
@@ -142,6 +193,7 @@ internal static class ConfigLoader
 
         config.Memory.StatePath = ResolvePath(config.Memory.StatePath, root);
         config.Memory.NeoCortexRoot = ResolvePath(config.Memory.NeoCortexRoot, root);
+        config.Memory.DatabasePath = ResolvePath(config.Memory.DatabasePath, root);
         config.Inbox.ChatInboxPath = ResolvePath(config.Inbox.ChatInboxPath, root);
         config.Inbox.DecisionInboxPath = ResolvePath(config.Inbox.DecisionInboxPath, root);
         config.Inbox.FeedbackInboxPath = ResolvePath(config.Inbox.FeedbackInboxPath, root);
@@ -220,5 +272,23 @@ internal static class ConfigLoader
             throw new InvalidOperationException("memory.statePath is required.");
         if (string.IsNullOrWhiteSpace(config.Memory.NeoCortexRoot) || RustOpsEnv.HasUnresolvedPlaceholder(config.Memory.NeoCortexRoot))
             throw new InvalidOperationException("memory.neoCortexRoot is required.");
+        if (string.IsNullOrWhiteSpace(config.Memory.DatabasePath) || RustOpsEnv.HasUnresolvedPlaceholder(config.Memory.DatabasePath))
+            throw new InvalidOperationException("memory.databasePath is required.");
+        if (config.Memory.MaxRetrievedMemoriesPerStep <= 0)
+            throw new InvalidOperationException("memory.maxRetrievedMemoriesPerStep must be > 0.");
+        if (config.Memory.MaxSearchCandidates <= 0)
+            throw new InvalidOperationException("memory.maxSearchCandidates must be > 0.");
+        if (config.Memory.MaxInjectedMemoryCharacters < 0)
+            throw new InvalidOperationException("memory.maxInjectedMemoryCharacters must be >= 0.");
+        if (config.Memory.MaxWritesPerWorkflowStep < 0)
+            throw new InvalidOperationException("memory.maxWritesPerWorkflowStep must be >= 0.");
+        if (config.Memory.SimilarityThreshold < 0 || config.Memory.SimilarityThreshold > 1)
+            throw new InvalidOperationException("memory.similarityThreshold must be between 0 and 1.");
+        if (config.Memory.PruneLowImportanceThreshold < 0 || config.Memory.PruneLowImportanceThreshold > 1)
+            throw new InvalidOperationException("memory.pruneLowImportanceThreshold must be between 0 and 1.");
+        if (config.Memory.PruneLowConfidenceThreshold < 0 || config.Memory.PruneLowConfidenceThreshold > 1)
+            throw new InvalidOperationException("memory.pruneLowConfidenceThreshold must be between 0 and 1.");
+        if (config.Memory.PruneOlderThanDays < 0)
+            throw new InvalidOperationException("memory.pruneOlderThanDays must be >= 0.");
     }
 }

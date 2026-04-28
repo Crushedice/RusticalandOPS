@@ -67,12 +67,14 @@ internal sealed class ResponseComposer : IResponseComposer
             payloadPreview = payloadPreview[..1200];
 
         var conversationHistory = BuildConversationHistory(context.SelectionState);
+        var memoryContext = BuildMemoryContext(context);
         var systemPrompt = BuildSystemPrompt();
 
         var prompt = $$"""
 {{systemPrompt}}
 
 {{conversationHistory}}
+{{memoryContext}}
 Operational context:
 - Admin said: "{{context.Message}}"
 - Detected intent: {{context.Route.Intent}}
@@ -143,6 +145,27 @@ When something works, confirm it clearly and note anything worth watching.
 
         sb.AppendLine();
         return sb.ToString();
+    }
+
+    private static string BuildMemoryContext(ToolExecutionContext context)
+    {
+        var sections = new List<string>();
+        if (context.PlanningMemoryContext?.HasResults == true)
+        {
+            sections.Add("Planning memory:\n" + context.PlanningMemoryContext.CompactContext);
+        }
+
+        if (context.ExecutionMemoryContext?.HasResults == true)
+        {
+            sections.Add("Execution memory:\n" + context.ExecutionMemoryContext.CompactContext);
+        }
+
+        if (sections.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        return string.Join("\n\n", sections) + "\n";
     }
 
     private static string ComposeFallback(ToolExecutionResult result)

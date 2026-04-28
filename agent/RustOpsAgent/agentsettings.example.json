@@ -14,7 +14,30 @@
   },
   "memory": {
     "statePath": "data/agent-state.json",
-    "neoCortexRoot": "data/NeoCortex"
+    "neoCortexRoot": "data/NeoCortex",
+    "provider": "sqlite",
+    "databasePath": "data/semantic-memory.db",
+    "searchEnabled": true,
+    "writeEnabled": true,
+    "debugLoggingEnabled": false,
+    "similarityThreshold": 0.62,
+    "maxRetrievedMemoriesPerStep": 6,
+    "maxSearchCandidates": 400,
+    "maxInjectedMemoryCharacters": 2200,
+    "maxWritesPerWorkflowStep": 1,
+    "pruneLowImportanceThreshold": 0.15,
+    "pruneLowConfidenceThreshold": 0.2,
+    "pruneOlderThanDays": 30,
+    "embedding": {
+      "provider": "openai-compatible",
+      "baseUrl": "${RUSTOPS_EMBEDDING_BASE_URL}",
+      "apiKey": "${RUSTOPS_EMBEDDING_API_KEY}",
+      "apiKeyEnvVarName": "RUSTOPS_EMBEDDING_API_KEY",
+      "requireApiKey": false,
+      "model": "${RUSTOPS_EMBEDDING_MODEL}",
+      "timeoutSeconds": 30,
+      "batchSize": 8
+    }
   },
   "inbox": {
     "feedbackInboxPath": "data/feedback-inbox",

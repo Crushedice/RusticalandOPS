@@ -31,6 +31,32 @@ internal sealed class MemorySettings
 {
     [JsonPropertyName("statePath")] public string StatePath { get; set; } = "data/agent-state.json";
     [JsonPropertyName("neoCortexRoot")] public string NeoCortexRoot { get; set; } = "data/NeoCortex";
+    [JsonPropertyName("provider")] public string Provider { get; set; } = "sqlite";
+    [JsonPropertyName("databasePath")] public string DatabasePath { get; set; } = "data/semantic-memory.db";
+    [JsonPropertyName("searchEnabled")] public bool SearchEnabled { get; set; } = true;
+    [JsonPropertyName("writeEnabled")] public bool WriteEnabled { get; set; } = true;
+    [JsonPropertyName("debugLoggingEnabled")] public bool DebugLoggingEnabled { get; set; }
+    [JsonPropertyName("similarityThreshold")] public double SimilarityThreshold { get; set; } = 0.62;
+    [JsonPropertyName("maxRetrievedMemoriesPerStep")] public int MaxRetrievedMemoriesPerStep { get; set; } = 6;
+    [JsonPropertyName("maxSearchCandidates")] public int MaxSearchCandidates { get; set; } = 400;
+    [JsonPropertyName("maxInjectedMemoryCharacters")] public int MaxInjectedMemoryCharacters { get; set; } = 2200;
+    [JsonPropertyName("maxWritesPerWorkflowStep")] public int MaxWritesPerWorkflowStep { get; set; } = 1;
+    [JsonPropertyName("pruneLowImportanceThreshold")] public double PruneLowImportanceThreshold { get; set; } = 0.15;
+    [JsonPropertyName("pruneLowConfidenceThreshold")] public double PruneLowConfidenceThreshold { get; set; } = 0.2;
+    [JsonPropertyName("pruneOlderThanDays")] public int PruneOlderThanDays { get; set; } = 30;
+    [JsonPropertyName("embedding")] public EmbeddingSettings Embedding { get; set; } = new();
+}
+
+internal sealed class EmbeddingSettings
+{
+    [JsonPropertyName("provider")] public string Provider { get; set; } = "openai-compatible";
+    [JsonPropertyName("baseUrl")] public string BaseUrl { get; set; } = "http://127.0.0.1:1234/v1";
+    [JsonPropertyName("apiKey")] public string? ApiKey { get; set; }
+    [JsonPropertyName("apiKeyEnvVarName")] public string ApiKeyEnvVarName { get; set; } = "RUSTOPS_EMBEDDING_API_KEY";
+    [JsonPropertyName("requireApiKey")] public bool RequireApiKey { get; set; }
+    [JsonPropertyName("model")] public string Model { get; set; } = "text-embedding-nomic-embed-text-v1.5";
+    [JsonPropertyName("timeoutSeconds")] public int TimeoutSeconds { get; set; } = 30;
+    [JsonPropertyName("batchSize")] public int BatchSize { get; set; } = 8;
 }
 
 internal sealed class InboxSettings
