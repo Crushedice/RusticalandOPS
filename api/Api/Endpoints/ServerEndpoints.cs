@@ -106,5 +106,13 @@ internal static class ServerEndpoints
             if (!rust.IsKnownServer(server)) return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
             return Results.Ok(await plugins.CheckUpdatesAsync(server, cancellationToken));
         });
+
+        app.MapPost("/servers/{server}/plugins/install", async (string server, PluginInstallRequest request, CancellationToken cancellationToken) =>
+        {
+            if (!rust.IsKnownServer(server)) return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
+            if (string.IsNullOrWhiteSpace(request.PluginName)) return Results.BadRequest(new ApiError("invalid_request", "pluginName is required"));
+            if (string.IsNullOrWhiteSpace(request.DownloadUrl)) return Results.BadRequest(new ApiError("invalid_request", "downloadUrl is required"));
+            return Results.Ok(await plugins.InstallPluginAsync(server, request.PluginName, request.DownloadUrl, cancellationToken));
+        });
     }
 }

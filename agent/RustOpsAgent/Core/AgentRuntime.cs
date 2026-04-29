@@ -48,6 +48,7 @@ internal sealed class AgentRuntime
     private readonly Dictionary<string, DateTime> _standInCooldownByServer = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _standInResponsesThisMinute = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _standInRateLimitWindowStart = DateTime.MinValue;
+    private DateTime _lastPluginCheckAtUtc = DateTime.MinValue;
 
     public AgentRuntime(
         AgentConfig config,
@@ -106,6 +107,7 @@ internal sealed class AgentRuntime
                 await SafeExecuteAsync(() => ReviewIncidentsAsync(cancellationToken), "incident-review", cancellationToken);
                 await SafeExecuteAsync(() => AnalyzePlayerSentimentAsync(cancellationToken), "sentiment-analysis", cancellationToken);
                 await SafeExecuteAsync(() => ProcessPlayerChatForStandInAsync(cancellationToken), "stand-in-admin", cancellationToken);
+                await SafeExecuteAsync(() => CheckPluginUpdatesAsync(cancellationToken), "plugin-check", cancellationToken);
                 await SafeExecuteAsync(() => EvolveClassifierAsync(cancellationToken), "classifier-evolution", cancellationToken);
 
                 _legacyState.Save();
@@ -1207,6 +1209,130 @@ internal sealed class AgentRuntime
         return normalized.Length > 200 ? normalized[..200] : normalized;
     }
 
+    private async Task CheckPluginUpdatesAsync(CancellationToken cancellationToken)
+    {
+        if (!_config.PluginUpdates.Enabled)
+            return;
+
+        var interval = TimeSpan.FromMinutes(Math.Max(5, _config.PluginUpdates.CheckIntervalMinutes));
+        if (DateTime.UtcNow - _lastPluginCheckAtUtc < interval)
+            return;
+
+        _lastPluginCheckAtUtc = DateTime.UtcNow;
+
+        List<string> servers;
+        try
+        {
+            using var list = await _api.GetAsync("/servers", cancellationToken);
+            servers = list.RootElement.ValueKind == JsonValueKind.Array
+                ? list.RootElement.EnumerateArray()
+                    .Select(n => n.ValueKind == JsonValueKind.String
+                        ? n.GetString()
+                        : n.TryGetProperty("name", out var nm) ? nm.GetString() : null)
+                    .Where(n => !string.IsNullOrWhiteSpace(n))
+                    .Select(n => n!)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+                : new List<string>();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[plugin-check] Failed to list servers: {ex.Message}");
+            return;
+        }
+
+        foreach (var server in servers)
+        {
+            if (_stop || cancellationToken.IsCancellationRequested)
+                return;
+
+            try
+            {
+                using var checkDoc = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/plugins/updates", cancellationToken);
+                if (!checkDoc.RootElement.TryGetProperty("updates", out var updatesArray) || updatesArray.ValueKind != JsonValueKind.Array)
+                    continue;
+
+                var available = new List<(string Plugin, string Current, string Latest, string? DownloadUrl)>();
+                foreach (var entry in updatesArray.EnumerateArray())
+                {
+                    var state = entry.TryGetProperty("state", out var sv) ? sv.GetString() : null;
+                    if (state != "update_available") continue;
+                    var plugin = entry.TryGetProperty("plugin", out var pn) ? pn.GetString() ?? string.Empty : string.Empty;
+                    var current = entry.TryGetProperty("current", out var cv) ? cv.GetString() : null;
+                    var latest = entry.TryGetProperty("latest", out var lv) ? lv.GetString() : null;
+                    var downloadUrl = entry.TryGetProperty("downloadUrl", out var du) ? du.GetString() : null;
+                    if (!string.IsNullOrWhiteSpace(plugin))
+                        available.Add((plugin, current ?? "?", latest ?? "?", downloadUrl));
+                }
+
+                if (available.Count == 0)
+                {
+                    Console.WriteLine($"[plugin-check] {server}: all plugins up to date.");
+                    continue;
+                }
+
+                var summary = string.Join(", ", available.Select(u => $"{u.Plugin} {u.Current} → {u.Latest}"));
+                var msg = $"[{server}] Plugin updates available ({available.Count}): {summary}";
+                Console.WriteLine($"[plugin-check] {msg}");
+                if (_config.PluginUpdates.NotifyAdmins)
+                    BroadcastOutbox(msg, server);
+                if (_config.Memory.WriteEnabled)
+                    _ = _semanticMemory.RecordServerFactAsync(server,
+                        $"Plugin updates available on {server}: {available.Count} plugin(s)",
+                        msg, new[] { "plugins", "updates", server.ToLowerInvariant() },
+                        CancellationToken.None);
+
+                if (!_config.PluginUpdates.DownloadEnabled)
+                    continue;
+
+                var installed = new List<string>();
+                var failed = new List<string>();
+                foreach (var (plugin, _, latest, downloadUrl) in available)
+                {
+                    if (string.IsNullOrWhiteSpace(downloadUrl))
+                    {
+                        failed.Add($"{plugin} (no download URL)");
+                        continue;
+                    }
+
+                    try
+                    {
+                        using var installDoc = await _api.PostAsync(
+                            $"/servers/{Uri.EscapeDataString(server)}/plugins/install",
+                            new { pluginName = plugin, downloadUrl },
+                            cancellationToken);
+                        installed.Add($"{plugin} v{latest}");
+                        Console.WriteLine($"[plugin-check] {server}: installed {plugin} v{latest}");
+                    }
+                    catch (Exception ex)
+                    {
+                        failed.Add(plugin);
+                        Console.WriteLine($"[plugin-check] {server}: failed to install {plugin}: {ex.Message}");
+                    }
+                }
+
+                if (installed.Count > 0 || failed.Count > 0)
+                {
+                    var installMsg = installed.Count > 0 ? $"Installed: {string.Join(", ", installed)}." : string.Empty;
+                    if (failed.Count > 0) installMsg += $" Failed: {string.Join(", ", failed)}.";
+                    var fullMsg = $"[{server}] Plugin auto-update: {installMsg.Trim()}";
+                    if (_config.PluginUpdates.NotifyAdmins)
+                        BroadcastOutbox(fullMsg, server);
+                    Console.WriteLine($"[plugin-check] {fullMsg}");
+                    if (_config.Memory.WriteEnabled && installed.Count > 0)
+                        _ = _semanticMemory.RecordServerFactAsync(server,
+                            $"Plugins auto-updated on {server}: {string.Join(", ", installed)}",
+                            fullMsg, new[] { "plugins", "installed", server.ToLowerInvariant() },
+                            CancellationToken.None);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[plugin-check] {server}: check failed — {ex.Message}");
+            }
+        }
+    }
+
     private async Task ProcessPlayerChatForStandInAsync(CancellationToken cancellationToken)
     {
         if (!_config.StandInAdmin.Enabled || _deepKernel is null || !_config.Llm.Enabled)
@@ -1975,7 +2101,14 @@ Repeated failure memory clusters:
             await File.WriteAllTextAsync(reviewPath, reviewNote, cancellationToken);
 
             await _gitOps.CommitAsync($"agent: incident review {DateTime.UtcNow:yyyyMMdd} pattern={pattern}", cancellationToken);
-            Console.WriteLine($"[review] Review committed locally for pattern '{pattern}' on branch {branch}.");
+            await _gitOps.PushAsync(branch, cancellationToken);
+            var prUrl = await _gitOps.CreatePrAsync(
+                branch,
+                $"[agent] Incident Review: {pattern}",
+                $"**Pattern:** {pattern}\n\n**Summary:** {summary ?? "See review file."}\n\n**Mitigation:** {mitigation ?? "Review handler coverage."}",
+                cancellationToken);
+            await _gitOps.CheckoutMainAsync(cancellationToken);
+            Console.WriteLine($"[review] Review PR opened for pattern '{pattern}': {prUrl}");
         }
         catch (Exception ex)
         {
@@ -1991,8 +2124,11 @@ Repeated failure memory clusters:
             var slug = $"incident-{incident.Classification}";
             var branch = await _gitOps.EnsureAgentBranchAsync(slug, cancellationToken);
             var title = $"[agent] Incident: {incident.Classification}";
-            var body = $"Request: {incident.Request}\nFailure: {incident.FailureReason}\nMissing: {incident.MissingCapability}\nPrevention: {incident.RecurrencePrevention}";
+            var body = $"**Request:** {incident.Request}\n**Failure:** {incident.FailureReason}\n**Missing:** {incident.MissingCapability}\n**Prevention:** {incident.RecurrencePrevention}";
             await _gitOps.CommitAsync($"incident: record {incident.Id}", cancellationToken);
+            await _gitOps.PushAsync(branch, cancellationToken);
+            await _gitOps.CreatePrAsync(branch, title, body, cancellationToken);
+            await _gitOps.CheckoutMainAsync(cancellationToken);
         }
         catch (Exception ex)
         {

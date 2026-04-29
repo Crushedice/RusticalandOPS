@@ -28,6 +28,14 @@ public sealed class ServerConfig
     [JsonPropertyName("logFile")] public string LogFile { get; set; } = "Log.txt";
 }
 
+public sealed class PluginInstallRequest
+{
+    [JsonPropertyName("pluginName")]
+    public string PluginName { get; set; } = string.Empty;
+    [JsonPropertyName("downloadUrl")]
+    public string DownloadUrl { get; set; } = string.Empty;
+}
+
 public sealed class HostInterfaceCounter
 {
     public string Name { get; set; } = string.Empty;

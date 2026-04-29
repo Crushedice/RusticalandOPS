@@ -108,16 +108,36 @@ internal sealed class PluginService
             var current = plugin.Version;
             var needsUpdate = !string.IsNullOrWhiteSpace(latest) && !string.Equals(latest, current, StringComparison.OrdinalIgnoreCase);
 
+            var downloadUrl = needsUpdate && first.TryGetProperty("download_url", out var dlNode)
+                ? dlNode.GetString() : null;
+
             updates.Add(new
             {
                 plugin = plugin.Name,
                 current,
                 latest,
+                downloadUrl,
                 state = needsUpdate ? "update_available" : "current"
             });
         }
 
         return new { server, updates };
+    }
+
+    public async Task<object> InstallPluginAsync(string server, string pluginName, string downloadUrl, CancellationToken cancellationToken)
+    {
+        var cfg = _rust.LoadConfig(server) ?? throw new InvalidOperationException($"No config for {server}");
+        var pluginsDir = Path.Combine(cfg.ServerDir, "oxide", "plugins");
+        Directory.CreateDirectory(pluginsDir);
+
+        // Sanitize the plugin name to a safe filename.
+        var safeName = string.Concat(pluginName.Select(c => char.IsLetterOrDigit(c) || c is '_' or '-' ? c : '_'));
+        var destPath = Path.Combine(pluginsDir, $"{safeName}.cs");
+
+        var bytes = await _http.GetByteArrayAsync(downloadUrl, cancellationToken);
+        await File.WriteAllBytesAsync(destPath, bytes, cancellationToken);
+
+        return new { server, plugin = pluginName, installed = true, bytes = bytes.Length };
     }
 
     private static (string? Name, string? Version) ParsePlugin(string path)

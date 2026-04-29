@@ -17,12 +17,15 @@ internal sealed class GitOpsService : IGitOpsService
     {
         const string branch = "agent-updates";
         await RunGitAsync("fetch --all", cancellationToken);
-        await RunGitAsync($"checkout -B {branch}", cancellationToken);
-        var status = await RunGitAsync("status --porcelain", cancellationToken);
-        if (!string.IsNullOrWhiteSpace(status))
-            await RunGitAsync("stash", cancellationToken);
-        await RunGitAsync($"rebase {_settings.RemoteName}/main", cancellationToken);
+        // Create/reset agent-updates from the upstream base so the working tree is at origin/main.
+        // This ensures AutoPullService can fast-forward main cleanly after we push and return to it.
+        await RunGitAsync($"checkout -B {branch} {_settings.RemoteName}/{_settings.BaseBranch}", cancellationToken);
         return branch;
+    }
+
+    public async Task CheckoutMainAsync(CancellationToken cancellationToken)
+    {
+        await RunGitAsync($"checkout {_settings.BaseBranch}", cancellationToken);
     }
 
     public async Task CommitAsync(string message, CancellationToken cancellationToken)
@@ -56,8 +59,18 @@ internal sealed class GitOpsService : IGitOpsService
             throw new InvalidOperationException("PR branch must be 'agent-updates' or under 'agent/*'.");
         }
 
-        var cmd = $"pr create --base {_settings.BaseBranch} --head {branchName} --title \"{Escape(title)}\" --body \"{Escape(body)}\"";
-        return await RunGhAsync(cmd, cancellationToken);
+        // Write body to a temp file so multi-line markdown isn't mangled by shell argument quoting.
+        var tempFile = Path.GetTempFileName();
+        try
+        {
+            await File.WriteAllTextAsync(tempFile, body, cancellationToken);
+            var cmd = $"pr create --base {_settings.BaseBranch} --head {branchName} --title \"{Escape(title)}\" --body-file \"{tempFile}\"";
+            return await RunGhAsync(cmd, cancellationToken);
+        }
+        finally
+        {
+            File.Delete(tempFile);
+        }
     }
 
     private async Task<string> RunGhAsync(string args, CancellationToken cancellationToken)

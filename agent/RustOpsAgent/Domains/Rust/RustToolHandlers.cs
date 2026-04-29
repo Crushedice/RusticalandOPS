@@ -1057,12 +1057,6 @@ internal sealed class RustPluginToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
     private readonly Core.Contracts.PluginUpdateSettings _settings;
-    private static readonly HttpClient _http = new(new HttpClientHandler { AllowAutoRedirect = true })
-    {
-        Timeout = TimeSpan.FromSeconds(15),
-        DefaultRequestHeaders = { { "User-Agent", "RustOpsAgent/1.0 (server-ops-bot)" } }
-    };
-
     private readonly ISemanticMemoryService? _semanticMemory;
 
     public RustPluginToolHandler(RustOpsApiClient api, Core.Contracts.PluginUpdateSettings? settings = null, ISemanticMemoryService? semanticMemory = null)
@@ -1124,134 +1118,99 @@ internal sealed class RustPluginToolHandler : IToolHandler
             }
         }
 
-        // --- Step 2: oxide/validate for file-level info + uMod version check ----------------
-        JsonDocument? validate = null;
+        // --- Step 2: version check via API + optional install -----------------------------------
+        JsonDocument? updatesDoc = null;
         try
         {
-            validate = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/oxide/validate", cancellationToken);
+            updatesDoc = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/plugins/updates", cancellationToken);
         }
         catch (Exception ex)
         {
             return new ToolExecutionResult(false,
-                $"Could not reach oxide/validate for {server}: {ex.Message}",
+                $"Could not reach plugins/updates for {server}: {ex.Message}",
                 server, false, "api_error");
         }
 
-        using (validate)
+        using (updatesDoc)
         {
             var updateMessages = new List<string>();
-            var pendingDownloads = new List<(string slug, string latestVersion, string downloadUrl)>();
+            var pendingInstalls = new List<(string plugin, string latest, string downloadUrl)>();
 
-            if (validate.RootElement.TryGetProperty("plugins", out var plugins) && plugins.ValueKind == JsonValueKind.Array)
+            if (updatesDoc.RootElement.TryGetProperty("updates", out var updatesArray) && updatesArray.ValueKind == JsonValueKind.Array)
             {
-                // Show any file-level issues from the validator
-                var fileIssues = plugins.EnumerateArray()
-                    .Where(p => p.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False)
-                    .Select(p => $"{(p.TryGetProperty("pluginName", out var n) ? n.GetString() : "?")}: {(p.TryGetProperty("message", out var m) ? m.GetString() : "validation error")}")
-                    .ToList();
-
-                foreach (var plugin in plugins.EnumerateArray().Take(20))
+                foreach (var entry in updatesArray.EnumerateArray())
                 {
-                    var pluginName = plugin.TryGetProperty("pluginName", out var nameNode) ? nameNode.GetString() : null;
-                    var pluginSlug = plugin.TryGetProperty("pluginSlug", out var slugNode) ? slugNode.GetString() : null;
-                    var pluginVersion = plugin.TryGetProperty("pluginVersion", out var versionNode) ? versionNode.GetString() : null;
-                    var query = !string.IsNullOrWhiteSpace(pluginSlug) ? pluginSlug : pluginName;
-                    if (string.IsNullOrWhiteSpace(query)) continue;
+                    var pluginName = entry.TryGetProperty("plugin", out var pn) ? pn.GetString() : null;
+                    var current = entry.TryGetProperty("current", out var cv) ? cv.GetString() : null;
+                    var latest = entry.TryGetProperty("latest", out var lv) ? lv.GetString() : null;
+                    var state = entry.TryGetProperty("state", out var sv) ? sv.GetString() : null;
+                    var downloadUrl = entry.TryGetProperty("downloadUrl", out var du) ? du.GetString() : null;
 
-                    var searchUrl = string.Format(_settings.SearchUrlTemplate, Uri.EscapeDataString(query), _settings.SearchFilter);
-                    try
+                    if (string.IsNullOrWhiteSpace(pluginName)) continue;
+
+                    if (state == "update_available")
                     {
-                        using var httpResponse = await _http.GetAsync(searchUrl, cancellationToken);
-                        if (!httpResponse.IsSuccessStatusCode)
-                        {
-                            updateMessages.Add($"{query}: uMod returned {(int)httpResponse.StatusCode}");
-                            continue;
-                        }
-
-                        using var responseDoc = await JsonDocument.ParseAsync(
-                            await httpResponse.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
-
-                        if (!responseDoc.RootElement.TryGetProperty("data", out var data)
-                            || data.ValueKind != JsonValueKind.Array
-                            || data.GetArrayLength() == 0)
-                        {
-                            updateMessages.Add($"{query}: not found on uMod");
-                            continue;
-                        }
-
-                        var entry = data[0];
-                        var latest = entry.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
-                        var downloadUrl = entry.TryGetProperty("download_url", out var dlNode) ? dlNode.GetString() : null;
-
-                        if (string.IsNullOrWhiteSpace(latest) || string.Equals(latest, pluginVersion, StringComparison.OrdinalIgnoreCase))
-                            updateMessages.Add($"{query}: up to date ({pluginVersion ?? "?"})");
-                        else
-                        {
-                            updateMessages.Add($"{query}: {pluginVersion ?? "?"} → {latest}");
-                            if (!string.IsNullOrWhiteSpace(downloadUrl))
-                                pendingDownloads.Add((query, latest, downloadUrl));
-                        }
+                        updateMessages.Add($"{pluginName}: {current ?? "?"} → {latest ?? "?"}");
+                        if (!string.IsNullOrWhiteSpace(downloadUrl))
+                            pendingInstalls.Add((pluginName, latest ?? "?", downloadUrl));
                     }
-                    catch (Exception ex)
-                    {
-                        updateMessages.Add($"{query}: check failed ({ex.Message.Split('\n')[0]})");
-                    }
+                    else if (state == "current")
+                        updateMessages.Add($"{pluginName}: up to date ({current ?? "?"})");
+                    else
+                        updateMessages.Add($"{pluginName}: {state ?? "unknown"}");
                 }
-
-                if (fileIssues.Count > 0)
-                    updateMessages.Insert(0, $"FILE ISSUES: {string.Join(" | ", fileIssues)}");
             }
 
             var versionSummary = updateMessages.Count > 0
                 ? string.Join(" | ", updateMessages)
                 : "No plugin files found at the configured oxide path.";
 
-            if (wantsInstall && _settings.DownloadEnabled && pendingDownloads.Count > 0)
+            if (wantsInstall && _settings.DownloadEnabled && pendingInstalls.Count > 0)
             {
-                var staged = await StageDownloadsAsync(server, pendingDownloads, cancellationToken);
-                return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}\n{staged}", server, false);
+                var installed = new List<string>();
+                var failed = new List<string>();
+                foreach (var (plugin, latest, downloadUrl) in pendingInstalls)
+                {
+                    try
+                    {
+                        using var installResp = await _api.PostAsync(
+                            $"/servers/{Uri.EscapeDataString(server)}/plugins/install",
+                            new { pluginName = plugin, downloadUrl },
+                            cancellationToken);
+                        installed.Add($"{plugin} v{latest}");
+
+                        if (_semanticMemory is not null)
+                            _ = _semanticMemory.RecordServerFactAsync(server,
+                                $"Plugin installed on {server}: {plugin} v{latest}",
+                                $"Plugin '{plugin}' updated to v{latest} on '{server}'.",
+                                new[] { "plugins", "installed", server.ToLowerInvariant(), plugin.ToLowerInvariant() },
+                                CancellationToken.None);
+                    }
+                    catch (Exception ex)
+                    {
+                        failed.Add(plugin);
+                        if (_semanticMemory is not null)
+                            _ = _semanticMemory.RecordServerFactAsync(server,
+                                $"Plugin install failed on {server}: {plugin}",
+                                $"Failed to install plugin '{plugin}' on '{server}': {ex.Message}",
+                                new[] { "plugins", "install-failure", server.ToLowerInvariant() },
+                                CancellationToken.None);
+                    }
+                }
+
+                var installSummary = installed.Count > 0 ? $"Installed: {string.Join(", ", installed)}." : string.Empty;
+                if (failed.Count > 0) installSummary += $" Failed: {string.Join(", ", failed)}.";
+                return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}\n{installSummary.Trim()}", server, installed.Count > 0);
             }
 
-            var actionHint = pendingDownloads.Count > 0 && _settings.DownloadEnabled
-                ? $" ({pendingDownloads.Count} update(s) available — say 'install updates' to apply)"
+            var actionHint = pendingInstalls.Count > 0 && _settings.DownloadEnabled
+                ? $" ({pendingInstalls.Count} update(s) available — say 'install plugin updates' to apply)"
                 : string.Empty;
 
             return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}{actionHint}", server, false);
         }
     }
 
-    private async Task<string> StageDownloadsAsync(
-        string server,
-        IReadOnlyList<(string slug, string version, string url)> downloads,
-        CancellationToken cancellationToken)
-    {
-        Directory.CreateDirectory(_settings.StagingPath);
-        var staged = new List<string>();
-        var failed = new List<string>();
-
-        foreach (var (slug, version, url) in downloads)
-        {
-            try
-            {
-                var fileName = $"{slug}.cs";
-                var dest = Path.Combine(_settings.StagingPath, fileName);
-                var bytes = await _http.GetByteArrayAsync(url, cancellationToken);
-                await File.WriteAllBytesAsync(dest, bytes, cancellationToken);
-                staged.Add($"{slug} v{version}");
-                Console.WriteLine($"[plugins] Staged {fileName} ({bytes.Length} bytes)");
-            }
-            catch (Exception ex)
-            {
-                failed.Add(slug);
-                Console.WriteLine($"[plugins] Download failed for {slug}: {ex.Message}");
-            }
-        }
-
-        var result = staged.Count > 0 ? $"Staged: {string.Join(", ", staged)}." : string.Empty;
-        if (failed.Count > 0)
-            result += $" Failed: {string.Join(", ", failed)}.";
-        return result.Trim();
-    }
 }
 
 internal sealed class RustNetworkToolHandler : IToolHandler
