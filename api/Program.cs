@@ -4160,7 +4160,8 @@ static ServerConfig NormalizeConfig(string server, ServerConfig cfg) => new()
     ServerEncryption           = string.IsNullOrWhiteSpace(cfg.ServerEncryption) ? "1" : cfg.ServerEncryption.Trim(),
     BoomboxServerUrlList       = cfg.BoomboxServerUrlList?.Trim()       ?? string.Empty,
     AdditionalArgs             = cfg.AdditionalArgs?.Trim()             ?? string.Empty,
-    ServerDir                  = string.IsNullOrWhiteSpace(cfg.ServerDir) ? $"/srv/rust/{server}" : RustOpsEnv.NormalizePath(cfg.ServerDir.Trim())
+    ServerDir                  = string.IsNullOrWhiteSpace(cfg.ServerDir) ? $"/srv/rust/{server}" : RustOpsEnv.NormalizePath(cfg.ServerDir.Trim()),
+    OxideDir                   = string.IsNullOrWhiteSpace(cfg.OxideDir) ? string.Empty : RustOpsEnv.NormalizePath(cfg.OxideDir.Trim())
 };
 
 static string? ValidateConfig(ServerConfig cfg)
@@ -4927,6 +4928,7 @@ public sealed class ServerConfig
     [JsonPropertyName("boombox.serverurllist")]       public string BoomboxServerUrlList        { get; set; } = string.Empty;
     [JsonPropertyName("additionalArgs")]              public string AdditionalArgs              { get; set; } = string.Empty;
     [JsonPropertyName("serverDir")]                   public string ServerDir                   { get; set; } = string.Empty;
+    [JsonPropertyName("oxideDir")]                    public string OxideDir                    { get; set; } = string.Empty;
 }
 
 public sealed record RconConnectionInfo(string Host, ushort Port, string Password, bool WebRconEnabled);

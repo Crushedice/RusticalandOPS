@@ -1133,6 +1133,17 @@ internal sealed class RustPluginToolHandler : IToolHandler
 
         using (updatesDoc)
         {
+            // Surface access_denied errors returned by the API instead of treating them as empty plugin list.
+            if (updatesDoc.RootElement.TryGetProperty("error", out var errNode) &&
+                string.Equals(errNode.GetString(), "access_denied", StringComparison.OrdinalIgnoreCase))
+            {
+                var path = updatesDoc.RootElement.TryGetProperty("path", out var pn) ? pn.GetString() : "unknown path";
+                var note = updatesDoc.RootElement.TryGetProperty("note", out var nn) ? nn.GetString() : string.Empty;
+                return new ToolExecutionResult(false,
+                    $"Plugin directory access denied for {server} at '{path}'. {note}",
+                    server, false, "access_denied");
+            }
+
             var updateMessages = new List<string>();
             var pendingInstalls = new List<(string plugin, string latest, string downloadUrl)>();
 

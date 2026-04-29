@@ -17,25 +17,30 @@ internal sealed class PluginService
     public object ValidateOxide(string server)
     {
         var cfg = _rust.LoadConfig(server) ?? throw new InvalidOperationException($"No config for {server}");
-        var roots = new[]
+        var roots = GetOxideRootCandidates(cfg);
+
+        string[] configFiles;
+        string[] pluginFiles;
+        try
         {
-            Path.Combine(cfg.ServerDir, "oxide"),
-            Path.Combine(Path.GetDirectoryName(cfg.LogFile) ?? cfg.ServerDir, "oxide")
-        };
+            configFiles = roots
+                .Select(root => Path.Combine(root, "config"))
+                .Where(Directory.Exists)
+                .SelectMany(path => Directory.GetFiles(path, "*.json", SearchOption.TopDirectoryOnly))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
 
-        var configFiles = roots
-            .Select(root => Path.Combine(root, "config"))
-            .Where(Directory.Exists)
-            .SelectMany(path => Directory.GetFiles(path, "*.json", SearchOption.TopDirectoryOnly))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        var pluginFiles = roots
-            .Select(root => Path.Combine(root, "plugins"))
-            .Where(Directory.Exists)
-            .SelectMany(path => Directory.GetFiles(path, "*.cs", SearchOption.TopDirectoryOnly))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+            pluginFiles = roots
+                .Select(root => Path.Combine(root, "plugins"))
+                .Where(Directory.Exists)
+                .SelectMany(path => Directory.GetFiles(path, "*.cs", SearchOption.TopDirectoryOnly))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return new { server, ok = false, error = "access_denied", note = ex.Message };
+        }
 
         var invalidJson = new List<string>();
         foreach (var json in configFiles)
@@ -69,16 +74,27 @@ internal sealed class PluginService
     public async Task<object> CheckUpdatesAsync(string server, CancellationToken cancellationToken)
     {
         var cfg = _rust.LoadConfig(server) ?? throw new InvalidOperationException($"No config for {server}");
-        var pluginsDir = Path.Combine(cfg.ServerDir, "oxide", "plugins");
-        if (!Directory.Exists(pluginsDir))
+        var pluginsDir = GetOxideRootCandidates(cfg)
+            .Select(root => Path.Combine(root, "plugins"))
+            .FirstOrDefault(Directory.Exists);
+
+        if (pluginsDir is null)
         {
-            return new { server, updates = Array.Empty<object>(), note = "plugins directory missing" };
+            return new { server, updates = Array.Empty<object>(), note = "plugins directory not found in any expected location" };
         }
 
-        var plugins = Directory.GetFiles(pluginsDir, "*.cs", SearchOption.TopDirectoryOnly)
-            .Select(ParsePlugin)
-            .Where(p => p.Name is not null)
-            .ToList();
+        List<(string? Name, string? Version)> plugins;
+        try
+        {
+            plugins = Directory.GetFiles(pluginsDir, "*.cs", SearchOption.TopDirectoryOnly)
+                .Select(ParsePlugin)
+                .Where(p => p.Name is not null)
+                .ToList();
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return new { server, updates = Array.Empty<object>(), error = "access_denied", path = pluginsDir, note = $"Read permission denied for '{pluginsDir}'. Grant read access to the RustOps API service user for that directory." };
+        }
 
         var updates = new List<object>();
         foreach (var plugin in plugins)
@@ -127,7 +143,10 @@ internal sealed class PluginService
     public async Task<object> InstallPluginAsync(string server, string pluginName, string downloadUrl, CancellationToken cancellationToken)
     {
         var cfg = _rust.LoadConfig(server) ?? throw new InvalidOperationException($"No config for {server}");
-        var pluginsDir = Path.Combine(cfg.ServerDir, "oxide", "plugins");
+        var pluginsDir = GetOxideRootCandidates(cfg)
+                             .Select(root => Path.Combine(root, "plugins"))
+                             .FirstOrDefault(Directory.Exists)
+                         ?? Path.Combine(cfg.ServerDir, "oxide", "plugins");
         Directory.CreateDirectory(pluginsDir);
 
         // Sanitize the plugin name to a safe filename.
@@ -138,6 +157,25 @@ internal sealed class PluginService
         await File.WriteAllBytesAsync(destPath, bytes, cancellationToken);
 
         return new { server, plugin = pluginName, installed = true, bytes = bytes.Length };
+    }
+
+    private static List<string> GetOxideRootCandidates(ServerConfig cfg)
+    {
+        // Explicit override takes priority — useful when oxide lives outside serverDir.
+        if (!string.IsNullOrWhiteSpace(cfg.OxideDir))
+            return new List<string> { cfg.OxideDir.TrimEnd('/') };
+
+        return new[]
+        {
+            Path.Combine(cfg.ServerDir, "oxide"),
+            Path.Combine(cfg.ServerDir, cfg.ServerIdentity, "oxide"),
+            Path.Combine(cfg.ServerDir, "server", cfg.ServerIdentity, "oxide"),
+            Path.Combine("/srv/rust", cfg.Name, "oxide"),
+            Path.Combine("/srv/rust", cfg.ServerIdentity, "oxide"),
+        }
+        .Where(p => !string.IsNullOrWhiteSpace(p))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
     }
 
     private static (string? Name, string? Version) ParsePlugin(string path)

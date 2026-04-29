@@ -25,6 +25,7 @@ public sealed class ServerConfig
     [JsonPropertyName("rcon.password")] public string RconPassword { get; set; } = string.Empty;
     [JsonPropertyName("additionalArgs")] public string AdditionalArgs { get; set; } = string.Empty;
     [JsonPropertyName("serverDir")] public string ServerDir { get; set; } = string.Empty;
+    [JsonPropertyName("oxideDir")] public string OxideDir { get; set; } = string.Empty;
     [JsonPropertyName("logFile")] public string LogFile { get; set; } = "Log.txt";
 }
 
