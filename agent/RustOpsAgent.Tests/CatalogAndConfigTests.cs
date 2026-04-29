@@ -208,4 +208,28 @@ public class CatalogAndConfigTests
         Assert.Equal(AdminIntentType.Troubleshooting, route.Intent);
         Assert.Equal("rust.plugins.verify", route.TargetRef);
     }
+
+    [Fact]
+    public void Catalog_SearchVariables_Finds_Pve_Convars_From_Broad_Query()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rustops-catalog-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var variablesPath = Path.Combine(root, "ServerVariables.agent-readable.jsonl");
+        var commandsPath = Path.Combine(root, "ServerCommands.agent-readable.jsonl");
+        File.WriteAllLines(variablesPath, new[]
+        {
+            """{"convar":"server.pve","generated_on_start":true,"default_raw":"False","default_type":"boolean","description":"Enables PvE mode - players cannot damage other players; they can still be killed by NPCs and the environment"}""",
+            """{"convar":"server.pvebulletdamagemultiplier","generated_on_start":true,"default_raw":"1","default_type":"integer","description":"Additional bullet damage multiplier applied only when players shoot NPCs or animals, stacks with bulletdamage"}""",
+            """{"convar":"server.fps","generated_on_start":false,"default_raw":"256","default_type":"integer","description":""}"""
+        });
+        File.WriteAllText(commandsPath, string.Empty);
+        var catalog = new ServerKnowledgeCatalog(variablesPath, commandsPath);
+
+        var matches = catalog.SearchVariables("what are the PVE convars", 5);
+
+        Assert.Collection(
+            matches.Take(2),
+            first => Assert.Equal("server.pve", first.Name),
+            second => Assert.Equal("server.pvebulletdamagemultiplier", second.Name));
+    }
 }

@@ -27,6 +27,16 @@ internal sealed class ResponseComposer : IResponseComposer
                 result.Message);
         }
 
+        if (string.Equals(result.ErrorCode, "authoritative_catalog", StringComparison.OrdinalIgnoreCase))
+        {
+            return new ComposedReply(
+                result.Message,
+                "response-compose-catalog",
+                false, false,
+                "template_authoritative_catalog",
+                result.Message.Length > 180 ? result.Message[..180] : result.Message);
+        }
+
         if (result.Payload is AggregateStatusPayload aggregatePayload)
         {
             var aggregateMessage = ComposeAggregateStatusMessage(aggregatePayload);

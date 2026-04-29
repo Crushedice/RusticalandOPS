@@ -37,6 +37,12 @@ internal sealed class RustChatToolHandler : IToolHandler
             return memoryCommandResult;
         }
 
+        var catalogQuestionResult = TryHandleCatalogQuestion(context);
+        if (catalogQuestionResult is not null)
+        {
+            return catalogQuestionResult;
+        }
+
         // Detect and handle git pull/rebuild operations
         var messageLowered = context.Message.ToLowerInvariant();
         if (IsGitPullRebuildRequest(messageLowered) && _autoPull != null)
@@ -211,6 +217,12 @@ internal sealed class RustChatToolHandler : IToolHandler
             return new ToolExecutionResult(true, $"Pruned {pruned} memory record(s).", MutatedState: pruned > 0);
         }
 
+        if (lowered.StartsWith("memory import server catalog", StringComparison.Ordinal) ||
+            lowered.StartsWith("memory import convar catalog", StringComparison.Ordinal))
+        {
+            return await ImportServerCatalogMemoryAsync(message, lowered, cancellationToken);
+        }
+
         if (lowered.StartsWith("memory add ", StringComparison.Ordinal))
         {
             var payload = message["memory add ".Length..].Trim();
@@ -232,6 +244,116 @@ internal sealed class RustChatToolHandler : IToolHandler
 
         return new ToolExecutionResult(false, "Unknown memory command. Try: memory stats | memory search <query> | memory recent | memory show <id> | memory delete <id> | memory repeated failures | memory rebuild | memory migrate | memory prune | memory add <summary> :: <detail>");
     }
+
+    private ToolExecutionResult? TryHandleCatalogQuestion(ToolExecutionContext context)
+    {
+        var lowered = context.Message.ToLowerInvariant();
+        var looksLikeConvarQuestion =
+            lowered.Contains("convar", StringComparison.Ordinal) ||
+            lowered.Contains("server variable", StringComparison.Ordinal) ||
+            lowered.Contains("variables", StringComparison.Ordinal);
+
+        if (!looksLikeConvarQuestion)
+        {
+            return null;
+        }
+
+        var snapshot = _knowledge.GetSnapshot();
+        var matches = _knowledge.SearchVariables(context.Message, 10);
+        if (matches.Count == 0)
+        {
+            return new ToolExecutionResult(
+                true,
+                $"I couldn't find matching server variables in the local catalog. Catalog file: `{snapshot.VariablesPath ?? "not found"}`.",
+                ErrorCode: "authoritative_catalog");
+        }
+
+        var lines = matches.Select(FormatVariableLine);
+        var message = "From the local server variable catalog:\n" + string.Join('\n', lines);
+        return new ToolExecutionResult(
+            true,
+            message,
+            Payload: new { source = "server-variable-catalog", variablesPath = snapshot.VariablesPath, count = matches.Count },
+            ErrorCode: "authoritative_catalog");
+    }
+
+    private async Task<ToolExecutionResult> ImportServerCatalogMemoryAsync(string message, string lowered, CancellationToken cancellationToken)
+    {
+        var dryRun = lowered.Contains("dry-run", StringComparison.Ordinal) || lowered.Contains("dry run", StringComparison.Ordinal);
+        var limit = TryExtractLimit(message);
+        var snapshot = _knowledge.GetSnapshot();
+        var variables = snapshot.Variables.Values.OrderBy(variable => variable.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        var commands = snapshot.Commands.Values.OrderBy(command => command.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        var entries = variables.Select(variable => (summary: $"Rust server convar: {variable.Name}", text: BuildVariableMemoryText(variable), tags: new[] { "server-catalog", "convar", variable.Name.ToLowerInvariant() }))
+            .Concat(commands.Select(command => (summary: $"Rust server command: {command.Name}", text: BuildCommandMemoryText(command), tags: new[] { "server-catalog", "command", command.Name.ToLowerInvariant() })))
+            .Take(limit ?? int.MaxValue)
+            .ToList();
+
+        if (entries.Count == 0)
+        {
+            return new ToolExecutionResult(false, $"No catalog entries were found. Variables: `{snapshot.VariablesPath ?? "not found"}`, commands: `{snapshot.CommandsPath ?? "not found"}`.", ErrorCode: "catalog_not_found");
+        }
+
+        if (dryRun)
+        {
+            return new ToolExecutionResult(true, $"Dry run: would import {entries.Count} catalog memory record(s). Variables={variables.Count}, commands={commands.Count}.", ErrorCode: "authoritative_catalog");
+        }
+
+        var before = await _semanticMemory.GetStatsAsync(cancellationToken);
+        var attempted = 0;
+        foreach (var entry in entries)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            attempted++;
+            await _semanticMemory.AddManualMemoryAsync(new ManualMemoryInput
+            {
+                Type = MemoryRecordType.Fact,
+                Scope = MemoryScope.Global,
+                Source = MemorySource.ManualImport,
+                Summary = entry.summary,
+                Text = entry.text,
+                Tags = entry.tags.ToList(),
+                RelatedEntityIds = entry.tags.ToList(),
+                Importance = 0.9,
+                Confidence = 0.98,
+                Metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["source"] = "server-catalog",
+                    ["variablesPath"] = snapshot.VariablesPath ?? string.Empty,
+                    ["commandsPath"] = snapshot.CommandsPath ?? string.Empty
+                }
+            }, cancellationToken);
+        }
+
+        var after = await _semanticMemory.GetStatsAsync(cancellationToken);
+        var imported = Math.Max(0, after.TotalRecords - before.TotalRecords);
+        return new ToolExecutionResult(
+            true,
+            $"Catalog memory import attempted {attempted} record(s); {imported} new record(s) are now stored. Duplicates are skipped by content hash. Use `memory import server catalog limit 20 dry-run` for a small test batch.",
+            MutatedState: imported > 0,
+            ErrorCode: "authoritative_catalog");
+    }
+
+    private static int? TryExtractLimit(string message)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(message, @"\blimit\s+(?<limit>\d+)\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return match.Success && int.TryParse(match.Groups["limit"].Value, out var limit) && limit > 0 ? limit : null;
+    }
+
+    private static string FormatVariableLine(ServerVariableDefinition variable)
+    {
+        var description = string.IsNullOrWhiteSpace(variable.Description) ? "No description in catalog." : variable.Description;
+        var generated = variable.Generated ? "Generated" : "Not generated";
+        var typeLabel = string.IsNullOrWhiteSpace(variable.DefaultType) ? string.Empty : $", {variable.DefaultType}";
+        var defaultValue = string.IsNullOrWhiteSpace(variable.DefaultValue) ? "unknown" : variable.DefaultValue;
+        return $"- `{variable.Name}` - {description} (default `{defaultValue}`{typeLabel}; {generated})";
+    }
+
+    private static string BuildVariableMemoryText(ServerVariableDefinition variable) =>
+        $"Type: Rust server convar\nName: {variable.Name}\nDescription: {variable.Description ?? "No description in catalog."}\nDefault: {variable.DefaultValue ?? "unknown"}\nDefaultType: {variable.DefaultType ?? "unknown"}\nGeneratedOnStartup: {variable.Generated}";
+
+    private static string BuildCommandMemoryText(ServerCommandDefinition command) =>
+        $"Type: Rust server command\nName: {command.Name}\nDescription: {command.Description ?? "No description in catalog."}\nRisk: {command.RiskLevel ?? "unknown"}\nGeneratedMetadata: {command.Generated}\nTags: {string.Join(", ", command.Tags ?? Array.Empty<string>())}";
 
     private static string FormatAge(DateTime ts)
     {

@@ -108,6 +108,30 @@ internal sealed class ServerKnowledgeCatalog
         return null;
     }
 
+    public IReadOnlyList<ServerVariableDefinition> SearchVariables(string query, int maxResults = 8)
+    {
+        if (string.IsNullOrWhiteSpace(query) || maxResults <= 0)
+            return Array.Empty<ServerVariableDefinition>();
+
+        var terms = ExtractSearchTerms(query);
+        if (terms.Count == 0)
+            return Array.Empty<ServerVariableDefinition>();
+
+        var snapshot = GetSnapshot();
+        return snapshot.Variables.Values
+            .Select(variable => new
+            {
+                Variable = variable,
+                Score = ScoreVariable(variable, terms)
+            })
+            .Where(item => item.Score > 0)
+            .OrderByDescending(item => item.Score)
+            .ThenBy(item => item.Variable.Name, StringComparer.OrdinalIgnoreCase)
+            .Take(maxResults)
+            .Select(item => item.Variable)
+            .ToList();
+    }
+
     private static ServerKnowledgeSnapshot LoadSnapshot(string? variablesPath, string? commandsPath)
     {
         var variables = new Dictionary<string, ServerVariableDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -352,6 +376,55 @@ internal sealed class ServerKnowledgeCatalog
         var trimmed = name.Trim().Trim('"', '\'', '`');
         trimmed = Regex.Replace(trimmed, @"\(\s*\)$", string.Empty);
         return trimmed.Trim().ToLowerInvariant();
+    }
+
+    private static IReadOnlyList<string> ExtractSearchTerms(string query)
+    {
+        var stopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "a", "about", "all", "and", "are", "available", "can", "catalog", "convar",
+            "convars", "control", "does", "for", "give", "have", "list", "main", "me",
+            "of", "on", "server", "show", "switch", "switches", "that", "the", "these",
+            "to", "variable", "variables", "what", "which", "with"
+        };
+
+        return Regex.Matches(query.ToLowerInvariant(), @"[a-z0-9._-]{2,}")
+            .Select(match => match.Value.Trim('.', '-', '_'))
+            .Where(term => term.Length >= 2 && !stopWords.Contains(term))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static int ScoreVariable(ServerVariableDefinition variable, IReadOnlyList<string> terms)
+    {
+        var name = variable.Name.ToLowerInvariant();
+        var category = name.Split('.', 2)[0];
+        var description = variable.Description?.ToLowerInvariant() ?? string.Empty;
+        var score = 0;
+
+        foreach (var term in terms)
+        {
+            if (name.Equals(term, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 100;
+            }
+            else if (name.EndsWith("." + term, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 60;
+            }
+            else if (name.Contains(term, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 40;
+            }
+
+            if (category.Equals(term, StringComparison.OrdinalIgnoreCase))
+                score += 12;
+
+            if (description.Contains(term, StringComparison.OrdinalIgnoreCase))
+                score += 8;
+        }
+
+        return score;
     }
 }
 
