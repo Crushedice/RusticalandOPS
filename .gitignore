@@ -1,14 +1,21 @@
 ﻿bin/
 obj/
+**/bin/
+**/obj/
+**/obj_build/
 build/
 data/
 runtime/
 .dotnet/
+.vs/
+**/.vs/
+.claude/settings.local.json
 *.user
 *.suo
 *.log
 *.db
 *.env
+*.zip
 rustops.env
 config.env
 
@@ -18,6 +25,12 @@ config.env
 *.exe
 *.deps.json
 *.runtimeconfig.json
+*.staticwebassets.endpoints.json
+
+# Published apphost binaries without extensions
+agent/RustOpsAgent/RustOpsAgent
+SteamBot/OpsSteamBot/OpsSteamBot
+api/rustmgrapi
 
 # Instance-specific config files (use .example versions as templates)
 agentsettings.json
