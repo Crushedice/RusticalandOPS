@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Net;
+using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -629,11 +630,23 @@ List<RemoteServerEntry> LoadRemoteServers()
                 var rconPort = entry.TryGetProperty("rconPort", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
                 var rconPassword = entry.TryGetProperty("rconPassword", out var pwd) ? pwd.GetString() : null;
                 var gamePort = entry.TryGetProperty("gamePort", out var gp) && gp.ValueKind == JsonValueKind.Number ? gp.GetInt32() : 0;
-                if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(rconIp) &&
-                    rconPort > 0 && !string.IsNullOrWhiteSpace(rconPassword))
+                var agentBaseUrl = entry.TryGetProperty("agentBaseUrl", out var abu) ? abu.GetString() : null;
+                var agentApiKey = entry.TryGetProperty("agentApiKey", out var aak) ? aak.GetString() : null;
+                var agentServerName = entry.TryGetProperty("agentServerName", out var asn) ? asn.GetString() : null;
+                var hasRcon = !string.IsNullOrWhiteSpace(rconIp) && rconPort > 0 && !string.IsNullOrWhiteSpace(rconPassword);
+                var hasAgent = !string.IsNullOrWhiteSpace(agentBaseUrl);
+                if (!string.IsNullOrWhiteSpace(name) && (hasRcon || hasAgent))
                 {
                     servers.Add(new RemoteServerEntry(
-                        name, displayName ?? name, rconIp, rconPort, rconPassword, gamePort));
+                        name,
+                        displayName ?? name,
+                        rconIp ?? string.Empty,
+                        rconPort,
+                        rconPassword ?? string.Empty,
+                        gamePort,
+                        agentBaseUrl ?? string.Empty,
+                        agentApiKey ?? string.Empty,
+                        agentServerName ?? string.Empty));
                 }
             }
             return servers;
@@ -655,7 +668,10 @@ void SaveRemoteServers(List<RemoteServerEntry> servers)
             ["rconIp"] = s.RconIp,
             ["rconPort"] = s.RconPort,
             ["rconPassword"] = s.RconPassword,
-            ["gamePort"] = s.GamePort
+            ["gamePort"] = s.GamePort,
+            ["agentBaseUrl"] = s.AgentBaseUrl,
+            ["agentApiKey"] = s.AgentApiKey,
+            ["agentServerName"] = s.AgentServerName
         }).ToList())
     };
     File.WriteAllText(path, JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true }));
@@ -686,6 +702,95 @@ bool IsRemoteServerName(string name)
 {
     var remoteServers = LoadRemoteServers();
     return remoteServers.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+}
+
+RemoteServerEntry? FindRemoteServer(string name)
+{
+    var remoteServers = LoadRemoteServers();
+    return remoteServers.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+}
+
+bool HasRemoteAgent(RemoteServerEntry? server) =>
+    server is not null && !string.IsNullOrWhiteSpace(server.AgentBaseUrl);
+
+string RemoteAgentServerName(RemoteServerEntry server) =>
+    string.IsNullOrWhiteSpace(server.AgentServerName) ? server.Name : server.AgentServerName.Trim();
+
+async Task<IResult?> TryProxyRemoteAgentAsync(
+    string server,
+    HttpMethod method,
+    string pathTemplate,
+    object? body = null)
+{
+    var remote = FindRemoteServer(server);
+    if (!HasRemoteAgent(remote))
+        return null;
+
+    var remoteServerName = Uri.EscapeDataString(RemoteAgentServerName(remote!));
+    var path = pathTemplate.Replace("{server}", remoteServerName, StringComparison.OrdinalIgnoreCase).TrimStart('/');
+    var baseUrl = remote!.AgentBaseUrl.Trim().TrimEnd('/');
+    var url = $"{baseUrl}/{path}";
+
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(45) };
+    using var message = new HttpRequestMessage(method, url);
+    var agentKey = string.IsNullOrWhiteSpace(remote.AgentApiKey) ? apiKey : remote.AgentApiKey.Trim();
+    message.Headers.TryAddWithoutValidation("X-Api-Key", agentKey);
+
+    if (body is not null)
+    {
+        message.Content = new StringContent(
+            JsonSerializer.Serialize(body, JsonDefaults.Options),
+            Encoding.UTF8,
+            "application/json");
+    }
+
+    try
+    {
+        using var response = await http.SendAsync(message);
+        var content = await response.Content.ReadAsStringAsync();
+        if (string.IsNullOrWhiteSpace(content))
+            return Results.StatusCode((int)response.StatusCode);
+
+        var contentType = response.Content.Headers.ContentType?.ToString() ?? "application/json";
+        return Results.Content(content, contentType, statusCode: (int)response.StatusCode);
+    }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "Remote agent proxy failed.", server, path);
+        return Results.BadRequest(new ApiError("remote_agent_error", ex.Message));
+    }
+}
+
+async Task<JsonNode?> TryReadRemoteAgentJsonAsync(string server, string pathTemplate)
+{
+    var remote = FindRemoteServer(server);
+    if (!HasRemoteAgent(remote))
+        return null;
+
+    var remoteServerName = Uri.EscapeDataString(RemoteAgentServerName(remote!));
+    var path = pathTemplate.Replace("{server}", remoteServerName, StringComparison.OrdinalIgnoreCase).TrimStart('/');
+    var baseUrl = remote!.AgentBaseUrl.Trim().TrimEnd('/');
+    var url = $"{baseUrl}/{path}";
+
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+    using var message = new HttpRequestMessage(HttpMethod.Get, url);
+    var agentKey = string.IsNullOrWhiteSpace(remote.AgentApiKey) ? apiKey : remote.AgentApiKey.Trim();
+    message.Headers.TryAddWithoutValidation("X-Api-Key", agentKey);
+
+    try
+    {
+        using var response = await http.SendAsync(message);
+        if (!response.IsSuccessStatusCode)
+            return null;
+
+        var content = await response.Content.ReadAsStringAsync();
+        return string.IsNullOrWhiteSpace(content) ? null : JsonNode.Parse(content);
+    }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "Remote agent summary read failed.", server, path);
+        return null;
+    }
 }
 
 // -- Server list ---------------------------------------------------------------
@@ -730,7 +835,10 @@ app.MapGet("/servers/remote/list", () =>
         displayName = s.DisplayName,
         rconIp = s.RconIp,
         rconPort = s.RconPort,
-        gamePort = s.GamePort
+        gamePort = s.GamePort,
+        agentBaseUrl = s.AgentBaseUrl,
+        agentServerName = s.AgentServerName,
+        agentEnabled = !string.IsNullOrWhiteSpace(s.AgentBaseUrl)
     }));
 });
 
@@ -797,6 +905,13 @@ app.MapPost("/servers/remote/{name}/test", async (string name) =>
     if (server == null)
         return Results.NotFound();
 
+    if (HasRemoteAgent(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(name, HttpMethod.Get, "/health");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     try
     {
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -833,12 +948,46 @@ app.MapGet("/servers/summary", async () =>
     });
 
     var statuses = await Task.WhenAll(tasks);
-    return Results.Ok(statuses);
+    var rows = statuses.Cast<object>().ToList();
+    foreach (var remote in LoadRemoteServers())
+    {
+        var remoteStatus = await TryReadRemoteAgentJsonAsync(remote.Name, "/servers/{server}/status");
+        if (remoteStatus is null)
+        {
+            rows.Add(new
+            {
+                name = remote.Name,
+                state = "rcon-only",
+                online = false,
+                remote = true,
+                agentEnabled = false
+            });
+            continue;
+        }
+
+        if (remoteStatus is JsonObject remoteObject)
+        {
+            remoteObject["name"] = remote.Name;
+            remoteObject["remote"] = true;
+            remoteObject["agentEnabled"] = true;
+        }
+
+        rows.Add(remoteStatus);
+    }
+
+    return Results.Ok(rows);
 });
 
 // -- Status --------------------------------------------------------------------
 app.MapGet("/servers/{server}/status", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/status");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -857,6 +1006,10 @@ app.MapGet("/servers/{server}/health", async (string server) =>
     // Check if this is a remote server first
     if (IsRemoteServerName(server))
     {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/health");
+        if (remoteResult is not null)
+            return remoteResult;
+
         return Results.Ok(new
         {
             name = server,
@@ -909,7 +1062,10 @@ app.MapGet("/servers/{server}/health", async (string server) =>
 app.MapPost("/servers/{server}/start", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "Start/stop operations are not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/start");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "Start/stop operations require a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -925,7 +1081,10 @@ app.MapPost("/servers/{server}/start", async (string server) =>
 app.MapPost("/servers/{server}/stop", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "Start/stop operations are not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/stop");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "Start/stop operations require a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -938,7 +1097,10 @@ app.MapPost("/servers/{server}/stop", async (string server) =>
 app.MapPost("/servers/{server}/restart", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "Start/stop/restart operations are not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/restart");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "Start/stop/restart operations require a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -954,7 +1116,10 @@ app.MapPost("/servers/{server}/restart", async (string server) =>
 app.MapPost("/servers/{server}/kill", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/kill");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "This operation requires a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -967,7 +1132,10 @@ app.MapPost("/servers/{server}/kill", async (string server) =>
 app.MapPost("/servers/{server}/update", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "Update operations are not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/update");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "Update operations require a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -980,7 +1148,10 @@ app.MapPost("/servers/{server}/update", async (string server) =>
 app.MapPost("/servers/{server}/umod", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/umod");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "This operation requires a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -993,7 +1164,10 @@ app.MapPost("/servers/{server}/umod", async (string server) =>
 app.MapPost("/servers/{server}/sync-config", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/sync-config");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "This operation requires a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -1008,7 +1182,10 @@ app.MapPost("/servers/{server}/sync-config", async (string server) =>
 app.MapPost("/servers/{server}/wipe", async (string server) =>
 {
     if (IsRemoteServerName(server))
-        return Results.BadRequest(new ApiError("remote_server", "Wipe operations are not available for remote servers."));
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/wipe");
+        return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "Wipe operations require a remote agent for this server."));
+    }
 
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -1018,8 +1195,15 @@ app.MapPost("/servers/{server}/wipe", async (string server) =>
 });
 
 // -- Config read ---------------------------------------------------------------
-app.MapGet("/servers/{server}/config", (string server) =>
+app.MapGet("/servers/{server}/config", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/config");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     var cfg = LoadServerConfig(server);
     if (cfg is null)
         return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
@@ -1027,8 +1211,15 @@ app.MapGet("/servers/{server}/config", (string server) =>
 });
 
 // -- Config write --------------------------------------------------------------
-app.MapPut("/servers/{server}/config", (string server, ServerConfig config) =>
+app.MapPut("/servers/{server}/config", async (string server, ServerConfig config) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Put, "/servers/{server}/config", config);
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     var normalized    = NormalizeConfig(server, config);
     var validationErr = ValidateConfig(normalized);
     if (validationErr is not null)
@@ -1045,8 +1236,15 @@ app.MapPut("/servers/{server}/config", (string server, ServerConfig config) =>
 });
 
 // -- Config validation / provisioning -----------------------------------------
-app.MapPost("/servers/{server}/config/validate", (string server, ServerConfig config) =>
+app.MapPost("/servers/{server}/config/validate", async (string server, ServerConfig config) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/config/validate", config);
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     var normalized = NormalizeConfig(server, config);
     var errors = new List<string>();
     var validationErr = ValidateConfig(normalized);
@@ -1296,6 +1494,13 @@ app.MapPost("/tasks", (ManagedTaskRequest request) =>
 // -- Send RCON command ---------------------------------------------------------
 app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequest request) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/command", request);
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1356,6 +1561,13 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
 
 app.MapPost("/servers/{server}/command/exec", async (string server, ServerCommandExecRequest request) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/command/exec", request);
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1415,6 +1627,7 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
             endpoint = new { host = endpoint.Host, port = endpoint.Port },
             directReply = (string?)null,
             warning = $"WebRCON failed: {ex.Message}",
+            fallback = string.IsNullOrWhiteSpace(fallback.StdOut) ? "command accepted by rustmgr send" : fallback.StdOut.Trim(),
             output = fallbackOutput
         });
     }
@@ -1445,6 +1658,13 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
 // -- Console log snapshot ------------------------------------------------------
 app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, $"/servers/{{server}}/console?lines={lines.GetValueOrDefault(defaultConsoleLines)}");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1463,6 +1683,19 @@ app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
 // previous entry as continuation text (stack traces etc).
 app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, string? since, int? offset) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var query = BuildQueryString(new Dictionary<string, string?>
+        {
+            ["lines"] = lines?.ToString(),
+            ["since"] = since,
+            ["offset"] = offset?.ToString()
+        });
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, $"/servers/{{server}}/logs/tail{query}");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1494,6 +1727,18 @@ app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, stri
 
 app.MapGet("/servers/{server}/logs/read", async (string server, long? offset, int? maxBytes) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var query = BuildQueryString(new Dictionary<string, string?>
+        {
+            ["offset"] = offset?.ToString(),
+            ["maxBytes"] = maxBytes?.ToString()
+        });
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, $"/servers/{{server}}/logs/read{query}");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1522,6 +1767,13 @@ app.MapGet("/servers/{server}/logs/read", async (string server, long? offset, in
 // -- Command trace (what was sent to the server) -------------------------------
 app.MapGet("/servers/{server}/commands", async (string server, int? lines) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, $"/servers/{{server}}/commands?lines={lines.GetValueOrDefault(80)}");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1536,6 +1788,13 @@ app.MapGet("/servers/{server}/commands", async (string server, int? lines) =>
 // -- Agent convenience: command trace as structured JSON -----------------------
 app.MapGet("/servers/{server}/events", async (string server, int? lines) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, $"/servers/{{server}}/events?lines={lines.GetValueOrDefault(defaultEventLines)}");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1557,6 +1816,13 @@ app.MapGet("/servers/{server}/events", async (string server, int? lines) =>
 // -- Serverinfo (live RCON query) ----------------------------------------------
 app.MapGet("/servers/{server}/serverinfo", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/serverinfo");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1592,6 +1858,13 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
 // -- Player list (live RCON query) ---------------------------------------------
 app.MapGet("/servers/{server}/players", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/players");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1627,6 +1900,13 @@ app.MapGet("/servers/{server}/players", async (string server) =>
 // -- Bans ----------------------------------------------------------------------
 app.MapGet("/servers/{server}/bans", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/bans");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1662,6 +1942,13 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
 // -- Kick ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest request) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/kick", request);
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1702,6 +1989,13 @@ app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest re
 // -- Ban -----------------------------------------------------------------------
 app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest request) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/ban", request);
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1742,6 +2036,13 @@ app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest req
 // -- Unban ---------------------------------------------------------------------
 app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest request) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/unban", request);
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1847,6 +2148,9 @@ static string BuildRustMgrError(CommandExecutionResult result)
 
 static async Task<bool> IsValidServerAsync(string server)
 {
+    if (File.Exists(GetConfigPath(server)))
+        return true;
+
     var result = await ExecRustMgrAsync("list");
     var names  = (result.StdOut ?? string.Empty)
         .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -2100,6 +2404,16 @@ static string TailLines(string text, int lines)
     if (string.IsNullOrWhiteSpace(text)) return string.Empty;
     var all = text.Replace("\r\n", "\n").Split('\n');
     return string.Join(Environment.NewLine, all.TakeLast(lines));
+}
+
+static string BuildQueryString(IReadOnlyDictionary<string, string?> values)
+{
+    var parts = values
+        .Where(kvp => !string.IsNullOrWhiteSpace(kvp.Value))
+        .Select(kvp => $"{Uri.EscapeDataString(kvp.Key)}={Uri.EscapeDataString(kvp.Value!)}")
+        .ToArray();
+
+    return parts.Length == 0 ? string.Empty : "?" + string.Join("&", parts);
 }
 
 static string? TryExtractJson(string? text)
@@ -5279,7 +5593,16 @@ public sealed class ServerConfig
 
 public sealed record RconConnectionInfo(string Host, ushort Port, string Password, bool WebRconEnabled);
 
-public sealed record RemoteServerEntry(string Name, string DisplayName, string RconIp, int RconPort, string RconPassword, int GamePort = 0);
+public sealed record RemoteServerEntry(
+    string Name,
+    string DisplayName,
+    string RconIp,
+    int RconPort,
+    string RconPassword,
+    int GamePort = 0,
+    string AgentBaseUrl = "",
+    string AgentApiKey = "",
+    string AgentServerName = "");
 
 internal sealed record IncidentFeedbackEntry(string? Verdict, string? Note, DateTime? AnsweredAtUtc);
 

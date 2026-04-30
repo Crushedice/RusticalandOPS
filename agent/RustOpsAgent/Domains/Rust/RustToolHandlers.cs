@@ -30,6 +30,13 @@ internal sealed class RustStatusToolHandler : IToolHandler
         var scope = RustToolHelper.ResolveServerScope(context, knownServers, allowPluralDefaultAll: true);
         if (scope.Servers.Count == 0)
         {
+            // Do not ask "which server?" for pure chat intents that carry no server context.
+            if (context.Route.Intent == AdminIntentType.Chat)
+            {
+                return new ToolExecutionResult(true, string.Empty, null, false, Payload: null,
+                    SelectedServers: Array.Empty<string>(), ScopeKind: ServerScopeKind.Unspecified);
+            }
+
             var clarification = RustToolHelper.BuildScopeClarificationQuestion(
                 context.Route.Intent,
                 knownServers,
@@ -267,7 +274,7 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         try
         {
             var rconResult = await RustDirectRconHelper.TryExecuteAsync(server, $"restart {seconds}", cancellationToken);
-            rconSent = !string.IsNullOrWhiteSpace(rconResult);
+            rconSent = rconResult is not null;
         }
         catch (Exception ex)
         {
@@ -479,6 +486,12 @@ internal sealed class RustRconToolHandler : IToolHandler
             }
         }
 
+        var catalogSearch = TryHandleGeneralCatalogQuestion(context.Message);
+        if (catalogSearch is not null)
+        {
+            return catalogSearch;
+        }
+
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
@@ -522,6 +535,8 @@ internal sealed class RustRconToolHandler : IToolHandler
                 command = ExtractCommandFromMessage(context.Message);
         }
 
+        command = NormalizeCommandForServer(command, server);
+
         if (string.IsNullOrWhiteSpace(command))
             return new ToolExecutionResult(false, "Which command should I run? Quote it or say 'run status'.", server, false, "clarification_required");
 
@@ -553,7 +568,7 @@ internal sealed class RustRconToolHandler : IToolHandler
             {
                 using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command/exec", new { command }, cancellationToken);
                 reply = BuildApiFallbackReply(server, response.RootElement);
-                succeeded = true;
+                succeeded = ApiCommandSucceeded(response.RootElement);
             }
         }
         catch (Exception ex)
@@ -702,6 +717,83 @@ internal sealed class RustRconToolHandler : IToolHandler
         return KnowledgeIntent.None;
     }
 
+    private ToolExecutionResult? TryHandleGeneralCatalogQuestion(string message)
+    {
+        var lowered = message.ToLowerInvariant();
+        var asksGeneralCatalog =
+            lowered.Contains("convar", StringComparison.Ordinal) ||
+            lowered.Contains("convars", StringComparison.Ordinal) ||
+            lowered.Contains("server variable", StringComparison.Ordinal) ||
+            lowered.Contains("server variables", StringComparison.Ordinal) ||
+            lowered.Contains("server command", StringComparison.Ordinal) ||
+            lowered.Contains("server commands", StringComparison.Ordinal);
+
+        if (!asksGeneralCatalog)
+            return null;
+
+        var snapshot = _knowledge.GetSnapshot();
+        var variableMatches = _knowledge.SearchVariables(message, 8);
+        var commandMatches = _knowledge.SearchCommands(message, 8);
+
+        if (variableMatches.Count == 0 && commandMatches.Count == 0)
+        {
+            return new ToolExecutionResult(
+                true,
+                $"I couldn't find matching server catalog entries. Variables: `{snapshot.VariablesPath ?? "not found"}`, commands: `{snapshot.CommandsPath ?? "not found"}`.",
+                ErrorCode: "authoritative_catalog");
+        }
+
+        var lines = new List<string>();
+        if (variableMatches.Count > 0)
+        {
+            lines.Add("Matching convars:");
+            lines.AddRange(variableMatches.Select(FormatVariableCatalogLine));
+        }
+
+        if (commandMatches.Count > 0)
+        {
+            if (lines.Count > 0)
+                lines.Add(string.Empty);
+            lines.Add("Matching server commands:");
+            lines.AddRange(commandMatches.Select(FormatCommandCatalogLine));
+        }
+
+        return new ToolExecutionResult(
+            true,
+            string.Join('\n', lines),
+            ErrorCode: "authoritative_catalog",
+            Payload: new
+            {
+                source = "server-command-variable-catalog",
+                variables = variableMatches.Count,
+                commands = commandMatches.Count,
+                snapshot.VariablesPath,
+                snapshot.CommandsPath
+            });
+    }
+
+    private static string FormatVariableCatalogLine(ServerVariableDefinition variable)
+    {
+        var description = string.IsNullOrWhiteSpace(variable.Description)
+            ? "No description available."
+            : variable.Description;
+        var defaultValue = string.IsNullOrWhiteSpace(variable.DefaultValue)
+            ? string.Empty
+            : $" Default: `{variable.DefaultValue}`.";
+        return $"- `{variable.Name}`: {description}{defaultValue}";
+    }
+
+    private static string FormatCommandCatalogLine(ServerCommandDefinition command)
+    {
+        var description = string.IsNullOrWhiteSpace(command.Description)
+            ? "No description available."
+            : command.Description;
+        var risk = string.IsNullOrWhiteSpace(command.RiskLevel)
+            ? string.Empty
+            : $" Risk: {command.RiskLevel}.";
+        return $"- `{command.Name}`: {description}{risk}";
+    }
+
     private string? CheckCommandPolicy(string commandRoot)
     {
         if (_cmdSettings.FreeMode)
@@ -765,6 +857,15 @@ internal sealed class RustRconToolHandler : IToolHandler
 
     internal static string BuildApiFallbackReply(string server, JsonElement root)
     {
+        if (root.TryGetProperty("ok", out var okNode) &&
+            okNode.ValueKind is JsonValueKind.False)
+        {
+            var error = root.TryGetProperty("message", out var messageNode)
+                ? messageNode.ToString()
+                : root.ToString();
+            return $"RCON {server}: command was not confirmed by the API. {error}";
+        }
+
         var apiReply = root.TryGetProperty("directReply", out var replyNode) && replyNode.ValueKind != JsonValueKind.Null
             ? replyNode.ToString()
             : string.Empty;
@@ -777,9 +878,37 @@ internal sealed class RustRconToolHandler : IToolHandler
             ? commandNode.GetString()
             : null;
         var outputSummary = ExtractApiOutputSummary(root, command);
-        return string.IsNullOrWhiteSpace(outputSummary)
-            ? $"RCON {server}: command sent via API (no direct reply)."
-            : $"RCON {server}: {TruncateOutput(outputSummary, 1200)}";
+        if (!string.IsNullOrWhiteSpace(outputSummary))
+            return $"RCON {server}: {TruncateOutput(outputSummary, 1200)}";
+
+        var transport = root.TryGetProperty("transport", out var transportNode) && transportNode.ValueKind == JsonValueKind.String
+            ? transportNode.GetString()
+            : null;
+        var fallback = root.TryGetProperty("fallback", out var fallbackNode) && fallbackNode.ValueKind != JsonValueKind.Null
+            ? fallbackNode.ToString()
+            : null;
+
+        if (!string.IsNullOrWhiteSpace(fallback))
+            return $"RCON {server}: {TruncateOutput(fallback, 500)}";
+
+        return string.Equals(transport, "rustmgr-send", StringComparison.OrdinalIgnoreCase)
+            ? $"RCON {server}: command accepted by rustmgr send fallback (no direct reply)."
+            : $"RCON {server}: command sent via API (no direct reply).";
+    }
+
+    private static bool ApiCommandSucceeded(JsonElement root)
+    {
+        if (root.TryGetProperty("ok", out var okNode))
+        {
+            return okNode.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => true
+            };
+        }
+
+        return true;
     }
 
     private static string? ExtractApiOutputSummary(JsonElement root, string? command)
@@ -865,6 +994,34 @@ internal sealed class RustRconToolHandler : IToolHandler
         }
 
         return string.Empty;
+    }
+
+    internal static string NormalizeCommandForServer(string? command, string? server)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+            return string.Empty;
+
+        var normalized = command.Trim().Trim(' ', ':', '"', '\'', '.');
+        if (string.IsNullOrWhiteSpace(normalized))
+            return string.Empty;
+
+        if (!string.IsNullOrWhiteSpace(server))
+        {
+            var escapedServer = Regex.Escape(server.Trim());
+            normalized = Regex.Replace(
+                normalized,
+                $@"\s+(?:on|for|to)\s+(?:the\s+)?{escapedServer}(?:\s+server)?\s*$",
+                string.Empty,
+                RegexOptions.IgnoreCase);
+        }
+
+        normalized = Regex.Replace(
+            normalized,
+            @"\s+(?:(?:on|for)\s+(?:the\s+)?[A-Za-z0-9._-]+(?:\s+server)?|to\s+(?:the\s+)?[A-Za-z0-9._-]+\s+server)\s*$",
+            string.Empty,
+            RegexOptions.IgnoreCase);
+
+        return normalized.Trim().Trim(' ', ':', '"', '\'', '.');
     }
 
     private enum KnowledgeOperation
@@ -1077,6 +1234,15 @@ internal sealed class RustPluginToolHandler : IToolHandler
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
+        if (string.IsNullOrWhiteSpace(context.Route.Slots.ServerName) &&
+            context.Route.Slots.ServerNames is not { Count: > 0 } &&
+            LooksLikeGeneralPluginReferenceQuestion(context.Message))
+        {
+            var referenceResult = await TryAnswerGeneralPluginReferenceAsync(context, cancellationToken);
+            if (referenceResult is not null)
+                return referenceResult;
+        }
+
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
@@ -1244,6 +1410,58 @@ internal sealed class RustPluginToolHandler : IToolHandler
             var finalIndexSuffix = indexReport is null ? string.Empty : $" Plugin index: {indexReport.ToSummary()}.";
             return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}{actionHint}{finalIndexSuffix}", server, false);
         }
+    }
+
+    private async Task<ToolExecutionResult?> TryAnswerGeneralPluginReferenceAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    {
+        if (_pluginReferenceIndexer is null)
+            return null;
+
+        var records = await _pluginReferenceIndexer.SearchAsync(context.Message, cancellationToken);
+        if (records.Count == 0)
+            return null;
+
+        var lines = records.Take(8).Select(record =>
+        {
+            var commands = record.Commands
+                .Select(command => command.Type == "ConsoleCommand"
+                    ? command.Command.TrimStart('/')
+                    : "/" + command.Command.TrimStart('/'))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(10)
+                .ToList();
+            var commandText = commands.Count == 0 ? "none detected" : string.Join(", ", commands);
+            var permissions = record.Permissions.Count == 0 ? string.Empty : $" Permissions: {string.Join(", ", record.Permissions.Take(10))}.";
+            return $"{record.PluginName}: commands {commandText}.{permissions}";
+        });
+
+        return new ToolExecutionResult(
+            true,
+            string.Join('\n', lines),
+            Payload: new { source = "plugin-reference-index", count = records.Count },
+            ErrorCode: "authoritative_catalog");
+    }
+
+    private static bool LooksLikeGeneralPluginReferenceQuestion(string message)
+    {
+        var lowered = message.ToLowerInvariant();
+        var asksReference =
+            lowered.Contains("what", StringComparison.Ordinal) ||
+            lowered.Contains("which", StringComparison.Ordinal) ||
+            lowered.Contains("how", StringComparison.Ordinal) ||
+            lowered.Contains("command", StringComparison.Ordinal) ||
+            lowered.Contains("permission", StringComparison.Ordinal) ||
+            lowered.Contains("hook", StringComparison.Ordinal) ||
+            lowered.Contains("config key", StringComparison.Ordinal);
+
+        var asksLiveServerState =
+            lowered.Contains("active", StringComparison.Ordinal) ||
+            lowered.Contains("loaded", StringComparison.Ordinal) ||
+            lowered.Contains("installed", StringComparison.Ordinal) ||
+            lowered.Contains("enabled", StringComparison.Ordinal) ||
+            lowered.Contains("on server", StringComparison.Ordinal);
+
+        return lowered.Contains("plugin", StringComparison.Ordinal) && asksReference && !asksLiveServerState;
     }
 
 }

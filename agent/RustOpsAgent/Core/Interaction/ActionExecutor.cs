@@ -23,12 +23,6 @@ internal sealed class ActionExecutor : IActionExecutor
             context = context with { ExecutionMemoryContext = executionMemory };
         }
 
-        var avoidRepeatResult = ShouldAvoidRepeatedFailure(context);
-        if (avoidRepeatResult is not null)
-        {
-            return avoidRepeatResult;
-        }
-
         if (context.Route.NeedsClarification && IsBlockingClarification(context.Route))
         {
             return new ToolExecutionResult(
@@ -41,6 +35,8 @@ internal sealed class ActionExecutor : IActionExecutor
                 ScopeKind: context.Route.Slots.ScopeKind);
         }
 
+        LogRepeatedFailureHints(context);
+
         var handler = _registry.ResolveSingle(context);
         if (handler is null)
         {
@@ -50,32 +46,23 @@ internal sealed class ActionExecutor : IActionExecutor
         return await handler.ExecuteAsync(context, cancellationToken);
     }
 
-    private static ToolExecutionResult? ShouldAvoidRepeatedFailure(ToolExecutionContext context)
+    private static void LogRepeatedFailureHints(ToolExecutionContext context)
     {
         var executionMemory = context.ExecutionMemoryContext;
         if (executionMemory is null || !executionMemory.HasResults)
         {
-            return null;
+            return;
         }
 
         var repeatedFailures = executionMemory.Results
             .Where(item => item.MemoryRecord.Type == MemoryRecordType.Failure && item.FinalScore >= 0.82)
             .Take(2)
             .ToList();
-        if (repeatedFailures.Count < 2)
-        {
-            return null;
-        }
 
-        var summary = repeatedFailures[0].MemoryRecord.Summary;
-        return new ToolExecutionResult(
-            false,
-            $"I’m avoiding a repeated failure for now. Similar attempts have failed before: {summary}",
-            context.Route.Slots.ServerName ?? context.SelectionState.LastServerName,
-            false,
-            "known_failure_repeated",
-            SelectedServers: context.Route.Slots.ServerNames ?? context.SelectionState.LastResolvedServers,
-            ScopeKind: context.Route.Slots.ScopeKind);
+        if (repeatedFailures.Count >= 2)
+        {
+            Console.WriteLine($"[memory] repeated failure hints present; continuing execution. Top hint: {repeatedFailures[0].MemoryRecord.Summary}");
+        }
     }
 
     private static bool IsBlockingClarification(AdminIntentRoute route)

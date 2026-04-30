@@ -1,0 +1,20 @@
+[Unit]
+Description=RustOps Remote Rust Server Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rustmgr
+Group=rustmgr
+WorkingDirectory=/opt/rust-manager/remote-agent/RustOpsRemoteAgent
+EnvironmentFile=-/opt/rust-manager/config.env
+EnvironmentFile=-/opt/rust-manager/remote-agent.env
+Environment=DOTNET_CLI_HOME=/opt/rust-manager
+ExecStart=/usr/bin/dotnet /opt/rust-manager/remote-agent/RustOpsRemoteAgent/RustOpsRemoteAgent.dll
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

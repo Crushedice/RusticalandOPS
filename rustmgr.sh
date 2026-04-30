@@ -1229,9 +1229,9 @@ send_one() {
     # which is not reliable for RustDedicated in batchmode. It is kept as a
     # last resort so graceful shutdown commands ("quit") can still be attempted.
     if tmux_has_session "$server"; then
-        tmux send-keys -t "$(session_name "$server")" "$cmd" C-m
+        tmux send-keys -t "$(session_name "$server")" -- "$cmd" C-m
         trace_server_command "$server" "send(tmux-fallback): $cmd"
-        echo "sent to $server: $cmd"
+        echo "sent to $server via tmux fallback: $cmd"
         return 0
     fi
 

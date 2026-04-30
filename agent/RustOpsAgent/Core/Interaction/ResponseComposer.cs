@@ -51,6 +51,17 @@ internal sealed class ResponseComposer : IResponseComposer
         // Bypass LLM for confirmed direct actions (MutatedState=true) — the tool message is
         // authoritative and a small local model hallucinates "already ongoing" style responses
         // when conversation history contains a prior action of the same type.
+        if (!result.Success)
+        {
+            var fallback = ComposeFallback(result);
+            return new ComposedReply(
+                fallback,
+                "response-compose-error",
+                false, false,
+                "template_error",
+                fallback.Length > 180 ? fallback[..180] : fallback);
+        }
+
         if (result.MutatedState)
         {
             return new ComposedReply(
@@ -59,6 +70,24 @@ internal sealed class ResponseComposer : IResponseComposer
                 false, false,
                 "template_direct_action",
                 result.Message.Length > 180 ? result.Message[..180] : result.Message);
+        }
+
+        var payloadPreview = result.Payload?.ToString();
+        if (!string.IsNullOrWhiteSpace(payloadPreview) && payloadPreview.Length > 1200)
+            payloadPreview = payloadPreview[..1200];
+
+        // If the tool succeeded but returned no payload data, do NOT let the LLM invent content.
+        if (result.Success && result.Payload is null && string.IsNullOrWhiteSpace(payloadPreview))
+        {
+            var message = string.IsNullOrWhiteSpace(result.Message)
+                ? "No data was returned."
+                : result.Message;
+            return new ComposedReply(
+                message,
+                "response-compose-no-payload",
+                false, false,
+                "template_no_payload",
+                message.Length > 180 ? message[..180] : message);
         }
 
         if (_kernel is null || !_settings.Enabled)
@@ -72,10 +101,6 @@ internal sealed class ResponseComposer : IResponseComposer
                 fallback);
         }
 
-        var payloadPreview = result.Payload?.ToString();
-        if (!string.IsNullOrWhiteSpace(payloadPreview) && payloadPreview.Length > 1200)
-            payloadPreview = payloadPreview[..1200];
-
         var conversationHistory = BuildConversationHistory(context.SelectionState);
         var memoryContext = BuildMemoryContext(context);
         var systemPrompt = BuildSystemPrompt();
@@ -84,7 +109,6 @@ internal sealed class ResponseComposer : IResponseComposer
 {{systemPrompt}}
 
 {{conversationHistory}}
-{{memoryContext}}
 Operational context:
 - Admin said: "{{context.Message}}"
 - Detected intent: {{context.Route.Intent}}
@@ -93,7 +117,11 @@ Operational context:
 - Tool result: {{result.Message}}
 {{(string.IsNullOrWhiteSpace(payloadPreview) ? string.Empty : $"- Data: {payloadPreview}")}}
 
+{{memoryContext}}
+
 Write a direct, natural reply to the admin. Be concise (under 100 words unless details genuinely require more). Do not mention internal routing, error codes, or tool names. Speak like a knowledgeable ops colleague — not a system message.
+DO NOT use future tense ("I will", "I'll", "let me check"). Only describe what the tool already did or found.
+If the tool returned no data for part of the request, say "not found" for that part - do not speculate.
 """;
 
         try
@@ -127,8 +155,18 @@ Write a direct, natural reply to the admin. Be concise (under 100 words unless d
 
     private string BuildSystemPrompt()
     {
+        const string criticalRules = """
+CRITICAL RULES - NEVER VIOLATE:
+1. Never say you "will", "shall", "are going to", or "will get back to" the admin about anything.
+   You are SYNCHRONOUS. If you did something, report it. If you did not do something, say so clearly.
+2. Never invent server paths, file contents, config values, or plugin configurations.
+   If the tool result contains data, use it. If it does not contain data for something the admin asked, say the data was not found.
+3. Oxide/uMod plugin configs are ALWAYS JSON, never YAML. Never generate or describe a YAML config for an Oxide plugin.
+4. Never make up file paths. Only report paths that appear verbatim in the tool result payload.
+""";
+
         if (_settings.UseChatSystemPrompt && !string.IsNullOrWhiteSpace(_settings.ChatSystemPrompt))
-            return _settings.ChatSystemPrompt!.Trim();
+            return $"{_settings.ChatSystemPrompt!.Trim()}\n\n{criticalRules}";
 
         return """
 You are RustOps, an AI operations assistant managing Rust game servers.
@@ -138,7 +176,7 @@ Communicate like a sharp, experienced ops person: direct answers first, relevant
 Avoid jargon about your own internals. Sound like a colleague, not a status board.
 When something fails, say what failed and what to try next.
 When something works, confirm it clearly and note anything worth watching.
-""";
+""" + "\n\n" + criticalRules;
     }
 
     private static string BuildConversationHistory(ConversationSelectionState state)
@@ -147,7 +185,7 @@ When something works, confirm it clearly and note anything worth watching.
             return string.Empty;
 
         var sb = new StringBuilder("Recent conversation:\n");
-        foreach (var msg in state.RecentMessages.TakeLast(6))
+        foreach (var msg in state.RecentMessages.TakeLast(10))
         {
             var label = msg.Role == "assistant" ? "RustOps" : "Admin";
             sb.AppendLine($"[{label}]: {msg.Text}");

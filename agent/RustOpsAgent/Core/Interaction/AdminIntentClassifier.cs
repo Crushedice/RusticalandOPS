@@ -89,6 +89,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             if (ShouldPromoteToStatusIntent(intent, lowered))
                 intent = AdminIntentType.StatusCheck;
 
+            if (intent is AdminIntentType.Troubleshooting or AdminIntentType.StatusCheck &&
+                LooksLikeServerlessReferenceQuestion(lowered, knownServers))
+            {
+                intent = AdminIntentType.Chat;
+            }
+
             var correctionFollowUp = IsCorrectionFollowUp(lowered);
             if (correctionFollowUp &&
                 !HasExplicitIntentSignal(lowered) &&
@@ -141,7 +147,11 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
                 }
             }
 
-            if (string.IsNullOrWhiteSpace(serverName))
+            var serverlessCatalogQuestion =
+                (intent == AdminIntentType.Chat || intent == AdminIntentType.RconCommand || intent == AdminIntentType.Troubleshooting) &&
+                LooksLikeServerlessCatalogQuestion(lowered, knownServers);
+
+            if (string.IsNullOrWhiteSpace(serverName) && !serverlessCatalogQuestion)
                 serverName = ExtractServerHint(message);
 
             var allowPluralDefaultAll = intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting;
@@ -149,17 +159,21 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
                 message, knownServers, state,
                 scopeKind, serverNames, serverName,
                 allowPluralDefaultAll: allowPluralDefaultAll,
-                allowLastScopeFallback: true);
+                allowLastScopeFallback: !serverlessCatalogQuestion);
 
             serverNames = scope.Servers.ToList();
             serverName = serverNames.Count == 1 ? serverNames[0] : null;
             scopeKind = scope.ScopeKind;
 
             targetRef = NormalizeTargetRef(targetRef) ?? InferTargetRef(intent, lowered);
+            if (intent == AdminIntentType.Chat && LooksLikeExplicitWebLookup(lowered))
+            {
+                targetRef = "web.search";
+            }
 
             // Bug #3 fix: LLM's needsClarification is respected only when it also provides a
             // clarification question (avoids false-positive blocking when scope is already resolved).
-            var scopeNeedsClarification = RequiresServerScope(intent) && scope.RequiresClarification;
+            var scopeNeedsClarification = RequiresServerScope(intent, lowered, knownServers) && scope.RequiresClarification;
             var needsClarification = scopeNeedsClarification
                 || (llmNeedsClarification && !scopeNeedsClarification && !string.IsNullOrWhiteSpace(clarification));
 
@@ -203,7 +217,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "══ TARGETREF VALUES ══\n" +
         "rust.server.control   rust.player.lookup    rust.rcon.command    rust.file.edit\n" +
         "rust.status.check     rust.logs.inspect     rust.plugins.verify  rust.network.inspect\n" +
-        "rust.chat.reply       rust.server.management\n\n" +
+        "rust.chat.reply       rust.server.management  web.search\n\n" +
         "══ SLOTS ══\n" +
         "serverName   string  – single server (match from Known servers list when possible)\n" +
         "serverNames  array   – multiple server names\n" +
@@ -243,6 +257,10 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "   Memory/admin commands such as \"memory stats\", \"/memory search\", \"memory migrate\" are ALSO chat.\n" +
         "   Plugin reference lookup commands such as \"/plugin-index search\", \"what commands does Backpacks have\",\n" +
         "   \"what permission is needed for /kit\", and \"which plugin owns /remove\" are ALSO chat.\n" +
+        "   General questions about plugins, server convars, or server commands do NOT need a server.\n" +
+        "   Only set serverName or ask for a server when the admin names a server or asks about live server state.\n" +
+        "   Examples of serverless catalog questions: \"what convars are there for stability\", \"what does ai.move do\",\n" +
+        "   \"what commands does Backpacks have\", \"which permission does /kit need\".\n" +
         "   CRITICAL: \"git pull\", \"rebuild the agent\", \"can you pull?\" -> ALWAYS intent=chat.\n\n" +
         "9. scopeKind=all when admin says \"all servers\", \"every server\", \"all N servers\".\n" +
         "   For general status/health questions with NO specific server name, default scopeKind=all.\n\n" +
@@ -254,7 +272,19 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "\"set maxplayers to 200 on cotton\"\n" +
         "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.maxplayers\", slots.configValue=\"200\", slots.serverName=\"cotton\"\n\n" +
         "\"what does ai.move do\"\n" +
-        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"ai.move\"\n\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, needsClarification=false, slots.commandText=\"ai.move\", serverName=null\n\n" +
+        "\"what convars are there for stability\"\n" +
+        "  -> intent=chat, targetRef=rust.chat.reply, needsClarification=false, serverName=null\n\n" +
+        "\"give me the config for the Vanish plugin from modded server\"\n" +
+        "  -> intent=file_edit, targetRef=rust.file.edit, slots.serverName=\"modded\"\n\n" +
+        "\"which plugins use the /kit permission\"\n" +
+        "  -> intent=chat, targetRef=rust.chat.reply, needsClarification=false, serverName=null\n\n" +
+        "\"how do I reload oxide\"\n" +
+        "  -> intent=chat, targetRef=rust.chat.reply, needsClarification=false, serverName=null\n\n" +
+        "\"what does vanish do\"\n" +
+        "  -> intent=chat, targetRef=rust.chat.reply, needsClarification=false, serverName=null\n\n" +
+        "\"docs for Vanish plugin\"\n" +
+        "  -> intent=chat, targetRef=web.search, needsClarification=false, serverName=null\n\n" +
         "\"what's the worldsize on monthly\"\n" +
         "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.serverName=\"monthly\"\n\n" +
         "\"show cotton config\" / \"open cotton.json\"\n" +
@@ -302,6 +332,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         sb.AppendLine();
         sb.AppendLine($"Known servers: {string.Join(", ", knownServers)}");
         sb.AppendLine();
+        var recentConversation = BuildRecentConversationSection(state);
+        if (!string.IsNullOrWhiteSpace(recentConversation))
+        {
+            sb.AppendLine(recentConversation);
+        }
+
         if (planningMemory.HasResults)
         {
             sb.AppendLine("══ RELEVANT MEMORY ══");
@@ -319,6 +355,21 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         return sb.ToString();
     }
 
+    private static string BuildRecentConversationSection(ConversationSelectionState state)
+    {
+        if (state.RecentMessages.Count == 0)
+            return string.Empty;
+
+        var sb = new StringBuilder("══ RECENT CONVERSATION ══\n");
+        foreach (var msg in state.RecentMessages.TakeLast(6))
+        {
+            var label = msg.Role == "assistant" ? "RustOps" : "Admin";
+            sb.AppendLine($"[{label}]: {msg.Text}");
+        }
+
+        return sb.ToString();
+    }
+
     private static AdminIntentRoute HeuristicFallback(
         string message,
         ConversationSelectionState state,
@@ -329,7 +380,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         bool llmSucceeded)
     {
         var lowered = message.ToLowerInvariant();
-        var intent = InferHeuristicIntent(lowered);
+        var intent = InferHeuristicIntent(lowered, knownServers);
 
         if (IsCorrectionFollowUp(lowered) &&
             !HasExplicitIntentSignal(lowered) &&
@@ -339,15 +390,18 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             intent = previousIntent;
         }
 
-        var hintedServer = ExtractServerHint(message);
+        var serverlessCatalogQuestion =
+            (intent == AdminIntentType.Chat || intent == AdminIntentType.RconCommand || intent == AdminIntentType.Troubleshooting) &&
+            LooksLikeServerlessCatalogQuestion(lowered, knownServers);
+        var hintedServer = serverlessCatalogQuestion ? null : ExtractServerHint(message);
         var scope = ServerScopeResolver.Resolve(
             message, knownServers, state,
             ServerScopeKind.Unspecified, null, hintedServer,
             allowPluralDefaultAll: intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting,
-            allowLastScopeFallback: true);
+            allowLastScopeFallback: !serverlessCatalogQuestion);
 
         var selectedServer = scope.Servers.Count == 1 ? scope.Servers[0] : null;
-        var needsClarification = RequiresServerScope(intent) && scope.RequiresClarification;
+        var needsClarification = RequiresServerScope(intent, lowered, knownServers) && scope.RequiresClarification;
         var targetRef = InferTargetRef(intent, lowered);
 
         return new AdminIntentRoute(
@@ -363,12 +417,15 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             llmSucceeded);
     }
 
-    private static AdminIntentType InferHeuristicIntent(string lowered)
+    private static AdminIntentType InferHeuristicIntent(string lowered, IReadOnlyList<string> knownServers)
     {
         if (lowered.StartsWith("memory ", StringComparison.Ordinal) ||
             lowered.StartsWith("/memory ", StringComparison.Ordinal) ||
             lowered.StartsWith("plugin-index ", StringComparison.Ordinal) ||
             lowered.StartsWith("/plugin-index ", StringComparison.Ordinal) ||
+            LooksLikeExplicitWebLookup(lowered) ||
+            LooksLikeGeneralServerCatalogQuestion(lowered, knownServers) ||
+            LooksLikeServerlessReferenceQuestion(lowered, knownServers) ||
             LooksLikePluginReferenceQuestion(lowered))
             return AdminIntentType.Chat;
         if (lowered.Contains("add server") || lowered.Contains("add remote") || lowered.Contains("register server") ||
@@ -400,16 +457,113 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
     }
 
     private static bool LooksLikePluginReferenceQuestion(string lowered) =>
-        (lowered.Contains("what command", StringComparison.Ordinal) ||
+        ((lowered.Contains("plugin", StringComparison.Ordinal) &&
+          (lowered.Contains("permission", StringComparison.Ordinal) ||
+           lowered.Contains("command", StringComparison.Ordinal) ||
+           lowered.Contains("what does", StringComparison.Ordinal))) ||
+         lowered.Contains("what command", StringComparison.Ordinal) ||
          lowered.Contains("which command", StringComparison.Ordinal) ||
          lowered.Contains("commands can players", StringComparison.Ordinal) ||
          lowered.Contains("permission is needed", StringComparison.Ordinal) ||
+         (lowered.Contains("permission", StringComparison.Ordinal) && lowered.Contains("/", StringComparison.Ordinal)) ||
          lowered.Contains("which plugin owns", StringComparison.Ordinal) ||
+         lowered.Contains("which plugins use", StringComparison.Ordinal) ||
          lowered.Contains("does this plugin use", StringComparison.Ordinal) ||
          lowered.Contains("hook", StringComparison.Ordinal) ||
          lowered.Contains("config key", StringComparison.Ordinal)) &&
         !lowered.Contains("run ", StringComparison.Ordinal) &&
         !lowered.Contains("execute ", StringComparison.Ordinal);
+
+    private static bool LooksLikeExplicitWebLookup(string lowered) =>
+        (lowered.StartsWith("search ", StringComparison.Ordinal) ||
+         lowered.StartsWith("search for ", StringComparison.Ordinal) ||
+         lowered.StartsWith("look up ", StringComparison.Ordinal) ||
+         lowered.StartsWith("lookup ", StringComparison.Ordinal) ||
+         lowered.StartsWith("find docs", StringComparison.Ordinal) ||
+         lowered.StartsWith("docs for ", StringComparison.Ordinal) ||
+         lowered.StartsWith("documentation for ", StringComparison.Ordinal) ||
+         lowered.StartsWith("what is ", StringComparison.Ordinal) ||
+         lowered.StartsWith("how does ", StringComparison.Ordinal)) &&
+        (lowered.Contains("rust", StringComparison.Ordinal) ||
+         lowered.Contains("oxide", StringComparison.Ordinal) ||
+         lowered.Contains("umod", StringComparison.Ordinal) ||
+         lowered.Contains("plugin", StringComparison.Ordinal) ||
+         lowered.Contains("convar", StringComparison.Ordinal) ||
+         lowered.Contains("permission", StringComparison.Ordinal));
+
+    private static bool LooksLikeServerlessReferenceQuestion(string lowered, IReadOnlyList<string> knownServers)
+    {
+        if (MentionsKnownServerWithScope(lowered, knownServers))
+            return false;
+
+        return LooksLikePluginReferenceQuestion(lowered) ||
+               lowered.Contains("how do i reload oxide", StringComparison.Ordinal) ||
+               lowered.Contains("reload oxide", StringComparison.Ordinal) ||
+               lowered.Contains("what does vanish do", StringComparison.Ordinal);
+    }
+
+    private static bool LooksLikeGeneralServerCatalogQuestion(string lowered, IReadOnlyList<string> knownServers)
+    {
+        var mentionsCatalog =
+            lowered.Contains("convar", StringComparison.Ordinal) ||
+            lowered.Contains("convars", StringComparison.Ordinal) ||
+            lowered.Contains("server variable", StringComparison.Ordinal) ||
+            lowered.Contains("server variables", StringComparison.Ordinal) ||
+            lowered.Contains("server command", StringComparison.Ordinal) ||
+            lowered.Contains("server commands", StringComparison.Ordinal);
+
+        if (!mentionsCatalog)
+            return false;
+
+        var asksGeneral =
+            lowered.Contains("what", StringComparison.Ordinal) ||
+            lowered.Contains("which", StringComparison.Ordinal) ||
+            lowered.Contains("list", StringComparison.Ordinal) ||
+            lowered.Contains("show", StringComparison.Ordinal) ||
+            lowered.Contains("are there", StringComparison.Ordinal) ||
+            lowered.Contains("available", StringComparison.Ordinal);
+
+        return asksGeneral && !MentionsKnownServerWithScope(lowered, knownServers);
+    }
+
+    private static bool LooksLikeServerlessRconCatalogQuestion(string lowered, IReadOnlyList<string> knownServers)
+    {
+        if (MentionsKnownServerWithScope(lowered, knownServers))
+            return false;
+
+        if (LooksLikeGeneralServerCatalogQuestion(lowered, knownServers))
+            return true;
+
+        var hasDottedIdentifier = Regex.IsMatch(lowered, @"\b[a-z][a-z0-9_-]*\.[a-z0-9_.-]+\b", RegexOptions.IgnoreCase);
+        if (!hasDottedIdentifier)
+            return false;
+
+        return
+            lowered.Contains("what does", StringComparison.Ordinal) ||
+            lowered.Contains("description", StringComparison.Ordinal) ||
+            lowered.Contains("explain", StringComparison.Ordinal) ||
+            (lowered.Contains(" do", StringComparison.Ordinal) && !lowered.Contains("how do", StringComparison.Ordinal));
+    }
+
+    private static bool LooksLikeServerlessCatalogQuestion(string lowered, IReadOnlyList<string> knownServers) =>
+        LooksLikeServerlessRconCatalogQuestion(lowered, knownServers) ||
+        LooksLikeServerlessReferenceQuestion(lowered, knownServers) ||
+        LooksLikeExplicitWebLookup(lowered);
+
+    private static bool MentionsKnownServerWithScope(string lowered, IReadOnlyList<string> knownServers)
+    {
+        foreach (var server in knownServers)
+        {
+            if (string.IsNullOrWhiteSpace(server))
+                continue;
+
+            var escaped = Regex.Escape(server.Trim().ToLowerInvariant());
+            if (Regex.IsMatch(lowered, $@"\b(?:on|for|in)\s+(?:the\s+)?{escaped}\b", RegexOptions.IgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
 
     // Standalone lifecycle verbs — only match when NOT part of "update rcon" etc.
     private static bool IsLifecycleVerb(string lowered) =>
@@ -469,8 +623,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         return intent != AdminIntentType.Clarification || normalized.Contains("clarification", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool RequiresServerScope(AdminIntentType intent)
+    private static bool RequiresServerScope(AdminIntentType intent, string loweredMessage, IReadOnlyList<string> knownServers)
     {
+        if ((intent == AdminIntentType.RconCommand || intent == AdminIntentType.Chat || intent == AdminIntentType.Troubleshooting) &&
+            LooksLikeServerlessCatalogQuestion(loweredMessage, knownServers))
+            return false;
+
         // FileEdit and ServerManagement handle their own scope internally.
         return intent is
             AdminIntentType.ServerControl or
@@ -507,7 +665,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             AdminIntentType.RconCommand => "rust.rcon.command",
             AdminIntentType.FileEdit => "rust.file.edit",
             AdminIntentType.ServerManagement => "rust.server.management",
-            AdminIntentType.Chat or AdminIntentType.Clarification => "rust.chat.reply",
+            AdminIntentType.Chat or AdminIntentType.Clarification => LooksLikeExplicitWebLookup(loweredMessage) ? "web.search" : "rust.chat.reply",
             AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting => InferDiagnosticsTarget(loweredMessage),
             _ => null
         };
@@ -545,6 +703,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             "rcon_command" => "rust.rcon.command",
             "file_edit" or "file" or "config" => "rust.file.edit",
             "server_management" or "server.management" => "rust.server.management",
+            "web" or "web.search" or "search" => "web.search",
             "chat" or "clarification" => "rust.chat.reply",
             _ => targetRef
         };
@@ -560,6 +719,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
 
         var readVerb =
             lowered.Contains("show", StringComparison.Ordinal) ||
+            lowered.Contains("give", StringComparison.Ordinal) ||
             lowered.Contains("read", StringComparison.Ordinal) ||
             lowered.Contains("view", StringComparison.Ordinal) ||
             lowered.Contains("open", StringComparison.Ordinal) ||

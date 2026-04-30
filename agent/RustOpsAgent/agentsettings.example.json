@@ -134,6 +134,9 @@
     "searchFilter": "rust",
     "referenceIndexDatabasePath": "data/plugin-reference-index.db"
   },
+  "webSearch": {
+    "enabled": true
+  },
   "llm": {
     "enabled": true,
     "provider": "${RUSTOPS_LLM_PROVIDER}",

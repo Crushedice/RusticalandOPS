@@ -16,6 +16,7 @@ internal sealed class AgentConfig
     [JsonPropertyName("autoPull")] public AutoPullSettings AutoPull { get; set; } = new();
     [JsonPropertyName("network")] public NetworkSettings Network { get; set; } = new();
     [JsonPropertyName("pluginUpdates")] public PluginUpdateSettings PluginUpdates { get; set; } = new();
+    [JsonPropertyName("webSearch")] public WebSearchSettings WebSearch { get; set; } = new();
     [JsonPropertyName("commandExecution")] public CommandExecutionSettings CommandExecution { get; set; } = new();
     [JsonPropertyName("cpuAffinity")] public CpuAffinitySettings CpuAffinity { get; set; } = new();
     [JsonPropertyName("consoleMonitor")] public ConsoleMonitorSettings ConsoleMonitor { get; set; } = new();
@@ -140,6 +141,11 @@ internal sealed class PluginUpdateSettings
     [JsonPropertyName("downloadEnabled")] public bool DownloadEnabled { get; set; }
     [JsonPropertyName("stagingPath")] public string StagingPath { get; set; } = "data/plugin-staging";
     [JsonPropertyName("referenceIndexDatabasePath")] public string ReferenceIndexDatabasePath { get; set; } = "data/plugin-reference-index.db";
+}
+
+internal sealed class WebSearchSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
 }
 
 internal sealed class CpuAffinitySettings

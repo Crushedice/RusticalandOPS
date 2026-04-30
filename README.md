@@ -52,7 +52,13 @@ The ASP.NET API remains the main deterministic interface over `rustmgr.sh`. It e
 
 This layer is still functional, but it remains a large inline route surface and still needs broader endpoint test coverage.
 
-### Layer 3: `agent/RustOpsAgent/`
+### Layer 3: `remote-agent/RustOpsRemoteAgent/`
+
+The remote agent is a Debian-installable host module for managing a Rust server on another machine. It runs beside that host's `rustmgr.sh` and exposes authenticated `/servers/{server}/...` endpoints for lifecycle actions, config, logs, command traces, WebRCON queries, and moderation.
+
+The main API remote registry supports agent-backed entries using `agentBaseUrl`, `agentApiKey`, and optional `agentServerName`. Existing RCON-only remote entries still work for command/query operations, while agent-backed entries can be started, stopped, restarted, updated, wiped, and inspected through the normal server endpoints.
+
+### Layer 4: `agent/RustOpsAgent/`
 
 This is the most actively evolving part of the stack.
 
@@ -79,7 +85,7 @@ Registered live tool handlers currently include:
 - `RustChatToolHandler`
 - `RustServerManagementToolHandler`
 
-### Layer 4: `SteamBot/OpsSteamBot/`
+### Layer 5: `SteamBot/OpsSteamBot/`
 
 The Steam bot remains a transport adapter, not a reasoning engine. It forwards chat to inbox files, handles `approve` / `reject` / `feedback` shortcuts, and sends replies from `message-outbox`.
 

@@ -417,31 +417,43 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
             return new WorkflowMemoryContext { Query = query, RetrievalSkipped = true, SkipReason = "memory search disabled", RetrievalOrigin = origin };
         }
 
-        if (_embeddingProvider is null)
-        {
-            LogDebug($"{origin} recall skipped: embedding provider unavailable");
-            return new WorkflowMemoryContext { Query = query, RetrievalSkipped = true, SkipReason = "embedding provider unavailable", RetrievalOrigin = origin };
-        }
-
         if (string.IsNullOrWhiteSpace(query))
         {
             LogDebug($"{origin} recall skipped: empty query");
             return new WorkflowMemoryContext { Query = query, RetrievalSkipped = true, SkipReason = "empty query", RetrievalOrigin = origin };
         }
 
+        float[]? embedding = null;
+        string? embeddingModel = null;
+        if (_embeddingProvider is null)
+        {
+            LogDebug($"{origin} recall using keyword fallback: embedding provider unavailable");
+        }
+        else
+        {
+            try
+            {
+                embedding = await _embeddingProvider.GenerateEmbeddingAsync(MemorySanitizer.Sanitize(query), cancellationToken);
+                embeddingModel = _embeddingProvider.ModelName;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[memory] embedding unavailable for {origin}; using keyword fallback: {ex.Message}");
+            }
+        }
+
         try
         {
-            var embedding = await _embeddingProvider.GenerateEmbeddingAsync(MemorySanitizer.Sanitize(query), cancellationToken);
             var request = new MemorySearchRequest
             {
                 Query = query,
                 QueryEmbedding = embedding,
-                QueryEmbeddingModel = _embeddingProvider.ModelName,
+                QueryEmbeddingModel = embeddingModel,
                 Scope = scope,
                 Types = types?.ToList(),
                 RelatedEntityIds = relatedIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
                 MaxResults = maxResultsOverride ?? _settings.MaxRetrievedMemoriesPerStep,
-                MinSimilarity = minSimilarityOverride ?? _settings.SimilarityThreshold,
+                MinSimilarity = minSimilarityOverride ?? (embedding is null ? Math.Min(_settings.SimilarityThreshold, 0.35) : _settings.SimilarityThreshold),
                 MinConfidence = _settings.MinimumRecallConfidence,
                 IncludeExpired = false
             };
@@ -452,7 +464,8 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
                 await _store.MarkAccessedAsync(result.MemoryRecord.Id, cancellationToken);
             }
 
-            LogDebug($"{origin} recall query=\"{query}\" retrieved={results.Count} top={string.Join(", ", results.Take(3).Select(r => $"{r.MemoryRecord.Type}:{r.FinalScore:F2}"))}");
+            var mode = embedding is null ? "keyword" : "semantic";
+            LogDebug($"{origin} {mode} recall query=\"{query}\" retrieved={results.Count} top={string.Join(", ", results.Take(3).Select(r => $"{r.MemoryRecord.Type}:{r.FinalScore:F2}"))}");
 
             return new WorkflowMemoryContext
             {

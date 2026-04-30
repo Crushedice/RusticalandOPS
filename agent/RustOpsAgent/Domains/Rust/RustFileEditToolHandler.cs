@@ -462,9 +462,9 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
             return new ToolExecutionResult(
                 true,
-                $"Updated plugin config `{pluginConfigName}` on {server}: set `{mutation.Key}` to `{mutation.DisplayValue}`.\n```json\n{prettyUpdated}\n```",
+                $"Updated plugin config `{pluginConfigName}` on {server} at {pluginPath}: set `{mutation.Key}` to `{mutation.DisplayValue}`.\n```json\n{prettyUpdated}\n```",
                 server, true,
-                Payload: prettyUpdated);
+                Payload: new { pluginPath, content = prettyUpdated });
         }
 
         var key = TryExtractConfigLookupKey(context.Message, includeAliases: false);
@@ -475,7 +475,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
                 var renderedValue = RenderJsonValue(valueNode);
                 return new ToolExecutionResult(
                     true,
-                    $"Plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server}: `{resolvedKey}` = `{renderedValue}`.",
+                    $"Plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server} ({pluginPath}): `{resolvedKey}` = `{renderedValue}`.",
                     server, false,
                     Payload: new { key = resolvedKey, value = renderedValue, pluginPath });
             }
@@ -491,7 +491,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             true,
             $"{Path.GetFileNameWithoutExtension(pluginPath)} plugin config ({pluginPath}).\n```json\n{pretty}\n```",
             server, true,
-            Payload: pretty);
+            Payload: new { pluginPath, content = pretty });
     }
 
     // ── Config key/value helpers ───────────────────────────────────────────────

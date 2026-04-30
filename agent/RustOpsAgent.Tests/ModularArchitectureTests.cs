@@ -367,7 +367,7 @@ public class ModularArchitectureTests
             CancellationToken.None);
 
         Assert.NotEmpty(composed.Message);
-        Assert.Equal("template_llm_disabled", composed.Source);
+        Assert.Equal("template_no_payload", composed.Source);
     }
 
     // ── Classifier ─────────────────────────────────────────────────────────────

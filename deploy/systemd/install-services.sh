@@ -9,6 +9,7 @@ SERVICE_GROUP="${SERVICE_GROUP:-rustmgr}"
 SERVICES=(
   rustmgrapi.service
   rustopsagent.service
+  rustops-remote-agent.service
   opssteambot.service
 )
 
@@ -50,6 +51,7 @@ ensure_layout() {
   mkdir -p "$ROOT_DIR/agent/RustOpsAgent/data/chat-inbox"
   mkdir -p "$ROOT_DIR/agent/RustOpsAgent/data/message-outbox"
   mkdir -p "$ROOT_DIR/agent/RustOpsAgent/data/message-outbox-sent"
+  mkdir -p "$ROOT_DIR/remote-agent/RustOpsRemoteAgent"
   chown -R "$SERVICE_USER:$SERVICE_GROUP" "$ROOT_DIR"
   log "ensured runtime layout under $ROOT_DIR"
 }

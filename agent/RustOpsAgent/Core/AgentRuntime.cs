@@ -368,6 +368,20 @@ internal sealed class AgentRuntime
             var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
             var route = await _classifier.ClassifyAsync(item.Message, state, knownServers, cancellationToken);
 
+            if (route.Intent == AdminIntentType.RconCommand && string.IsNullOrWhiteSpace(route.Slots.CommandText))
+            {
+                var extractedCommand = RustRconToolHandler.ExtractCommandFromMessage(item.Message);
+                if (!string.IsNullOrWhiteSpace(extractedCommand))
+                {
+                    route = route with
+                    {
+                        Slots = route.Slots with { CommandText = extractedCommand },
+                        ClassifierSource = route.ClassifierSource + "+rcon-command-extract"
+                    };
+                    Console.WriteLine($"[chat] Extracted RCON command from message: '{extractedCommand}'");
+                }
+            }
+
             // If there's an outstanding clarification and the classifier didn't find a new intent,
             // re-route to the handler that originally asked the question so it can process the answer.
             // BUT: skip this if the message contains explicit intent signals (pull, git, rebuild, etc.)
@@ -386,7 +400,9 @@ internal sealed class AgentRuntime
 
             if (pending is not null &&
                 !hasExplicitNewIntent &&
-                (route.Intent == AdminIntentType.Clarification || route.Intent == AdminIntentType.Chat) &&
+                (route.Intent == AdminIntentType.Clarification ||
+                 route.Intent == AdminIntentType.Chat ||
+                 (!string.IsNullOrWhiteSpace(route.Slots.ServerName) && string.IsNullOrWhiteSpace(route.Slots.CommandText))) &&
                 Enum.TryParse<AdminIntentType>(pending.Intent, true, out var pendingIntent) &&
                 pendingIntent != AdminIntentType.Clarification)
             {
@@ -402,6 +418,7 @@ internal sealed class AgentRuntime
                     TargetRef = route.TargetRef ?? pending.TargetRef,
                     ClassifierSource = route.ClassifierSource + "+pending-clarification-override"
                 };
+                state.PendingClarification = null;
                 Console.WriteLine($"[chat] Overriding intent to {pendingIntent} (pending clarification answer)");
             }
 
@@ -958,6 +975,8 @@ internal sealed class AgentRuntime
         }
 
         var newHighImportanceLines = new List<string>();
+        var newConsoleMemoryCandidates = new List<string>();
+        var uncertainReviewPrompts = new List<(string Key, string Line)>();
 
         if (root.TryGetProperty("entries", out var entriesNode) && entriesNode.ValueKind == JsonValueKind.Array)
         {
@@ -1016,33 +1035,52 @@ internal sealed class AgentRuntime
                 // --- Console error/warning stream ---
                 if (consoleMonitor is not null)
                 {
-                    var category = ClassifyConsoleLine(lowered);
+                    var consoleSignalLine = ExtractConsoleSignalLine(line);
+                    var category = consoleSignalLine is null ? "info" : ClassifyConsoleLine(consoleSignalLine.ToLowerInvariant());
                     if (category is "error" or "warning")
                     {
-                        var key = NormalizeErrorKey(line);
+                        if (IsPurePlayerConnectionNoise(consoleSignalLine!))
+                        {
+                            continue;
+                        }
+
+                        var key = NormalizeErrorKey(consoleSignalLine!);
                         var existing = serverConsole.RecentErrors
                             .FirstOrDefault(e => string.Equals(e.Message, key, StringComparison.OrdinalIgnoreCase));
                         if (existing is not null)
                         {
                             existing.Count++;
                             existing.LastSeenAtUtc = DateTime.UtcNow;
+                            if (string.IsNullOrWhiteSpace(existing.SampleLine) || IsBetterConsoleSample(consoleSignalLine!, existing.SampleLine))
+                            {
+                                existing.SampleLine = TrimSingleLine(consoleSignalLine!, 600);
+                            }
                         }
                         else
                         {
-                            serverConsole.RecentErrors.Add(new ConsoleErrorEntry
+                            existing = new ConsoleErrorEntry
                             {
                                 Message = key,
+                                SampleLine = TrimSingleLine(consoleSignalLine!, 600),
                                 Category = category,
                                 FirstSeenAtUtc = DateTime.UtcNow,
                                 LastSeenAtUtc = DateTime.UtcNow
-                            });
+                            };
+                            serverConsole.RecentErrors.Add(existing);
                         }
                         serverConsole.TotalErrorsIngested++;
                         serverConsole.ErrorCountSinceLastAlert++;
                         consoleChanged = true;
+                        newConsoleMemoryCandidates.Add(consoleSignalLine!);
+                        if (ShouldAskAdminToReviewConsoleLine(consoleSignalLine!, category) && existing.ReviewPromptedAtUtc is null)
+                        {
+                            existing.ReviewPromptedAtUtc = DateTime.UtcNow;
+                            uncertainReviewPrompts.Add((key, consoleSignalLine!));
+                        }
 
                         // Track compile/oxide errors for learning seeding
-                        if (lowered.Contains("oxide") || lowered.Contains("compil") || lowered.Contains("error while"))
+                        var signalLowered = consoleSignalLine!.ToLowerInvariant();
+                        if (signalLowered.Contains("oxide") || signalLowered.Contains("compil") || signalLowered.Contains("error while"))
                         {
                             _compileErrorCounts.TryGetValue(server, out var ceCount);
                             _compileErrorCounts[server] = ceCount + 1;
@@ -1126,17 +1164,20 @@ internal sealed class AgentRuntime
             // Escalate if error count exceeds threshold, unless alerts are muted.
             if (serverConsole.ErrorCountSinceLastAlert >= _config.ConsoleMonitor.ErrorEscalationThreshold)
             {
+                var alertCount = serverConsole.ErrorCountSinceLastAlert;
                 serverConsole.LastAlertAtUtc = DateTime.UtcNow;
                 serverConsole.ErrorCountSinceLastAlert = 0;
                 if (DateTime.UtcNow > _alertMutedUntilUtc)
                 {
-                    Console.WriteLine($"[console] ESCALATE {server}: {serverConsole.ErrorCountSinceLastAlert} errors since last alert.");
+                    Console.WriteLine($"[console] ESCALATE {server}: {alertCount} errors since last alert.");
                     var topErrors = serverConsole.RecentErrors
                         .OrderByDescending(e => e.Count)
+                        .Select(e => new { Entry = e, Line = TryFormatConsoleAlertLine(e) })
+                        .Where(item => !string.IsNullOrWhiteSpace(item.Line))
                         .Take(3)
-                        .Select(e => $"  • {e.Message[..(Math.Min(e.Message.Length, 60))]} ({e.Count}x)")
+                        .Select(item => $"  • {item.Line} ({item.Entry.Count}x)")
                         .ToList();
-                    var alertMsg = $"[{server}] {serverConsole.ErrorCountSinceLastAlert} console errors since last alert." +
+                    var alertMsg = $"[{server}] {alertCount} console errors since last alert." +
                         (topErrors.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topErrors) : string.Empty);
                     BroadcastOutbox(alertMsg, server);
                 }
@@ -1157,6 +1198,11 @@ internal sealed class AgentRuntime
                 .TakeLast(_config.ConsoleMonitor.MaxChatMessages)
                 .ToList();
             _neoCortex.SavePlayerChat(playerChat);
+        }
+
+        if (_config.Memory.WriteEnabled)
+        {
+            await RecordConsoleMonitorCandidatesAsync(server, newConsoleMemoryCandidates, uncertainReviewPrompts);
         }
 
         if (!logChanged)
@@ -1190,7 +1236,10 @@ internal sealed class AgentRuntime
 
     private static string ClassifyConsoleLine(string lowered)
     {
-        if (lowered.Contains("exception") || lowered.Contains("fatal") || lowered.Contains("crash") ||
+        if (IsPurePlayerConnectionNoise(lowered))
+            return "info";
+        if (lowered.Contains("exception") || lowered.Contains("fatal") ||
+            (lowered.Contains("crash") && !lowered.Contains("silent-crashes")) ||
             (lowered.Contains("error") && !lowered.Contains("errorcorrection")))
             return "error";
         if (lowered.Contains("warn"))
@@ -1200,13 +1249,211 @@ internal sealed class AgentRuntime
         return "info";
     }
 
+    private async Task RecordConsoleMonitorCandidatesAsync(
+        string server,
+        IReadOnlyList<string> newConsoleMemoryCandidates,
+        IReadOnlyList<(string Key, string Line)> uncertainReviewPrompts)
+    {
+        foreach (var logLine in newConsoleMemoryCandidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var summary = $"[{server}] console monitor: {TrimSingleLine(logLine, 120)}";
+            var detail = $"Server: {server}\nLog: {logLine}";
+            await _semanticMemory.RecordServerFactAsync(server, summary, detail,
+                new[] { "console-monitor", "log", server.ToLowerInvariant() }, CancellationToken.None);
+        }
+
+        foreach (var (_, logLine) in uncertainReviewPrompts.Take(3))
+        {
+            var prompt =
+                $"[{server}] I noticed a possible console issue but I am not confident it is a real error. " +
+                $"I saved it as pending memory for admin review.\n" +
+                $"Line: {TrimSingleLine(logLine, 500)}\n" +
+                "Reply with `memory pending`, then `memory approve <id>` or `memory reject <id>`.";
+            BroadcastOutbox(prompt, server);
+        }
+    }
+
     private static string NormalizeErrorKey(string line)
     {
         // Strip timestamps and volatile parts to group repeated messages.
         var normalized = System.Text.RegularExpressions.Regex.Replace(line, @"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", "<ts>");
         normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\d{2}:\d{2}:\d{2}", "<time>");
+        normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", "<ip>:<port>");
+        normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\b\d{1,3}(?:\.\d{1,3}){3}\b", "<ip>");
+        normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\b7656\d{13}\b", "<steamid>");
         normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\b\d+\b", "<n>");
-        return normalized.Length > 200 ? normalized[..200] : normalized;
+        return normalized.Length > 240 ? normalized[..240] : normalized;
+    }
+
+    private static string? ExtractConsoleSignalLine(string line)
+    {
+        var lines = line
+            .Replace("\r\n", "\n")
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (lines.Length == 0)
+        {
+            return null;
+        }
+
+        foreach (var candidate in lines)
+        {
+            if (IsPurePlayerConnectionNoise(candidate) || IsMundaneConsoleLine(candidate))
+            {
+                continue;
+            }
+
+            var lowered = candidate.ToLowerInvariant();
+            if (lowered.Contains("exception", StringComparison.Ordinal) ||
+                lowered.Contains("failed to call hook", StringComparison.Ordinal) ||
+                lowered.Contains("failed to send notification", StringComparison.Ordinal) ||
+                lowered.Contains("http error", StringComparison.Ordinal) ||
+                lowered.Contains("curl error", StringComparison.Ordinal) ||
+                lowered.Contains("unable to connect", StringComparison.Ordinal) ||
+                lowered.Contains("connection timed out", StringComparison.Ordinal) ||
+                lowered.Contains("connection reset by peer", StringComparison.Ordinal) ||
+                lowered.Contains("fallback handler could not load library", StringComparison.Ordinal) ||
+                lowered.Contains("response status code does not indicate success", StringComparison.Ordinal) ||
+                lowered.StartsWith("error:", StringComparison.Ordinal) ||
+                lowered.Contains(" error:", StringComparison.Ordinal) ||
+                lowered.Contains("failed:", StringComparison.Ordinal) ||
+                lowered.Contains("fatal", StringComparison.Ordinal) ||
+                (lowered.Contains("crash", StringComparison.Ordinal) && !lowered.Contains("silent-crashes", StringComparison.Ordinal)))
+            {
+                return candidate;
+            }
+        }
+
+        var firstNonNoise = lines.FirstOrDefault(candidate => !IsPurePlayerConnectionNoise(candidate) && !IsMundaneConsoleLine(candidate));
+        if (firstNonNoise is null)
+        {
+            return null;
+        }
+
+        var category = ClassifyConsoleLine(firstNonNoise.ToLowerInvariant());
+        return category is "error" or "warning" ? firstNonNoise : null;
+    }
+
+    private static bool IsMundaneConsoleLine(string line)
+    {
+        var lowered = line.ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(lowered))
+        {
+            return true;
+        }
+
+        if (lowered.StartsWith("mono path[", StringComparison.Ordinal) ||
+            lowered.StartsWith("mono config path", StringComparison.Ordinal) ||
+            lowered.StartsWith("preloaded ", StringComparison.Ordinal) ||
+            lowered.StartsWith("shutdown handler:", StringComparison.Ordinal) ||
+            lowered.StartsWith("command line:", StringComparison.Ordinal) ||
+            lowered.StartsWith("system", StringComparison.Ordinal) ||
+            lowered.StartsWith("cpu", StringComparison.Ordinal) ||
+            lowered.StartsWith("gpu", StringComparison.Ordinal) ||
+            lowered.StartsWith("setup unity update hooks", StringComparison.Ordinal) ||
+            lowered.StartsWith("server config loaded", StringComparison.Ordinal) ||
+            lowered.StartsWith("running server/", StringComparison.Ordinal) ||
+            lowered.StartsWith("manifest ", StringComparison.Ordinal) ||
+            lowered.StartsWith("loading shared/", StringComparison.Ordinal) ||
+            lowered.StartsWith("saved ", StringComparison.Ordinal) ||
+            lowered.StartsWith("saving complete", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        var mundaneFragments = new[]
+        {
+            "[empty low fps]",
+            "was killed by",
+            "has spawned",
+            "calling 'onserversave'",
+            "calling 'onplayerconnected'",
+            "server is empty",
+            "server is no longer empty",
+            "setting fps limit",
+            "checking for new steam item definitions",
+            "unloaded plugin ",
+            "loaded plugin ",
+            "[better chat]"
+        };
+
+        if (mundaneFragments.Any(fragment => lowered.Contains(fragment, StringComparison.Ordinal)))
+        {
+            return true;
+        }
+
+        return System.Text.RegularExpressions.Regex.IsMatch(line, @"^\d{1,3}(?:\.\d{1,3}){3}:\d+/\d+/.+\sdisconnecting:\s(?:disconnect|closing)$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    private static bool IsPurePlayerConnectionNoise(string line)
+    {
+        var lowered = line.ToLowerInvariant();
+        var looksLikePlayerConnection =
+            lowered.Contains("joined from ip", StringComparison.Ordinal) ||
+            lowered.Contains("networkid", StringComparison.Ordinal) ||
+            System.Text.RegularExpressions.Regex.IsMatch(line, @"\bjoined\s+\[(windows|linux|osx|mac|unknown)/", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        if (!looksLikePlayerConnection)
+        {
+            return false;
+        }
+
+        return !HasHighConfidenceConsoleErrorSignal(lowered);
+    }
+
+    private static bool HasHighConfidenceConsoleErrorSignal(string lowered) =>
+        lowered.Contains("exception", StringComparison.Ordinal) ||
+        lowered.Contains("fatal", StringComparison.Ordinal) ||
+        lowered.Contains("crash", StringComparison.Ordinal) ||
+        lowered.Contains("stack trace", StringComparison.Ordinal);
+
+    private static bool ShouldAskAdminToReviewConsoleLine(string line, string category)
+    {
+        var lowered = line.ToLowerInvariant();
+        if (IsPurePlayerConnectionNoise(line))
+        {
+            return false;
+        }
+
+        if (HasHighConfidenceConsoleErrorSignal(lowered))
+        {
+            return false;
+        }
+
+        return category == "warning" ||
+               lowered.Contains("unable to connect", StringComparison.Ordinal) ||
+               lowered.Contains("access denied", StringComparison.Ordinal) ||
+               lowered.Contains("error:", StringComparison.Ordinal) ||
+               lowered.Contains("failed:", StringComparison.Ordinal) ||
+               lowered.Contains("disconnect", StringComparison.Ordinal);
+    }
+
+    private static bool IsBetterConsoleSample(string candidate, string current)
+    {
+        var candidateLowered = candidate.ToLowerInvariant();
+        var currentLowered = current.ToLowerInvariant();
+        if (HasHighConfidenceConsoleErrorSignal(candidateLowered) && !HasHighConfidenceConsoleErrorSignal(currentLowered))
+        {
+            return true;
+        }
+
+        return candidate.Length > current.Length && candidate.Length <= 600;
+    }
+
+    private static string FormatConsoleAlertLine(ConsoleErrorEntry entry)
+    {
+        return TryFormatConsoleAlertLine(entry) ?? TrimSingleLine(entry.Message, 600);
+    }
+
+    private static string? TryFormatConsoleAlertLine(ConsoleErrorEntry entry)
+    {
+        var sample = string.IsNullOrWhiteSpace(entry.SampleLine) ? entry.Message : entry.SampleLine;
+        if (!string.IsNullOrWhiteSpace(entry.SampleLine))
+        {
+            return TrimSingleLine(sample, 600);
+        }
+
+        var signal = ExtractConsoleSignalLine(sample);
+        return string.IsNullOrWhiteSpace(signal) ? null : TrimSingleLine(signal, 600);
     }
 
     private async Task CheckPluginUpdatesAsync(CancellationToken cancellationToken)
@@ -2158,8 +2405,8 @@ Repeated failure memory clusters:
     {
         state.RecentMessages.Add(new ConversationMessage { Role = "user", Text = userMessage, AtUtc = DateTime.UtcNow });
         state.RecentMessages.Add(new ConversationMessage { Role = "assistant", Text = agentReply, AtUtc = DateTime.UtcNow });
-        if (state.RecentMessages.Count > 12)
-            state.RecentMessages = state.RecentMessages.TakeLast(12).ToList();
+        if (state.RecentMessages.Count > 20)
+            state.RecentMessages = state.RecentMessages.TakeLast(20).ToList();
     }
 
     private void UpdateSelectionState(ConversationSelectionState state, string message, AdminIntentRoute route, ToolExecutionResult result)
@@ -2190,7 +2437,17 @@ Repeated failure memory clusters:
                         : ServerScopeKind.Subset;
         }
 
-        state.LastCommandText = route.Slots.CommandText ?? state.LastCommandText;
+        var commandText = route.Slots.CommandText;
+        if (string.IsNullOrWhiteSpace(commandText) && route.Intent == AdminIntentType.RconCommand)
+        {
+            commandText = RustRconToolHandler.ExtractCommandFromMessage(message);
+        }
+
+        if (!string.IsNullOrWhiteSpace(commandText))
+        {
+            state.LastCommandText = commandText;
+        }
+
         state.LastTimeRange = route.Slots.TimeRange ?? state.LastTimeRange;
         state.LastUserMessageSummary = TrimSingleLine(message, 180);
         if (string.Equals(result.ErrorCode, "clarification_required", StringComparison.OrdinalIgnoreCase))

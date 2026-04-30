@@ -7,7 +7,11 @@ namespace rustmgrapi.Api.Services;
 internal sealed class PluginService
 {
     private readonly RustManagerService _rust;
-    private readonly HttpClient _http = new();
+    private readonly HttpClient _http = new()
+    {
+        Timeout = TimeSpan.FromSeconds(15),
+        DefaultRequestHeaders = { { "User-Agent", "RustOpsAgent/1.0" } }
+    };
 
     public PluginService(RustManagerService rust)
     {
@@ -121,12 +125,32 @@ internal sealed class PluginService
             }
 
             var first = data[0];
-            var latest = first.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+            var resultName = first.TryGetProperty("name", out var nameNode) ? nameNode.GetString() : null;
+            var resultTitle = first.TryGetProperty("title", out var titleNode) ? titleNode.GetString() : null;
+            var isMatch = string.Equals(resultName, plugin.Name, StringComparison.OrdinalIgnoreCase)
+                       || string.Equals(resultTitle, plugin.Name, StringComparison.OrdinalIgnoreCase);
+            if (!isMatch)
+            {
+                updates.Add(new { plugin = plugin.Name, state = "not_found", reason = "umod name mismatch" });
+                continue;
+            }
+
+            var latest = first.TryGetProperty("latest_release_version", out var latestNode)
+                ? latestNode.GetString()
+                : first.TryGetProperty("latest_release_version_formatted", out var latestFNode)
+                    ? latestFNode.GetString()
+                    : null;
             var current = plugin.Version;
             var needsUpdate = !string.IsNullOrWhiteSpace(latest) && !string.Equals(latest, current, StringComparison.OrdinalIgnoreCase);
 
-            var downloadUrl = needsUpdate && first.TryGetProperty("download_url", out var dlNode)
-                ? dlNode.GetString() : null;
+            // uMod search returns a page slug in `url`, not a direct download_url.
+            var pluginSlug = first.TryGetProperty("url", out var urlNode) ? urlNode.GetString()?.TrimStart('/') : null;
+            var fallbackSlug = plugin.Name is null
+                ? null
+                : $"plugins/{Uri.EscapeDataString(plugin.Name.ToLowerInvariant())}";
+            var downloadUrl = needsUpdate
+                ? $"https://umod.org/{(string.IsNullOrWhiteSpace(pluginSlug) ? fallbackSlug : pluginSlug)}/download?id={latest}"
+                : null;
 
             updates.Add(new
             {

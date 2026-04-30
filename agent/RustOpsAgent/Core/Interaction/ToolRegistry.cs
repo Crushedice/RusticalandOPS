@@ -23,6 +23,16 @@ internal sealed class ToolRegistry
     {
         var route = context.Route;
 
+        if (route.Intent == AdminIntentType.Chat &&
+            _handlers.TryGetValue(
+                string.Equals(route.TargetRef, "web.search", StringComparison.OrdinalIgnoreCase)
+                    ? "web.search"
+                    : "rust.chat.reply",
+                out var chatHandler))
+        {
+            return chatHandler;
+        }
+
         // When the LLM provides a targetRef, look it up across ALL handlers first.
         // This handles the case where the LLM classifies intent as server_control but
         // targetRef as rust.rcon.command — the targetRef wins as the stronger signal.

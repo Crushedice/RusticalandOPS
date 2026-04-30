@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Infrastructure;
@@ -133,7 +134,7 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
 
             var similarity = queryEmbedding is { Length: > 0 }
                 ? Similarity(queryEmbedding, candidate.Embedding)
-                : 0.5;
+                : KeywordSimilarity(request.Query, candidate);
 
             if (similarity < request.MinSimilarity)
             {
@@ -654,6 +655,21 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
 
     private static string BuildMatchReason(MemorySearchRequest request, MemoryRecord record, double similarity, double scopeBoost, double typeBoost)
     {
+        if (request.QueryEmbedding is not { Length: > 0 })
+        {
+            if (scopeBoost > 0 && request.Scope is not null)
+            {
+                return $"keyword+scope:{request.Scope}";
+            }
+
+            if (typeBoost > 0)
+            {
+                return $"keyword+type:{record.Type}";
+            }
+
+            return similarity >= 0.85 ? "strong_keyword_match" : "keyword_match";
+        }
+
         if (scopeBoost > 0 && request.Scope is not null)
         {
             return $"semantic+scope:{request.Scope}";
@@ -666,6 +682,42 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
 
         return similarity >= 0.85 ? "strong_semantic_match" : "semantic_match";
     }
+
+    private static double KeywordSimilarity(string query, MemoryRecord record)
+    {
+        var tokens = Tokenize(query);
+        if (tokens.Count == 0)
+        {
+            return 0.0;
+        }
+
+        var haystack = string.Join(' ', new[]
+        {
+            record.Summary,
+            record.Text,
+            record.Title,
+            record.Category,
+            string.Join(' ', record.Tags),
+            string.Join(' ', record.RelatedEntityIds)
+        }).ToLowerInvariant();
+
+        var matched = tokens.Count(token => haystack.Contains(token, StringComparison.OrdinalIgnoreCase));
+        if (matched == 0)
+        {
+            return 0.0;
+        }
+
+        var coverage = matched / (double)tokens.Count;
+        var phraseBoost = haystack.Contains(query.Trim(), StringComparison.OrdinalIgnoreCase) ? 0.2 : 0.0;
+        return Math.Clamp(coverage + phraseBoost, 0.0, 1.0);
+    }
+
+    private static List<string> Tokenize(string query) =>
+        Regex.Matches(query.ToLowerInvariant(), @"[a-z0-9_.-]{3,}")
+            .Select(match => match.Value)
+            .Where(token => token is not "the" and not "and" and not "for" and not "with" and not "from" and not "what" and not "how")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
     private async Task<int> ScalarAsync(SqliteConnection connection, string sql, CancellationToken cancellationToken, params (string Name, object Value)[] parameters)
     {

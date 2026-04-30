@@ -475,28 +475,58 @@ internal sealed class RustChatToolHandler : IToolHandler
             lowered.Contains("convar", StringComparison.Ordinal) ||
             lowered.Contains("server variable", StringComparison.Ordinal) ||
             lowered.Contains("variables", StringComparison.Ordinal);
+        var looksLikeCommandQuestion =
+            lowered.Contains("server command", StringComparison.Ordinal) ||
+            lowered.Contains("server commands", StringComparison.Ordinal);
 
-        if (!looksLikeConvarQuestion)
+        if (!looksLikeConvarQuestion && !looksLikeCommandQuestion)
         {
             return null;
         }
 
         var snapshot = _knowledge.GetSnapshot();
-        var matches = _knowledge.SearchVariables(context.Message, 10);
-        if (matches.Count == 0)
+        var variableMatches = looksLikeConvarQuestion
+            ? _knowledge.SearchVariables(context.Message, 10)
+            : Array.Empty<ServerVariableDefinition>();
+        var commandMatches = looksLikeCommandQuestion
+            ? _knowledge.SearchCommands(context.Message, 10)
+            : Array.Empty<ServerCommandDefinition>();
+
+        if (variableMatches.Count == 0 && commandMatches.Count == 0)
         {
             return new ToolExecutionResult(
                 true,
-                $"I couldn't find matching server variables in the local catalog. Catalog file: `{snapshot.VariablesPath ?? "not found"}`.",
+                $"I couldn't find matching server catalog entries. Variables: `{snapshot.VariablesPath ?? "not found"}`, commands: `{snapshot.CommandsPath ?? "not found"}`.",
                 ErrorCode: "authoritative_catalog");
         }
 
-        var lines = matches.Select(FormatVariableLine);
-        var message = "From the local server variable catalog:\n" + string.Join('\n', lines);
+        var lines = new List<string>();
+        if (variableMatches.Count > 0)
+        {
+            lines.Add("Matching convars:");
+            lines.AddRange(variableMatches.Select(FormatVariableLine));
+        }
+
+        if (commandMatches.Count > 0)
+        {
+            if (lines.Count > 0)
+                lines.Add(string.Empty);
+            lines.Add("Matching server commands:");
+            lines.AddRange(commandMatches.Select(FormatCommandLine));
+        }
+
+        var message = "From the local server catalog:\n" + string.Join('\n', lines);
         return new ToolExecutionResult(
             true,
             message,
-            Payload: new { source = "server-variable-catalog", variablesPath = snapshot.VariablesPath, count = matches.Count },
+            Payload: new
+            {
+                source = "server-catalog",
+                variablesPath = snapshot.VariablesPath,
+                commandsPath = snapshot.CommandsPath,
+                variables = variableMatches.Count,
+                commands = commandMatches.Count
+            },
             ErrorCode: "authoritative_catalog");
     }
 
@@ -570,6 +600,13 @@ internal sealed class RustChatToolHandler : IToolHandler
         var typeLabel = string.IsNullOrWhiteSpace(variable.DefaultType) ? string.Empty : $", {variable.DefaultType}";
         var defaultValue = string.IsNullOrWhiteSpace(variable.DefaultValue) ? "unknown" : variable.DefaultValue;
         return $"- `{variable.Name}` - {description} (default `{defaultValue}`{typeLabel}; {generated})";
+    }
+
+    private static string FormatCommandLine(ServerCommandDefinition command)
+    {
+        var description = string.IsNullOrWhiteSpace(command.Description) ? "No description in catalog." : command.Description;
+        var risk = string.IsNullOrWhiteSpace(command.RiskLevel) ? string.Empty : $"; risk `{command.RiskLevel}`";
+        return $"- `{command.Name}` - {description}{risk}";
     }
 
     private static string BuildVariableMemoryText(ServerVariableDefinition variable) =>

@@ -132,6 +132,30 @@ internal sealed class ServerKnowledgeCatalog
             .ToList();
     }
 
+    public IReadOnlyList<ServerCommandDefinition> SearchCommands(string query, int maxResults = 8)
+    {
+        if (string.IsNullOrWhiteSpace(query) || maxResults <= 0)
+            return Array.Empty<ServerCommandDefinition>();
+
+        var terms = ExtractSearchTerms(query);
+        if (terms.Count == 0)
+            return Array.Empty<ServerCommandDefinition>();
+
+        var snapshot = GetSnapshot();
+        return snapshot.Commands.Values
+            .Select(command => new
+            {
+                Command = command,
+                Score = ScoreCommand(command, terms)
+            })
+            .Where(item => item.Score > 0)
+            .OrderByDescending(item => item.Score)
+            .ThenBy(item => item.Command.Name, StringComparer.OrdinalIgnoreCase)
+            .Take(maxResults)
+            .Select(item => item.Command)
+            .ToList();
+    }
+
     private static ServerKnowledgeSnapshot LoadSnapshot(string? variablesPath, string? commandsPath)
     {
         var variables = new Dictionary<string, ServerVariableDefinition>(StringComparer.OrdinalIgnoreCase);
@@ -422,6 +446,34 @@ internal sealed class ServerKnowledgeCatalog
 
             if (description.Contains(term, StringComparison.OrdinalIgnoreCase))
                 score += 8;
+        }
+
+        return score;
+    }
+
+    private static int ScoreCommand(ServerCommandDefinition command, IReadOnlyList<string> terms)
+    {
+        var name = command.Name.ToLowerInvariant();
+        var category = name.Split('.', 2)[0];
+        var description = command.Description?.ToLowerInvariant() ?? string.Empty;
+        var tags = command.Tags is null ? string.Empty : string.Join(" ", command.Tags).ToLowerInvariant();
+        var score = 0;
+
+        foreach (var term in terms)
+        {
+            if (name.Equals(term, StringComparison.OrdinalIgnoreCase))
+                score += 100;
+            else if (name.EndsWith("." + term, StringComparison.OrdinalIgnoreCase))
+                score += 60;
+            else if (name.Contains(term, StringComparison.OrdinalIgnoreCase))
+                score += 40;
+
+            if (category.Equals(term, StringComparison.OrdinalIgnoreCase))
+                score += 12;
+            if (description.Contains(term, StringComparison.OrdinalIgnoreCase))
+                score += 8;
+            if (tags.Contains(term, StringComparison.OrdinalIgnoreCase))
+                score += 6;
         }
 
         return score;

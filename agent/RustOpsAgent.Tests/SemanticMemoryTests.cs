@@ -494,6 +494,51 @@ public class SemanticMemoryTests
     }
 
     [Fact]
+    public async Task SemanticMemory_Recall_Uses_Keyword_Fallback_When_EmbeddingProvider_Is_Null()
+    {
+        var root = TempRoot();
+        var settings = TestMemorySettings(Path.Combine(root, "memory.db"));
+        var store = new SqliteMemoryStore(settings.DatabasePath, settings);
+        var record = NewRecord("Vanish plugin config path", Array.Empty<float>(), MemoryRecordType.PluginSummary, MemoryScope.Project, tags: new[] { "vanish", "plugin" });
+        record.Confidence = 0.9;
+        record.Normalize();
+        await store.UpsertAsync(record, CancellationToken.None);
+        var service = new SemanticMemoryService(settings, store, embeddingProvider: null, Path.Combine(root, "legacy-state.json"), Path.Combine(root, "NeoCortex"));
+
+        var context = await service.RecallForPlanningAsync(
+            "vanish plugin",
+            new ConversationSelectionState { AdminId = "admin" },
+            Array.Empty<string>(),
+            CancellationToken.None);
+
+        Assert.True(context.HasResults);
+        Assert.Contains(context.Results, result => result.MemoryRecord.Summary.Contains("Vanish", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains("keyword", context.Results[0].MatchReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SemanticMemory_Recall_Uses_Keyword_Fallback_When_EmbeddingProvider_Throws()
+    {
+        var root = TempRoot();
+        var settings = TestMemorySettings(Path.Combine(root, "memory.db"));
+        var store = new SqliteMemoryStore(settings.DatabasePath, settings);
+        var record = NewRecord("Oxide reload procedure", Array.Empty<float>(), MemoryRecordType.Procedure, MemoryScope.Project, tags: new[] { "oxide", "reload" });
+        record.Confidence = 0.9;
+        record.Normalize();
+        await store.UpsertAsync(record, CancellationToken.None);
+        var service = new SemanticMemoryService(settings, store, new ThrowingEmbeddingProvider(), Path.Combine(root, "legacy-state.json"), Path.Combine(root, "NeoCortex"));
+
+        var context = await service.RecallForPlanningAsync(
+            "oxide reload",
+            new ConversationSelectionState { AdminId = "admin" },
+            Array.Empty<string>(),
+            CancellationToken.None);
+
+        Assert.True(context.HasResults);
+        Assert.Contains(context.Results, result => result.MemoryRecord.Summary.Contains("Oxide reload", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public async Task RustChatToolHandler_Routes_Memory_Commands()
     {
         var service = new CommandMemoryService();
@@ -560,6 +605,63 @@ public class SemanticMemoryTests
         var reply = ReadOnlyOutboxMessage(harness.Config.Outbox.MessageOutboxPath);
 
         Assert.Equal("MEMORY-SEEN", reply);
+    }
+
+    [Fact]
+    public async Task ResponseComposer_Includes_Guardrails_History_And_Late_Memory()
+    {
+        string capturedPrompt = string.Empty;
+        var kernel = BuildKernel(prompt =>
+        {
+            capturedPrompt = prompt;
+            return "ok";
+        });
+        var composer = new ResponseComposer(kernel, new LlmSettings { Enabled = true, UseChatSystemPrompt = false });
+        var state = new ConversationSelectionState { AdminId = "admin" };
+        for (var i = 0; i < 6; i++)
+        {
+            state.RecentMessages.Add(new ConversationMessage { Role = "user", Text = $"admin-{i}" });
+            state.RecentMessages.Add(new ConversationMessage { Role = "assistant", Text = $"ops-{i}" });
+        }
+
+        var memoryContext = new WorkflowMemoryContext
+        {
+            Results = new List<MemorySearchResult> { NewSearchResult("Known Vanish config path") },
+            CompactContext = "Known Vanish config path"
+        };
+        var route = new AdminIntentRoute(AdminIntentType.Chat, new AdminIntentSlots(null, null, null, null, null), 0.9, false, null, "rust.chat.reply", memoryContext);
+        var context = new ToolExecutionContext("admin", "show vanish", route, state, DateTime.UtcNow, memoryContext, null);
+
+        await composer.ComposeAsync(
+            context,
+            new ToolExecutionResult(true, "Found data.", Payload: new { path = "/srv/rust/modded/oxide/config/Vanish.json" }),
+            CancellationToken.None);
+
+        Assert.Contains("CRITICAL RULES - NEVER VIOLATE", capturedPrompt);
+        Assert.Contains("Oxide/uMod plugin configs are ALWAYS JSON, never YAML", capturedPrompt);
+        Assert.DoesNotContain("admin-0", capturedPrompt);
+        Assert.Contains("admin-1", capturedPrompt);
+        Assert.Contains("ops-5", capturedPrompt);
+        Assert.True(capturedPrompt.IndexOf("Operational context:", StringComparison.Ordinal) < capturedPrompt.IndexOf("Planning memory:", StringComparison.Ordinal));
+        Assert.Contains("DO NOT use future tense", capturedPrompt);
+    }
+
+    [Fact]
+    public async Task ResponseComposer_Bypasses_Llm_On_Success_With_No_Payload()
+    {
+        var kernel = BuildKernel(_ => "invented yaml");
+        var composer = new ResponseComposer(kernel, new LlmSettings { Enabled = true, UseChatSystemPrompt = false });
+        var route = new AdminIntentRoute(AdminIntentType.Chat, new AdminIntentSlots(null, null, null, null, null), 0.9, false, null, "rust.chat.reply");
+        var context = new ToolExecutionContext("admin", "show config", route, new ConversationSelectionState(), DateTime.UtcNow);
+
+        var composed = await composer.ComposeAsync(
+            context,
+            new ToolExecutionResult(true, "No config data was returned."),
+            CancellationToken.None);
+
+        Assert.Equal("No config data was returned.", composed.Message);
+        Assert.Equal("template_no_payload", composed.Source);
+        Assert.False(composed.LlmAttempted);
     }
 
     [Fact]
@@ -667,6 +769,74 @@ public class SemanticMemoryTests
         Assert.Equal(MemoryRecordType.ToolObservation, pending.Type);
         Assert.Equal(MemoryApprovalState.Pending, pending.ApprovalState);
         Assert.True(pending.Confidence < 0.82);
+    }
+
+    [Fact]
+    public void ConsoleMonitor_Classifies_Player_Join_As_Info_Noise()
+    {
+        var classify = typeof(AgentRuntime).GetMethod("ClassifyConsoleLine", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(classify);
+
+        var line = "80.138.130.74:62953/76561198778952007/Ernesto Che Guevara joined [windows/76561198778952007]";
+        var category = (string)classify!.Invoke(null, new object[] { line.ToLowerInvariant() })!;
+
+        Assert.Equal("info", category);
+    }
+
+    [Fact]
+    public void ConsoleMonitor_Alert_Line_Uses_Full_Sample_Instead_Of_Normalized_Key()
+    {
+        var formatter = typeof(AgentRuntime).GetMethod("FormatConsoleAlertLine", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(formatter);
+
+        var entry = new ConsoleErrorEntry
+        {
+            Message = "[DiscordExtension] [Error]: Rest Request Exception (Web Erro",
+            SampleLine = "[DiscordExtension] [Error]: Rest Request Exception (Web Error: ConnectFailure) while posting Discord webhook for player Ernesto Che Guevara joined [windows/76561198778952007]",
+            Count = 23
+        };
+
+        var alertLine = (string)formatter!.Invoke(null, new object[] { entry })!;
+
+        Assert.Contains("ConnectFailure", alertLine);
+        Assert.Contains("Discord webhook", alertLine);
+        Assert.False(alertLine.EndsWith("Web Erro", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ConsoleMonitor_Extracts_Failure_Signal_From_Player_Context_Batch()
+    {
+        var extractor = typeof(AgentRuntime).GetMethod("ExtractConsoleSignalLine", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(extractor);
+
+        var batch = """
+        1.2.3.4:63828/76561199114790042/Ernesto Che Guevara joined [windows/76561199114790042]
+        Ernesto Che Guevara[76561199114790042] has spawned
+        Failed to send notification: InternalServerError
+        """;
+
+        var signal = (string?)extractor!.Invoke(null, new object[] { batch });
+
+        Assert.Equal("Failed to send notification: InternalServerError", signal);
+    }
+
+    [Fact]
+    public void ConsoleMonitor_Ignores_Startup_Batch_With_Silent_Crashes_Flag()
+    {
+        var extractor = typeof(AgentRuntime).GetMethod("ExtractConsoleSignalLine", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(extractor);
+
+        var batch = """
+        Mono path[0] = '/srv/rust/sandbox/RustDedicated_Data/Managed'
+        Mono config path = '/srv/rust/sandbox/RustDedicated_Data/MonoBleedingEdge/etc'
+        Command Line: "./RustDedicated" "-batchmode" "-nographics" "-silent-crashes" "+server.hostname" "Rusticaland Sandbox"
+        Setup unity update hooks
+        Server Config Loaded
+        """;
+
+        var signal = (string?)extractor!.Invoke(null, new object[] { batch });
+
+        Assert.Null(signal);
     }
 
     [Fact]
@@ -893,6 +1063,16 @@ public class SemanticMemoryTests
         return record;
     }
 
+    private static MemorySearchResult NewSearchResult(string summary) => new()
+    {
+        MemoryRecord = NewRecord(summary, new[] { 1f, 0f, 0f, 0f }),
+        SimilarityScore = 0.9,
+        RecencyScore = 0.9,
+        ImportanceScore = 0.9,
+        FinalScore = 0.9,
+        MatchReason = "semantic_match"
+    };
+
     private static Kernel BuildKernel(Func<string, string> responder)
     {
         var builder = Kernel.CreateBuilder();
@@ -1028,7 +1208,7 @@ public class SemanticMemoryTests
         public IReadOnlyCollection<AdminIntentType> EligibleIntents => new[] { AdminIntentType.StatusCheck };
 
         public Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken) =>
-            Task.FromResult(new ToolExecutionResult(true, _message, context.Route.Slots.ServerName));
+            Task.FromResult(new ToolExecutionResult(true, _message, context.Route.Slots.ServerName, Payload: new { message = _message }));
     }
 
     private sealed class StaticRconHandler : IToolHandler

@@ -161,6 +161,60 @@ public class CatalogAndConfigTests
     }
 
     [Fact]
+    public async Task Classifier_Does_Not_Require_Server_For_Convar_Catalog_Topic()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var route = await classifier.ClassifyAsync(
+            "what convars are there for stability?",
+            state,
+            new[] { "monthly", "weekly" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.Chat, route.Intent);
+        Assert.Equal("rust.chat.reply", route.TargetRef);
+        Assert.False(route.NeedsClarification);
+        Assert.Null(route.Slots.ServerName);
+    }
+
+    [Fact]
+    public async Task Classifier_Does_Not_Require_Server_For_Convar_Explanation()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var route = await classifier.ClassifyAsync(
+            "what does ai.move do?",
+            state,
+            new[] { "monthly", "weekly" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.RconCommand, route.Intent);
+        Assert.Equal("rust.rcon.command", route.TargetRef);
+        Assert.False(route.NeedsClarification);
+        Assert.Null(route.Slots.ServerName);
+    }
+
+    [Fact]
+    public async Task Classifier_Does_Not_Require_Server_For_Server_Command_Catalog_Topic()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var route = await classifier.ClassifyAsync(
+            "what server commands are there for stability?",
+            state,
+            new[] { "monthly", "weekly" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.Chat, route.Intent);
+        Assert.Equal("rust.chat.reply", route.TargetRef);
+        Assert.False(route.NeedsClarification);
+        Assert.Null(route.Slots.ServerName);
+    }
+
+    [Fact]
     public async Task Classifier_Routes_Worldsize_Value_Query_To_FileEdit()
     {
         var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
@@ -191,6 +245,61 @@ public class CatalogAndConfigTests
 
         Assert.Equal(AdminIntentType.Chat, route.Intent);
         Assert.Equal("rust.chat.reply", route.TargetRef);
+    }
+
+    [Fact]
+    public async Task Classifier_Routes_Plugin_Config_Read_To_FileEdit()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var route = await classifier.ClassifyAsync(
+            "give me the config for the Vanish plugin from modded server",
+            state,
+            new[] { "modded", "monthly" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.FileEdit, route.Intent);
+        Assert.Equal("rust.file.edit", route.TargetRef);
+        Assert.Equal("modded", route.Slots.ServerName, StringComparer.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("which plugins use the /kit permission")]
+    [InlineData("how do I reload oxide")]
+    [InlineData("what does vanish do")]
+    public async Task Classifier_Does_Not_Require_Server_For_Serverless_Reference_Questions(string message)
+    {
+        var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
+        var state = new ConversationSelectionState { AdminId = "admin", LastServerName = "monthly" };
+
+        var route = await classifier.ClassifyAsync(
+            message,
+            state,
+            new[] { "monthly", "weekly" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.Chat, route.Intent);
+        Assert.Equal("rust.chat.reply", route.TargetRef);
+        Assert.False(route.NeedsClarification);
+        Assert.Null(route.Slots.ServerName);
+    }
+
+    [Fact]
+    public async Task Classifier_Routes_Explicit_Docs_Request_To_WebSearch()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null, settings: new LlmSettings { Enabled = false }, neoCortex: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var route = await classifier.ClassifyAsync(
+            "docs for Vanish plugin",
+            state,
+            new[] { "monthly", "weekly" },
+            CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.Chat, route.Intent);
+        Assert.Equal("web.search", route.TargetRef);
+        Assert.False(route.NeedsClarification);
     }
 
     [Fact]
@@ -231,5 +340,27 @@ public class CatalogAndConfigTests
             matches.Take(2),
             first => Assert.Equal("server.pve", first.Name),
             second => Assert.Equal("server.pvebulletdamagemultiplier", second.Name));
+    }
+
+    [Fact]
+    public void Catalog_SearchCommands_Finds_Commands_From_Broad_Query()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "rustops-catalog-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var variablesPath = Path.Combine(root, "ServerVariables.agent-readable.jsonl");
+        var commandsPath = Path.Combine(root, "ServerCommands.agent-readable.jsonl");
+        File.WriteAllText(variablesPath, string.Empty);
+        File.WriteAllLines(commandsPath, new[]
+        {
+            """{"command":"global.status","generated_marker":true,"description":"Prints connected players, entity counts, uptime, FPS, and server identity","risk":"safe","tags":["status","diagnostic"]}""",
+            """{"command":"server.save","generated_marker":true,"description":"Saves the current world state to disk","risk":"safe","tags":["save","world"]}"""
+        });
+        var catalog = new ServerKnowledgeCatalog(variablesPath, commandsPath);
+
+        var matches = catalog.SearchCommands("what server commands show status", 5);
+
+        Assert.Collection(
+            matches.Take(1),
+            first => Assert.Equal("global.status", first.Name));
     }
 }

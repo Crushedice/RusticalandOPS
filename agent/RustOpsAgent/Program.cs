@@ -55,6 +55,15 @@ Console.WriteLine($"[agent] Config loaded. API={config.Api.BaseUrl} LLM={config.
 Console.WriteLine($"[agent] Paths: state={config.Memory.StatePath}");
 Console.WriteLine($"[agent] Paths: chat-inbox={config.Inbox.ChatInboxPath}");
 Console.WriteLine($"[agent] Paths: outbox={config.Outbox.MessageOutboxPath}");
+if (!config.Memory.WriteEnabled)
+{
+    Console.WriteLine("[memory] WARNING: Memory writes are disabled (memory.writeEnabled=false). Agent will not learn from interactions.");
+}
+
+if (config.Memory.MaxWritesPerWorkflowStep <= 0)
+{
+    Console.WriteLine("[memory] WARNING: Memory writes are disabled (memory.maxWritesPerWorkflowStep<=0). Agent will not learn from interactions.");
+}
 
 var neoCortex = new NeoCortexStore(config.Memory.NeoCortexRoot, config.Memory.StatePath);
 neoCortex.EnsureMigrated();
@@ -172,6 +181,11 @@ var handlers = new List<IToolHandler>
     new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer),
     new RustServerManagementToolHandler(apiClient)
 };
+
+if (config.WebSearch.Enabled)
+{
+    handlers.Add(new WebSearchToolHandler());
+}
 
 var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry, semanticMemory);

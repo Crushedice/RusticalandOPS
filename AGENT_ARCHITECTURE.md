@@ -20,7 +20,18 @@ It exposes safe, structured endpoints for:
 - managed scheduled tasks
 - Oxide config/plugin validation
 
-3. `agent/` or future agent service
+3. `remote-agent/`
+The Debian-side remote host control service.
+Install `remote-agent/RustOpsRemoteAgent` on a different Rust host when the main API should manage that host as if it were local.
+It exposes authenticated endpoints for:
+- server lifecycle through the host's local `rustmgr.sh`
+- config read/write/validation
+- log, command trace, and event reads
+- WebRCON command/query/moderation
+
+The main API stores agent-backed remote entries in `remote-servers.json` with `agentBaseUrl`, `agentApiKey`, and optional `agentServerName`, then proxies normal `/servers/{server}/...` calls to the remote agent.
+
+4. `agent/` or future agent service
 The reasoning layer.
 This service should:
 - call a local LLM runtime such as LM Studio via OpenAI-compatible endpoints
@@ -28,7 +39,7 @@ This service should:
 - keep policy boundaries for destructive actions
 - choose the proper interface adapter
 
-4. Interface adapters
+5. Interface adapters
 - Steam chat bot
 - web dashboard
 - optional CLI

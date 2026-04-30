@@ -11,6 +11,7 @@ These unit files assume a flat published deployment on the Linux host.
 - `/opt/rust-manager/api/rustmgrapi.dll`
 - `/opt/rust-manager/agent/RustOpsAgent/RustOpsAgent.dll`
 - `/opt/rust-manager/agent/RustOpsAgent/agentsettings.json`
+- `/opt/rust-manager/remote-agent/RustOpsRemoteAgent/RustOpsRemoteAgent.dll`
 - `/opt/rust-manager/SteamBot/OpsSteamBot/OpsSteamBot.dll`
 - `/opt/rust-manager/SteamBot/OpsSteamBot/botsettings.json`
 
@@ -30,6 +31,7 @@ Copy the service files into `/etc/systemd/system/`:
 ```bash
 sudo cp /opt/rust-manager/deploy/systemd/rustmgrapi.service /etc/systemd/system/
 sudo cp /opt/rust-manager/deploy/systemd/rustopsagent.service /etc/systemd/system/
+sudo cp /opt/rust-manager/deploy/systemd/rustops-remote-agent.service /etc/systemd/system/
 sudo cp /opt/rust-manager/deploy/systemd/opssteambot.service /etc/systemd/system/
 ```
 
@@ -39,6 +41,7 @@ Then reload and enable them:
 sudo systemctl daemon-reload
 sudo systemctl enable --now rustmgrapi.service
 sudo systemctl enable --now rustopsagent.service
+sudo systemctl enable --now rustops-remote-agent.service
 sudo systemctl enable --now opssteambot.service
 ```
 
@@ -48,6 +51,8 @@ Edit `rustmgrapi.service` and set:
 
 - `RUSTMGR_API_KEY`
 - `RUSTMGR_BIND` if you do not want `0.0.0.0:2077`
+- `RUSTOPS_REMOTE_AGENT_API_KEY` for remote host management
+- `RUSTOPS_REMOTE_AGENT_BIND` if the remote agent should not listen on `0.0.0.0:2088`
 
 Or place the shared values in:
 
@@ -84,6 +89,11 @@ dotnet /opt/rust-manager/agent/RustOpsAgent/RustOpsAgent.dll /opt/rust-manager/a
 ```
 
 ```bash
+cd /opt/rust-manager/remote-agent/RustOpsRemoteAgent
+dotnet /opt/rust-manager/remote-agent/RustOpsRemoteAgent/RustOpsRemoteAgent.dll
+```
+
+```bash
 cd /opt/rust-manager/SteamBot/OpsSteamBot
 dotnet /opt/rust-manager/SteamBot/OpsSteamBot/OpsSteamBot.dll /opt/rust-manager/SteamBot/OpsSteamBot/botsettings.json
 ```
@@ -95,6 +105,7 @@ Use `journalctl`:
 ```bash
 journalctl -u rustmgrapi.service -f
 journalctl -u rustopsagent.service -f
+journalctl -u rustops-remote-agent.service -f
 journalctl -u opssteambot.service -f
 ```
 

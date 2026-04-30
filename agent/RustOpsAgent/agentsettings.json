@@ -77,6 +77,9 @@
     "downloadEnabled": false,
     "stagingPath": "data/plugin-staging"
   },
+  "webSearch": {
+    "enabled": true
+  },
   "autoPull": {
     "enabled": true,
     "intervalMinutes": 60,

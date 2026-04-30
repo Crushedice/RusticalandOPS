@@ -125,10 +125,12 @@ internal sealed class ServerConsoleState
 internal sealed class ConsoleErrorEntry
 {
     [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
+    [JsonPropertyName("sampleLine")] public string SampleLine { get; set; } = string.Empty;
     [JsonPropertyName("count")] public int Count { get; set; } = 1;
     [JsonPropertyName("firstSeenAtUtc")] public DateTime FirstSeenAtUtc { get; set; } = DateTime.UtcNow;
     [JsonPropertyName("lastSeenAtUtc")] public DateTime LastSeenAtUtc { get; set; } = DateTime.UtcNow;
     [JsonPropertyName("category")] public string Category { get; set; } = "error";
+    [JsonPropertyName("reviewPromptedAtUtc")] public DateTime? ReviewPromptedAtUtc { get; set; }
 }
 
 // Player chat knowledge — store player messages and derived sentiment.

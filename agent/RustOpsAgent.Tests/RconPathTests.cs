@@ -142,4 +142,64 @@ public class RconPathTests
 
         Assert.Equal(string.Empty, command);
     }
+
+    [Fact]
+    public void NormalizeCommandForServer_Strips_Trailing_Server_Qualifier()
+    {
+        var command = RustRconToolHandler.NormalizeCommandForServer("status on cotton", "cotton");
+
+        Assert.Equal("status", command);
+    }
+
+    [Fact]
+    public void NormalizeCommandForServer_Strips_Generic_Trailing_Server_Qualifier()
+    {
+        var command = RustRconToolHandler.NormalizeCommandForServer("say hello to monthly server", "cotton");
+
+        Assert.Equal("say hello", command);
+    }
+
+    [Fact]
+    public void NormalizeCommandForServer_Does_Not_Strip_Command_Argument_After_To()
+    {
+        var command = RustRconToolHandler.NormalizeCommandForServer("say hello to all", "cotton");
+
+        Assert.Equal("say hello to all", command);
+    }
+
+    [Fact]
+    public void BuildApiFallbackReply_Reports_Unconfirmed_Api_Result()
+    {
+        using var doc = JsonDocument.Parse("""
+        {
+          "ok": false,
+          "message": "tmux fallback attempted but command was not confirmed"
+        }
+        """);
+
+        var reply = RustRconToolHandler.BuildApiFallbackReply("alpha", doc.RootElement);
+
+        Assert.Contains("not confirmed", reply, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void BuildApiFallbackReply_Reports_Tmux_Fallback_When_Api_Uses_Rustmgr_Send()
+    {
+        using var doc = JsonDocument.Parse("""
+        {
+          "ok": true,
+          "transport": "rustmgr-send",
+          "directReply": null,
+          "fallback": "sent to modded via tmux fallback: say greetings",
+          "output": {
+            "messages": []
+          }
+        }
+        """);
+
+        var reply = RustRconToolHandler.BuildApiFallbackReply("modded", doc.RootElement);
+
+        Assert.Contains("tmux fallback", reply, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("say greetings", reply, StringComparison.OrdinalIgnoreCase);
+    }
 }
