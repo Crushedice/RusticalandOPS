@@ -567,7 +567,7 @@ internal sealed class RustRconToolHandler : IToolHandler
             else
             {
                 using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command/exec", new { command }, cancellationToken);
-                reply = BuildApiFallbackReply(server, response.RootElement);
+                reply = BuildApiFallbackReply(server, response.RootElement, _cmdSettings.MaxOutputChars);
                 succeeded = ApiCommandSucceeded(response.RootElement);
             }
         }
@@ -849,13 +849,20 @@ internal sealed class RustRconToolHandler : IToolHandler
         }
     }
 
-    private static string TruncateOutput(string output, int maxChars = 800)
+    private string TruncateOutput(string output, int? maxChars = null)
+    {
+        output = output.Trim();
+        var limit = maxChars ?? _cmdSettings.MaxOutputChars;
+        return output.Length > limit ? output[..limit] + "…" : output;
+    }
+
+    private static string TruncateStatic(string output, int maxChars)
     {
         output = output.Trim();
         return output.Length > maxChars ? output[..maxChars] + "…" : output;
     }
 
-    internal static string BuildApiFallbackReply(string server, JsonElement root)
+    internal static string BuildApiFallbackReply(string server, JsonElement root, int maxOutputChars = 800)
     {
         if (root.TryGetProperty("ok", out var okNode) &&
             okNode.ValueKind is JsonValueKind.False)
@@ -871,7 +878,7 @@ internal sealed class RustRconToolHandler : IToolHandler
             : string.Empty;
         if (!string.IsNullOrWhiteSpace(apiReply))
         {
-            return $"RCON {server}: {TruncateOutput(apiReply)}";
+            return $"RCON {server}: {TruncateStatic(apiReply, maxOutputChars)}";
         }
 
         var command = root.TryGetProperty("command", out var commandNode) && commandNode.ValueKind == JsonValueKind.String
@@ -879,7 +886,7 @@ internal sealed class RustRconToolHandler : IToolHandler
             : null;
         var outputSummary = ExtractApiOutputSummary(root, command);
         if (!string.IsNullOrWhiteSpace(outputSummary))
-            return $"RCON {server}: {TruncateOutput(outputSummary, 1200)}";
+            return $"RCON {server}: {TruncateStatic(outputSummary, maxOutputChars)}";
 
         var transport = root.TryGetProperty("transport", out var transportNode) && transportNode.ValueKind == JsonValueKind.String
             ? transportNode.GetString()
@@ -889,7 +896,7 @@ internal sealed class RustRconToolHandler : IToolHandler
             : null;
 
         if (!string.IsNullOrWhiteSpace(fallback))
-            return $"RCON {server}: {TruncateOutput(fallback, 500)}";
+            return $"RCON {server}: {TruncateStatic(fallback, Math.Min(500, maxOutputChars))}";
 
         return string.Equals(transport, "rustmgr-send", StringComparison.OrdinalIgnoreCase)
             ? $"RCON {server}: command accepted by rustmgr send fallback (no direct reply)."

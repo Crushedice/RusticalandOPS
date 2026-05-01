@@ -58,6 +58,8 @@ The remote agent is a Debian-installable host module for managing a Rust server 
 
 The main API remote registry supports agent-backed entries using `agentBaseUrl`, `agentApiKey`, and optional `agentServerName`. Existing RCON-only remote entries still work for command/query operations, while agent-backed entries can be started, stopped, restarted, updated, wiped, and inspected through the normal server endpoints.
 
+Use `deploy/setup-remote-node.sh` to set up a complete remote node on a fresh Debian host automatically, including steamcmd, rustmgr, the remote agent binary, and the systemd service. This is separate from RCON-only remote control; the remote node gives the agent the same degree of control it has over local servers.
+
 ### Layer 4: `agent/RustOpsAgent/`
 
 This is the most actively evolving part of the stack.
@@ -122,6 +124,10 @@ It stores structured records such as:
 - `ServerState`
 - `ToolObservation`
 - `Reflection`
+- `Exception`
+- `ServerConvar`
+- `ServerCommand`
+- `PluginSummary`
 
 Current properties include structured type/scope/source metadata, tags, related entity ids, timestamps, importance/confidence fields, metadata, content hash deduplication, and optional embeddings.
 
@@ -208,7 +214,35 @@ Separate LLM config blocks still exist for:
 - `llmDeep`
 - `llmCompose`
 
-## Running
+## Deployment
+
+### Install on a primary Debian host
+
+```bash
+sudo bash deploy/install-agent.sh
+```
+
+This script installs .NET, steamcmd, creates the `rustmgr` user/group, builds and deploys all binaries (API, agent, remote agent), writes a starter `config.env`, and registers and enables the systemd services.  Services are enabled but **not started** — edit `config.env` first, then:
+
+```bash
+systemctl start rustmgrapi rustopsagent
+```
+
+### Set up a remote node on another Debian host
+
+A remote node lets the primary agent control a Rust server on a different machine with the same lifecycle commands it uses locally (start, stop, restart, update, wipe, logs, RCON, plugin management).
+
+Drop `deploy/setup-remote-node.sh` on the target host and run:
+
+```bash
+sudo bash setup-remote-node.sh
+```
+
+This installs .NET, steamcmd, creates the service user, deploys the remote agent binary, writes a `remote-agent.env` with a generated API key, and enables the `rustops-remote-agent` systemd service.
+
+After setup, register the node in the primary host's agent registry with the generated API key and the node's URL (`http://<host>:2088`).
+
+### Run locally (development)
 
 1. Copy `agent/RustOpsAgent/agentsettings.example.json` to `agent/RustOpsAgent/agentsettings.json`.
 2. Optional: copy `config.env.example` to `config.env` and fill in shared values.
@@ -260,6 +294,23 @@ Example server command JSONL row:
 ```json
 {"command":"server.readcfg","generated_command_metadata":true,"description":"Reads and executes serverauto.cfg then server.cfg from the server cfg folder.","risk_level_inferred":"safe","tags":["config","server"]}
 ```
+
+## Plugin Config Reading and Writing
+
+The agent can read, inspect, and modify plugin JSON config files directly.
+
+Natural language commands that work:
+
+```text
+show the Vanish config on modded
+what is the timeout in Kits on main?
+set Kits cooldown to 60 on vanilla
+give me the oxide/config/NTeleportation.json from modded
+```
+
+The handler locates the plugin config file in the `oxide/config` directory, reads it, and presents it. When a key-value mutation is detected and the request is clearly a write (not a read query), it applies the change in-place and writes the file back.  Successful writes are recorded in semantic memory as `Fix` records tagged with `plugin-config`.
+
+Plugin config operations are local-only today — they require the oxide config directory to be accessible on the host running the API. Remote node servers surface the same functionality through the remote agent endpoints.
 
 ## Plugin Reference Index
 
@@ -325,6 +376,7 @@ At the last verification run:
 - search is SQLite plus in-process scoring, not ANN/Qdrant
 - embedding support is OpenAI-compatible only; there is no separate native Ollama protocol
 - deployment is still primarily systemd-oriented rather than container-first
+- plugin config reading and writing requires the oxide/config directory to be accessible on the local host (remote-node configs are exposed through the remote agent's own endpoints)
 
 ## Recommended Next Cleanup
 

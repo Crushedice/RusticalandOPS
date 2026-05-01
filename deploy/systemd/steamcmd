@@ -1,0 +1,31 @@
+#!/bin/sh
+# Copyright (C) 2015 Alexandre Detiste <alexandre@detiste.be>
+# License: MIT
+
+set -eu
+
+# check for old install < 0~20180105-4
+if [ -e ~/.steam/steamcmd ]
+then
+	exec ~/.steam/steamcmd/steamcmd.sh "$@"
+fi
+
+# create a fake Steam installation to avoid
+# that steamcmd uses "/home/$user/Steam" instead
+
+STEAMROOT="${XDG_DATA_HOME:-"$HOME/.local/share"}/Steam"
+if [ ! -e ~/.steam ]
+then
+	mkdir -p ~/.steam
+	ln -s "$STEAMROOT" ~/.steam/root
+	ln -s "$STEAMROOT" ~/.steam/steam
+fi
+
+if [ ! -e "$STEAMROOT/steamcmd" ]
+then
+	mkdir -p "$STEAMROOT/steamcmd/linux32"
+	# steamcmd will replace these files with newer ones itself on first run
+	cp /usr/lib/games/steam/steamcmd.sh "$STEAMROOT/steamcmd/"
+	cp /usr/lib/games/steam/steamcmd    "$STEAMROOT/steamcmd/linux32/"
+fi
+exec "$STEAMROOT/steamcmd/steamcmd.sh" "$@"

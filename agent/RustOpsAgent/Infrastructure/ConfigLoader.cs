@@ -242,6 +242,22 @@ internal static class ConfigLoader
             config.GitOps.PushBranchPrefix = "agent/";
         }
 
+        config.CommandExecution.Enabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_COMMANDS_ENABLED", config.CommandExecution.Enabled);
+        config.CommandExecution.FreeMode =
+            RustOpsEnv.GetBoolean("RUSTOPS_COMMANDS_FREE_MODE", config.CommandExecution.FreeMode);
+        config.CommandExecution.DefaultWaitMs =
+            RustOpsEnv.GetInt32("RUSTOPS_COMMANDS_DEFAULT_WAIT_MS", config.CommandExecution.DefaultWaitMs);
+        config.CommandExecution.MaxWaitMs =
+            RustOpsEnv.GetInt32("RUSTOPS_COMMANDS_MAX_WAIT_MS", config.CommandExecution.MaxWaitMs);
+        config.CommandExecution.MaxOutputChars =
+            RustOpsEnv.GetInt32("RUSTOPS_COMMANDS_MAX_OUTPUT_CHARS", config.CommandExecution.MaxOutputChars);
+        var commandAllowList = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_COMMANDS_ALLOWLIST");
+        if (!string.IsNullOrWhiteSpace(commandAllowList))
+            config.CommandExecution.AllowList = commandAllowList
+                .Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                .ToList();
+
         ValidateResolvedConfig(config);
 
         return config;

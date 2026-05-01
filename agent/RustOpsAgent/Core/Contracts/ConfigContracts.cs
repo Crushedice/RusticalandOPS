@@ -96,6 +96,9 @@ internal sealed class CommandExecutionSettings
 {
     [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
     [JsonPropertyName("freeMode")] public bool FreeMode { get; set; }
+    [JsonPropertyName("defaultWaitMs")] public int DefaultWaitMs { get; set; } = 2500;
+    [JsonPropertyName("maxWaitMs")] public int MaxWaitMs { get; set; } = 12000;
+    [JsonPropertyName("maxOutputChars")] public int MaxOutputChars { get; set; } = 8000;
     [JsonPropertyName("allowList")] public List<string> AllowList { get; set; } = new() { "playerlist", "serverinfo", "bans", "oxide.plugins", "status", "version" };
     [JsonPropertyName("autoAllowAfterSuccesses")] public int AutoAllowAfterSuccesses { get; set; } = 5;
     [JsonPropertyName("requireApprovalAfterFailures")] public int RequireApprovalAfterFailures { get; set; } = 2;
