@@ -114,6 +114,9 @@ app.Use(async (ctx, next) =>
     await next();
 });
 
+// -- Remote agent status tracking (declare early for use in endpoints) ----------
+var remoteAgentStatus = new Dictionary<string, RemoteAgentStatus>(StringComparer.OrdinalIgnoreCase);
+
 // -- Health --------------------------------------------------------------------
 app.MapGet("/health", () => Results.Ok(new
 {
@@ -187,8 +190,8 @@ app.MapGet("/dashboard/summary", async () =>
     var remoteOnlineCount = 0;
     foreach (var remote in remoteServersForSummary.Where(r => !string.IsNullOrWhiteSpace(r.AgentBaseUrl)))
     {
-        var healthResult = await TryProxyRemoteAgentAsync(remote.Name, HttpMethod.Get, "/health");
-        if (healthResult != null)
+        await CheckRemoteAgentHealthAsync(remote);
+        if (remoteAgentStatus.ContainsKey(remote.Name) && remoteAgentStatus[remote.Name].IsReachable)
             remoteOnlineCount++;
     }
 
@@ -229,7 +232,54 @@ app.MapGet("/dashboard/summary", async () =>
             semanticMemorySize = 0,
             pluginDbSize = 0
         },
-        servers = statuses.OrderBy(s => s.name, StringComparer.OrdinalIgnoreCase),
+        servers = statuses
+            .Select(s => new
+            {
+                s.name,
+                s.state,
+                s.online,
+                s.autoRestart,
+                s.pid,
+                s.recentWarningCount,
+                s.currentPlayers,
+                s.maxPlayers,
+                s.playerPreview,
+                s.uptimeSeconds,
+                s.memoryMb,
+                s.queryOk,
+                hostname = (string?)s.hostname,
+                s.map,
+                s.framerate,
+                s.queuedPlayers,
+                remote = false,
+                agentReachable = false,
+                agentLastCheckAtUtc = (DateTime?)null,
+                agentLastCheckLatencyMs = (int?)null
+            })
+            .Concat(remoteServersForSummary.Select(r => new
+            {
+                name = r.Name,
+                state = "remote",
+                online = false,
+                autoRestart = false,
+                pid = (int?)null,
+                recentWarningCount = 0,
+                currentPlayers = (int?)null,
+                maxPlayers = (int?)null,
+                playerPreview = new List<string>(),
+                uptimeSeconds = (long?)null,
+                memoryMb = (double?)null,
+                queryOk = false,
+                hostname = (string?)r.DisplayName,
+                map = (string?)null,
+                framerate = (double?)null,
+                queuedPlayers = (int?)null,
+                remote = true,
+                agentReachable = remoteAgentStatus.ContainsKey(r.Name) && remoteAgentStatus[r.Name].IsReachable,
+                agentLastCheckAtUtc = remoteAgentStatus.ContainsKey(r.Name) ? remoteAgentStatus[r.Name].LastHealthCheckAtUtc : null,
+                agentLastCheckLatencyMs = remoteAgentStatus.ContainsKey(r.Name) ? remoteAgentStatus[r.Name].LastHealthCheckLatencyMs : null
+            }))
+            .OrderBy(s => s.name, StringComparer.OrdinalIgnoreCase),
         mailboxes = new[]
         {
             DescribeMailbox("feedback-inbox", agentPaths.FeedbackInboxPath),
@@ -842,6 +892,55 @@ bool HasRemoteAgent(RemoteServerEntry? server) =>
 string RemoteAgentServerName(RemoteServerEntry server) =>
     string.IsNullOrWhiteSpace(server.AgentServerName) ? server.Name : server.AgentServerName.Trim();
 
+async Task CheckRemoteAgentHealthAsync(RemoteServerEntry remote)
+{
+    var statusKey = remote.Name;
+    if (!remoteAgentStatus.ContainsKey(statusKey))
+        remoteAgentStatus[statusKey] = new RemoteAgentStatus
+        {
+            ServerName = remote.Name,
+            AgentBaseUrl = remote.AgentBaseUrl
+        };
+
+    var status = remoteAgentStatus[statusKey];
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    try
+    {
+        var url = $"{remote.AgentBaseUrl.TrimEnd('/')}/health";
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        using var message = new HttpRequestMessage(HttpMethod.Get, url);
+        var agentKey = string.IsNullOrWhiteSpace(remote.AgentApiKey) ? apiKey : remote.AgentApiKey.Trim();
+        message.Headers.TryAddWithoutValidation("X-Api-Key", agentKey);
+
+        using var response = await http.SendAsync(message);
+        sw.Stop();
+        status.LastHealthCheckLatencyMs = (int)sw.ElapsedMilliseconds;
+        status.LastHealthCheckAtUtc = DateTime.UtcNow;
+
+        if (response.IsSuccessStatusCode)
+        {
+            status.IsReachable = true;
+            status.SuccessCount++;
+            status.LastError = null;
+        }
+        else
+        {
+            status.IsReachable = false;
+            status.FailureCount++;
+            status.LastError = $"HTTP {response.StatusCode}";
+        }
+    }
+    catch (Exception ex)
+    {
+        sw.Stop();
+        status.IsReachable = false;
+        status.FailureCount++;
+        status.LastError = ex.Message;
+        status.LastHealthCheckAtUtc = DateTime.UtcNow;
+        status.LastHealthCheckLatencyMs = (int)sw.ElapsedMilliseconds;
+    }
+}
+
 async Task<IResult?> TryProxyRemoteAgentAsync(
     string server,
     HttpMethod method,
@@ -952,9 +1051,6 @@ app.MapGet("/servers", async () =>
 });
 
 // -- Remote Server CRUD ----------------------------------------------------------
-// Remote agent status tracking
-var remoteAgentStatus = new Dictionary<string, RemoteAgentStatus>(StringComparer.OrdinalIgnoreCase);
-
 app.MapGet("/servers/remote/list", () =>
 {
     var remoteServers = LoadRemoteServers();
