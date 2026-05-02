@@ -201,6 +201,8 @@ app.MapGet("/dashboard/summary", async () =>
         {
             servers = statuses.Length,
             onlineServers = statuses.Count(s => s.online),
+            remoteServers = 0,
+            remoteServersOnline = 0,
             pendingActions = memory.PendingActions.Count,
             incidents = memory.RecentIncidents.Count,
             agentErrors = memory.AgentErrors.Count,
@@ -210,7 +212,11 @@ app.MapGet("/dashboard/summary", async () =>
             decisionInbox = CountJsonFiles(agentPaths.DecisionInboxPath),
             chatInbox = CountJsonFiles(agentPaths.ChatInboxPath),
             messageOutbox = CountJsonFiles(agentPaths.MessageOutboxPath),
-            sentOutbox = CountJsonFiles(agentPaths.SentOutboxPath)
+            sentOutbox = CountJsonFiles(agentPaths.SentOutboxPath),
+            adminChatMessages = 0,
+            llmCallsCount = memory.LlmInteractions.Count,
+            semanticMemorySize = 0,
+            pluginDbSize = 0
         },
         servers = statuses.OrderBy(s => s.name, StringComparer.OrdinalIgnoreCase),
         mailboxes = new[]
@@ -276,6 +282,88 @@ app.MapPut("/agent/log-rules", async (HttpRequest request) =>
         path = agentPaths.LogRulesPath,
         savedAtUtc = DateTime.UtcNow
     });
+});
+
+app.MapGet("/agent/truncation-status", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
+    var state = memory.StateFile;
+
+    var errorsPath = Path.Combine(agentPaths.NeoCortexRoot, "logs");
+    var incidentsFile = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents.jsonl");
+    var items = new List<object>
+    {
+        new { name = "Agent state file", path = state.Path, sizeBytes = state.SizeBytes, exists = state.Exists, canTruncate = state.Exists && state.SizeBytes > 0 },
+        new { name = "Recent errors log", path = errorsPath, sizeBytes = Directory.Exists(errorsPath) ? GetDirSize(errorsPath) : 0, exists = Directory.Exists(errorsPath), canTruncate = true },
+        new { name = "Incidents storage", path = incidentsFile, sizeBytes = File.Exists(incidentsFile) ? new FileInfo(incidentsFile).Length : 0, exists = File.Exists(incidentsFile), canTruncate = true }
+    };
+
+    return Results.Ok(new
+    {
+        items,
+        note = "Use the delete endpoints below to truncate logs older than a specified date. This helps manage disk space.",
+        generatedAtUtc = DateTime.UtcNow
+    });
+});
+
+app.MapPost("/agent/truncate/errors", async (TruncationRequest request) =>
+{
+    if (request.BeforeDateUtc == null)
+        return Results.BadRequest(new ApiError("invalid_request", "beforeDateUtc is required"));
+
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var filePath = Path.Combine(agentPaths.NeoCortexRoot, "logs", "recent-errors.txt");
+
+    if (!File.Exists(filePath))
+        return Results.Ok(new { ok = true, deleted = 0, message = "No errors file found" });
+
+    var cutoffTime = request.BeforeDateUtc.Value;
+    var lines = File.ReadAllLines(filePath);
+    var kept = lines.Where(line =>
+    {
+        if (string.IsNullOrWhiteSpace(line)) return true;
+        var match = Regex.Match(line, @"\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})");
+        if (!match.Success) return true;
+        return DateTime.TryParse(match.Groups[1].Value, out var dt) && dt >= cutoffTime;
+    }).ToList();
+
+    var deleted = lines.Length - kept.Count;
+    await File.WriteAllLinesAsync(filePath, kept);
+
+    return Results.Ok(new { ok = true, deleted, message = $"Deleted {deleted} error entries before {cutoffTime:O}" });
+});
+
+app.MapPost("/agent/truncate/incidents", async (TruncationRequest request) =>
+{
+    if (request.BeforeDateUtc == null)
+        return Results.BadRequest(new ApiError("invalid_request", "beforeDateUtc is required"));
+
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var incidentsFile = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents.jsonl");
+
+    if (!File.Exists(incidentsFile))
+        return Results.Ok(new { ok = true, deleted = 0, message = "No incidents file found" });
+
+    var cutoffTime = request.BeforeDateUtc.Value;
+    var lines = File.ReadAllLines(incidentsFile);
+    var kept = lines.Where(line =>
+    {
+        if (string.IsNullOrWhiteSpace(line)) return true;
+        try
+        {
+            var doc = JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("timestamp", out var ts) && DateTime.TryParse(ts.GetString() ?? "", out var dt))
+                return dt >= cutoffTime;
+            return true;
+        }
+        catch { return true; }
+    }).ToList();
+
+    var deleted = lines.Length - kept.Count;
+    await File.WriteAllLinesAsync(incidentsFile, kept);
+
+    return Results.Ok(new { ok = true, deleted, message = $"Deleted {deleted} incident entries before {cutoffTime:O}" });
 });
 
 IResult ReadLlmConfig()
@@ -568,6 +656,33 @@ app.MapGet("/agent/player-chat/recent", () =>
     }
 });
 
+app.MapGet("/agent/player-chat/admin-calls", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var chatPath = Path.Combine(agentPaths.NeoCortexRoot, "chat", "knowledge.json");
+    if (!File.Exists(chatPath))
+        return Results.Ok(new { adminCalls = Array.Empty<object>(), perServerVolume = new object(), dailySummaries = Array.Empty<object>() });
+    try
+    {
+        var content = File.ReadAllText(chatPath);
+        var doc = JsonDocument.Parse(content);
+        var root = doc.RootElement;
+        var adminCalls = root.TryGetProperty("adminCalls", out var ac) ? ac : default(JsonElement);
+        var perServerVolume = root.TryGetProperty("perServerVolume", out var psv) ? psv : default(JsonElement);
+        var dailySummaries = root.TryGetProperty("dailySummaries", out var ds) ? ds : default(JsonElement);
+        return Results.Ok(new
+        {
+            adminCalls = (object)(adminCalls.ValueKind != JsonValueKind.Null ? adminCalls : JsonDocument.Parse("[]").RootElement),
+            perServerVolume = (object)(perServerVolume.ValueKind != JsonValueKind.Null ? perServerVolume : JsonDocument.Parse("{}").RootElement),
+            dailySummaries = (object)(dailySummaries.ValueKind != JsonValueKind.Null ? dailySummaries : JsonDocument.Parse("[]").RootElement)
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
 app.MapGet("/host/services", async () => Results.Ok(await GetManagedServicesSnapshotAsync()));
 
 app.MapGet("/host/llm/summary", async () =>
@@ -826,6 +941,9 @@ app.MapGet("/servers", async () =>
 });
 
 // -- Remote Server CRUD ----------------------------------------------------------
+// Remote agent status tracking
+var remoteAgentStatus = new Dictionary<string, RemoteAgentStatus>(StringComparer.OrdinalIgnoreCase);
+
 app.MapGet("/servers/remote/list", () =>
 {
     var remoteServers = LoadRemoteServers();
@@ -840,6 +958,50 @@ app.MapGet("/servers/remote/list", () =>
         agentServerName = s.AgentServerName,
         agentEnabled = !string.IsNullOrWhiteSpace(s.AgentBaseUrl)
     }));
+});
+
+app.MapGet("/servers/remote/agent-status", () =>
+{
+    return Results.Ok(remoteAgentStatus.Values.OrderBy(s => s.ServerName));
+});
+
+app.MapPost("/servers/remote/{name}/check-health", async (string name) =>
+{
+    var server = LoadRemoteServers().FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    if (server == null || string.IsNullOrWhiteSpace(server.AgentBaseUrl))
+        return Results.NotFound(new ApiError("not_found", "Remote server not found or has no agent"));
+
+    var statusKey = server.Name;
+    if (!remoteAgentStatus.ContainsKey(statusKey))
+        remoteAgentStatus[statusKey] = new RemoteAgentStatus { ServerName = server.Name, AgentBaseUrl = server.AgentBaseUrl };
+
+    var status = remoteAgentStatus[statusKey];
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    try
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(name, HttpMethod.Get, "/health");
+        sw.Stop();
+
+        if (remoteResult is not null)
+        {
+            status.IsReachable = true;
+            status.LastHealthCheckAtUtc = DateTime.UtcNow;
+            status.LastHealthCheckLatencyMs = (int)sw.ElapsedMilliseconds;
+            status.SuccessCount++;
+            status.LastError = null;
+            return Results.Ok(new { ok = true, latencyMs = sw.ElapsedMilliseconds });
+        }
+    }
+    catch (Exception ex)
+    {
+        sw.Stop();
+        status.IsReachable = false;
+        status.LastError = ex.Message;
+        status.FailureCount++;
+        status.LastHealthCheckAtUtc = DateTime.UtcNow;
+    }
+
+    return Results.BadRequest(new ApiError("agent_unreachable", "Remote agent health check failed"));
 });
 
 app.MapPost("/servers/remote", (RemoteServerEntry server) =>
@@ -952,6 +1114,8 @@ app.MapGet("/servers/summary", async () =>
     foreach (var remote in LoadRemoteServers())
     {
         var remoteStatus = await TryReadRemoteAgentJsonAsync(remote.Name, "/servers/{server}/status");
+        var agentStatus = remoteAgentStatus.TryGetValue(remote.Name, out var agSt) ? agSt : null;
+
         if (remoteStatus is null)
         {
             rows.Add(new
@@ -960,7 +1124,11 @@ app.MapGet("/servers/summary", async () =>
                 state = "rcon-only",
                 online = false,
                 remote = true,
-                agentEnabled = false
+                agentEnabled = false,
+                agentBaseUrl = remote.AgentBaseUrl,
+                agentReachable = agentStatus?.IsReachable ?? false,
+                agentLastCheckAtUtc = agentStatus?.LastHealthCheckAtUtc,
+                agentLastCheckLatencyMs = agentStatus?.LastHealthCheckLatencyMs
             });
             continue;
         }
@@ -970,6 +1138,10 @@ app.MapGet("/servers/summary", async () =>
             remoteObject["name"] = remote.Name;
             remoteObject["remote"] = true;
             remoteObject["agentEnabled"] = true;
+            remoteObject["agentBaseUrl"] = remote.AgentBaseUrl;
+            remoteObject["agentReachable"] = agentStatus?.IsReachable ?? false;
+            remoteObject["agentLastCheckAtUtc"] = agentStatus?.LastHealthCheckAtUtc;
+            remoteObject["agentLastCheckLatencyMs"] = agentStatus?.LastHealthCheckLatencyMs;
         }
 
         rows.Add(remoteStatus);
@@ -2531,6 +2703,17 @@ static void SaveServerConfig(ServerConfig config)
 static int CountJsonFiles(string path) =>
     Directory.Exists(path) ? Directory.GetFiles(path, "*.json").Length : 0;
 
+static long GetDirSize(string path)
+{
+    if (!Directory.Exists(path)) return 0;
+    try
+    {
+        var dir = new DirectoryInfo(path);
+        return dir.EnumerateFiles("*", System.IO.SearchOption.AllDirectories).Sum(f => f.Length);
+    }
+    catch { return 0; }
+}
+
 static object DescribeMailbox(string name, string path)
 {
     var files = Directory.Exists(path)
@@ -4042,18 +4225,19 @@ static string BuildDashboardHtml() => """
       <div class="grid">
         <div class="card wide"><h2>Service Status <span class="legend" data-tip="All three core services should normally stay active: API, Agent, and Steam Adapter. If one is inactive or failed, the stack is only partially working.">?</span></h2><div id="services" class="micro-grid"></div></div>
         <div class="card"><h2>Agent Runtime</h2><div id="agentRuntime" class="kv"></div></div>
-        <div class="card"><h2>Pending Actions</h2><div id="pending" class="list"></div></div>
+        <div class="card"><h2>Remote Agent Status <span class="legend" data-tip="Monitors the health and connectivity of configured remote agents running on other machines.">?</span></h2><div id="remoteAgentStatus" class="list"></div><div class="toolbar" style="margin-top:12px;"><button id="addRemoteAgentBtn" style="padding:8px 14px;font-size:13px;">+ Add Remote Agent</button></div></div>
         <div class="card"><h2>Recent Incidents</h2><div id="incidents" class="list"></div></div>
         <div class="card"><h2>Recent Actions</h2><div id="actions" class="list"></div></div>
         <div class="card"><h2>Mailboxes</h2><div id="mailboxes" class="mailbox-grid"></div></div>
         <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
-        <div class="card"><h2>Capability Gaps <span class="legend" data-tip="Patterns the agent recorded when it could not fulfill a request. Each entry feeds the self-repair evolution cycle to propose a concrete improvement.">?</span></h2><div id="capabilityGaps" class="list"></div></div>
-        <div class="card"><h2>Evolution History <span class="legend" data-tip="Each entry is one self-repair cycle: how many bounded actions were applied, what they changed, and the LLM reasoning behind the decision.">?</span></h2><div id="selfRepairHistory" class="list"></div></div>
         <div class="card"><h2>Server Console <span class="legend" data-tip="Live error counts per server pulled from the agent's console monitor. Errors are deduplicated and counted since the last agent restart.">?</span></h2><div id="consoleStats" class="list"></div></div>
         <div class="card"><h2>Player Chat <span class="legend" data-tip="Stats computed from the player chat stream the agent reads in real time. Word counts cover today's messages only. Sentiment is updated every 30 minutes by the LLM.">?</span></h2><div id="chatStats" class="list"></div></div>
+        <div class="card"><h2>Admin Calls <span class="legend" data-tip="Player messages that match admin/mod call patterns (asking for help, reporting issues, etc). Each entry shows who called, what server, and what they said.">?</span></h2><div id="adminCalls" class="list"></div></div>
+        <div class="card"><h2>Per-Server Chat Volume <span class="legend" data-tip="Message counts per server for today and cumulative. Tracks active player discussions per server.">?</span></h2><div id="serverChatVolume" class="list"></div></div>
         <div class="card wide"><h2>Incident Feedback <span class="legend" data-tip="Each row is an incident the agent recorded when it failed to fulfill a request. Use the verdict buttons and note field to give the agent real feedback — it reads this to improve future handling.">?</span></h2><div id="incidentFeedbackStatus" class="muted" style="margin-bottom:10px;">Loading incidents…</div><div id="incidentFeedbackList" class="list"></div></div>
         <div class="card"><h2>Agent Log Rules <span class="legend" data-tip="Edit JSON arrays here.\nignoreContains: always ignore these substrings.\nstartupIgnoreContains: ignore only during startup window.\nincidentContains: always elevate these substrings.\nExample:\n{\n  &quot;ignoreContains&quot;: [&quot;known noise&quot;],\n  &quot;startupIgnoreContains&quot;: [&quot;shader unsupported&quot;],\n  &quot;incidentContains&quot;: [&quot;Error while compiling&quot;]\n}">?</span></h2><div id="rulesMeta" class="muted">Not loaded.</div><textarea id="rulesEditor" spellcheck="false" style="margin-top:12px;"></textarea><div class="toolbar"><div id="rulesSaveStatus" class="muted">No changes saved yet.</div><button id="saveRules">Save Rules</button></div></div>
         <div class="card"><h2>Command Policy <span class="legend" data-tip="Controls whether the agent can execute raw server commands.\nIf Free mode is disabled, only allowlisted commands can be executed.\nChanges apply after restarting rustopsagent.service.">?</span></h2><div id="commandConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="commandEnabled" type="checkbox"> Command execution enabled</label><label class="check"><input id="commandFreeMode" type="checkbox"> Free mode (no allowlist restriction)</label></div><div class="row" style="margin-top:12px;"><div><label for="commandDefaultWaitMs" class="tiny muted">Default wait (ms)</label><input id="commandDefaultWaitMs" type="number" min="200" max="20000" step="100"></div><div><label for="commandMaxWaitMs" class="tiny muted">Max wait (ms)</label><input id="commandMaxWaitMs" type="number" min="500" max="30000" step="100"></div></div><div class="row" style="margin-top:12px;"><div><label for="commandMaxOutputChars" class="tiny muted">Max output chars</label><input id="commandMaxOutputChars" type="number" min="500" max="64000" step="100"></div></div><div style="margin-top:12px;"><label for="commandAllowList" class="tiny muted">Allowlist (comma/line separated)</label><textarea id="commandAllowList" spellcheck="false" style="min-height:140px;"></textarea></div><div class="toolbar"><div id="commandSaveStatus" class="muted">No changes saved yet.</div><button id="saveCommandConfig">Save Command Policy</button></div></div>
+        <div class="card wide"><h2>Data Truncation <span class="legend" data-tip="Cleanup controls to manage disk space. Delete logs and incidents older than a specified date.">?</span></h2><div id="truncationStatus" class="list" style="margin-bottom:16px;"></div><div style="padding:12px;border:1px solid rgba(39,64,87,.7);border-radius:14px;background:rgba(21,36,52,.55);"><div class="row"><div><label for="truncationDate" class="tiny muted">Truncate data before (UTC)</label><input id="truncationDate" type="date"></div><div style="display:flex;gap:8px;align-items:flex-end;"><label class="check" style="white-space:nowrap;"><input id="truncationDryRun" type="checkbox"> Dry run</label><button id="truncateErrors">Delete Errors</button><button id="truncateIncidents">Delete Incidents</button></div></div></div><div id="truncationResult" class="muted" style="margin-top:12px;"></div></div>
       </div>
     </section>
 
@@ -4267,8 +4451,75 @@ static string BuildDashboardHtml() => """
     }
 
     function renderServers(servers) {
-      $('servers').innerHTML = (servers || []).map(server => `<tr><td><strong>${esc(server.name)}</strong><div class="tiny muted">${esc(server.hostname || 'hostname unavailable')}</div></td><td>${pill(server.state)}</td><td>${esc(server.currentPlayers ?? (server.online ? '?' : '-'))}/${esc(server.maxPlayers ?? '?')}</td><td>${esc(dur(server.uptimeSeconds))}</td><td>${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : '-'}</td><td>${server.autoRestart ? 'on' : 'off'}</td><td>${esc(server.recentWarningCount ?? 0)}</td></tr>`).join('') || '<tr><td colspan="7" class="muted">No servers returned.</td></tr>';
-      $('serverCards').innerHTML = (servers || []).map(server => `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(server.name)}</strong>${pill(server.state)}</div><div class="muted" style="margin-top:6px;">${esc(server.hostname || 'hostname unavailable')}</div><div class="tiny muted" style="margin-top:8px;">Map ${esc(server.map || 'n/a')} | Queue ${esc(server.queuedPlayers ?? 0)} | FPS ${esc(server.framerate ?? 'n/a')}</div><div class="tiny muted" style="margin-top:8px;">PID ${esc(server.pid ?? '-')} | Uptime ${esc(dur(server.uptimeSeconds))} | Mem ${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : 'n/a'} | ${server.queryOk ? 'query-ok' : (server.online ? 'query-missed' : 'offline')}</div><div class="chip-list">${(server.playerPreview || []).slice(0, 5).map(name => `<span class="chip">${esc(name)}</span>`).join('') || '<span class="muted tiny">No player names sampled.</span>'}</div></div>`).join('') || '<div class="muted">No live query data available.</div>';
+      $('servers').innerHTML = (servers || []).map(server => {
+        const isRemote = server.remote === true;
+        const remoteBadge = isRemote ? ' <span class="pill" style="background:rgba(102,200,255,.12);color:var(--accent);">[REMOTE]</span>' : '';
+        const agentStatus = isRemote ? (server.agentReachable ? `agent-ok | ${server.agentLastCheckLatencyMs}ms` : 'agent-offline') : '';
+        return `<tr><td><strong>${esc(server.name)}${remoteBadge}</strong><div class="tiny muted">${esc(server.hostname || 'hostname unavailable')}${agentStatus ? `<br/>${agentStatus}` : ''}</div></td><td>${pill(server.state)}</td><td>${esc(server.currentPlayers ?? (server.online ? '?' : '-'))}/${esc(server.maxPlayers ?? '?')}</td><td>${esc(dur(server.uptimeSeconds))}</td><td>${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : '-'}</td><td>${server.autoRestart ? 'on' : 'off'}</td><td>${esc(server.recentWarningCount ?? 0)}</td></tr>`;
+      }).join('') || '<tr><td colspan="7" class="muted">No servers returned.</td></tr>';
+      $('serverCards').innerHTML = (servers || []).map(server => {
+        const isRemote = server.remote === true;
+        const remoteBadge = isRemote ? '<span class="chip" style="background:rgba(102,200,255,.10);border-color:rgba(102,200,255,.22);">[REMOTE]</span>' : '';
+        const agentInfo = isRemote && server.agentReachable ? `Agent: ${esc(server.agentLastCheckLatencyMs)}ms ago<br/>` : (isRemote ? 'Agent: offline<br/>' : '');
+        return `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(server.name)}</strong>${pill(server.state)}${remoteBadge}</div><div class="muted" style="margin-top:6px;">${esc(server.hostname || 'hostname unavailable')}</div>${agentInfo ? `<div class="tiny muted" style="margin-top:4px;">${agentInfo}</div>` : ''}<div class="tiny muted" style="margin-top:8px;">Map ${esc(server.map || 'n/a')} | Queue ${esc(server.queuedPlayers ?? 0)} | FPS ${esc(server.framerate ?? 'n/a')}</div><div class="tiny muted" style="margin-top:8px;">PID ${esc(server.pid ?? '-')} | Uptime ${esc(dur(server.uptimeSeconds))} | Mem ${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : 'n/a'} | ${server.queryOk ? 'query-ok' : (server.online ? 'query-missed' : 'offline')}</div><div class="chip-list">${(server.playerPreview || []).slice(0, 5).map(name => `<span class="chip">${esc(name)}</span>`).join('') || '<span class="muted tiny">No player names sampled.</span>'}</div></div>`;
+      }).join('') || '<div class="muted">No live query data available.</div>';
+    }
+
+    async function renderRemoteAgentStatus() {
+      try {
+        const agents = await fetchJson('/servers/remote/agent-status');
+        const agentsList = (agents || []).map(agent => {
+          const statusPill = agent.isReachable ? `${pill('ok')} | ${agent.lastHealthCheckLatencyMs}ms` : pill('offline');
+          const lastCheck = agent.lastHealthCheckAtUtc ? `| checked ${fmt(agent.lastHealthCheckAtUtc)}` : '| never checked';
+          const errorInfo = agent.lastError ? `<br/><span class="muted" style="font-size:11px;">${esc(agent.lastError)}</span>` : '';
+          return item(`${esc(agent.serverName)}`, `${agent.agentBaseUrl}`, `${statusPill} ${lastCheck}${errorInfo}`);
+        }).join('');
+        $('remoteAgentStatus').innerHTML = agentsList || '<div class="muted">No remote agents configured.</div>';
+      } catch (error) {
+        $('remoteAgentStatus').innerHTML = `<div class="muted">Failed to load agent status: ${esc(error.message)}</div>`;
+      }
+    }
+
+    async function showAddRemoteAgentModal() {
+      const name = prompt('Enter server name (unique identifier):');
+      if (!name) return;
+      const displayName = prompt('Enter display name:') || name;
+      const baseUrl = prompt('Enter agent base URL (e.g. http://192.168.1.100:2088):');
+      if (!baseUrl) return;
+      const apiKey = prompt('Enter agent API key:');
+      if (!apiKey) return;
+
+      try {
+        await fetchJson('/servers/remote/agent-register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, displayName, agentBaseUrl: baseUrl, agentApiKey: apiKey })
+        });
+        await renderRemoteAgentStatus();
+        alert('Remote agent registered successfully');
+      } catch (error) {
+        alert(`Failed to register agent: ${error.message}`);
+      }
+    }
+
+    function renderAdminCalls(data) {
+      const calls = (data?.adminCalls || []).sort((a,b) => new Date(b.capturedAtUtc) - new Date(a.capturedAtUtc)).slice(0, 20);
+      if (!calls.length) { $('adminCalls').innerHTML = '<div class="muted">No admin calls recorded.</div>'; return; }
+      $('adminCalls').innerHTML = calls.map(call => item(
+        `${esc(call.playerName)} @ ${esc(call.serverName)}`,
+        `${esc(call.message)}`,
+        `${pill(call.callType || 'request')} | ${fmt(call.capturedAtUtc)}${call.acknowledged ? ' | acknowledged' : ''}`
+      )).join('');
+    }
+
+    function renderServerChatVolume(data) {
+      const volumes = Object.values(data?.perServerVolume || {}).sort((a,b) => b.todayMessageCount - a.todayMessageCount).slice(0, 10);
+      if (!volumes.length) { $('serverChatVolume').innerHTML = '<div class="muted">No per-server volume data yet.</div>'; return; }
+      $('serverChatVolume').innerHTML = volumes.map(vol => item(
+        `${esc(vol.serverName)}`,
+        `Today: ${vol.todayMessageCount} msgs | Total: ${vol.totalMessageCount} | Players: ${vol.activePlayerCount}`,
+        `${vol.lastMessageAtUtc ? `last: ${fmt(vol.lastMessageAtUtc)}` : 'no messages yet'}`
+      )).join('');
     }
 
     function renderAgent(summary) {
@@ -4277,16 +4528,13 @@ static string BuildDashboardHtml() => """
       const state = summary.agentState || {};
       const stateStatus = !state.exists ? 'missing' : (state.parseOk === false ? 'parse-failed' : 'ok');
       $('agentRuntime').innerHTML = [
-        kv('Pending actions', summary.counts?.pendingActions ?? 0),
         kv('Incidents tracked', summary.counts?.incidents ?? 0),
-        kv('Feedback inbox', summary.counts?.feedbackInbox ?? 0),
-        kv('Chat inbox', summary.counts?.chatInbox ?? 0),
         kv('Last LLM use', fmt(runtime.lastLlmInteractionAtUtc)),
         kv('State file', `${stateStatus}${state.sizeBytes ? ` | ${bytes(state.sizeBytes)}` : ''}`),
         kv('State save', fmt(state.lastSavedAtUtc || state.lastWriteAtUtc)),
-        kv('Rules path', runtime.logRulesPath || summary.host?.agentLogRulesPath || 'n/a')
+        kv('Semantic memory DB', summary.counts?.semanticMemorySize ? bytes(summary.counts.semanticMemorySize) : 'measuring...'),
+        kv('Plugin DB', summary.counts?.pluginDbSize ? bytes(summary.counts.pluginDbSize) : 'measuring...')
       ].join('');
-      $('pending').innerHTML = (summary.pendingActions || []).map(entry => item(`${entry.serverName} | ${entry.actionType}`, entry.summary || '', `${esc(fmt(entry.createdAtUtc))} | ${esc(entry.id)}`)).join('') || '<div class="muted">No pending actions.</div>';
       $('incidents').innerHTML = (summary.recentIncidents || []).map(entry => item(`${entry.serverName} | ${entry.title || entry.category || 'incident'}`, entry.summary || '', esc(fmt(entry.createdAtUtc)))).join('') || '<div class="muted">No incidents recorded.</div>';
       $('actions').innerHTML = (summary.recentActions || []).map(entry => item(`${entry.serverName} | ${entry.actionType}`, entry.summary || '', `${esc(fmt(entry.executedAtUtc))} | ${entry.success ? 'success' : 'failed'} | ${esc(entry.trigger)}`)).join('') || '<div class="muted">No recent actions.</div>';
       $('mailboxes').innerHTML = (summary.mailboxes || []).map(box => `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;"><strong>${esc(box.name)}</strong><span class="muted">${esc(box.count)} files</span></div><pre style="margin-top:8px;">${esc(box.path)}</pre><div class="muted" style="margin-top:8px;">${(box.files || []).slice(0, 4).map(file => `${esc(file.name)} (${fmt(file.modifiedAtUtc)})`).join('\n') || 'empty'}</div></div>`).join('') || '<div class="muted">No mailbox data available.</div>';
@@ -4294,8 +4542,6 @@ static string BuildDashboardHtml() => """
       if (state.path) diagnostics.push(item('Agent state file', state.path, `${state.exists ? 'exists' : 'missing'}${state.parseError ? ` | ${esc(state.parseError)}` : ''}`));
       $('errors').innerHTML = diagnostics.concat((summary.agentErrors || []).map(text => item('Agent error', text || ''))).join('') || '<div class="muted">No recent agent errors.</div>';
       $('feedback').innerHTML = (summary.recentFeedback || []).map(entry => item(`${entry.verdict || 'note'} | ${entry.serverName || 'general'}`, entry.note || '', `${esc(fmt(entry.receivedAtUtc))} | ${esc(entry.adminId || 'unknown admin')}`)).join('') || '<div class="muted">No recent feedback.</div>';
-      $('capabilityGaps').innerHTML = (summary.capabilityGaps || []).map(entry => item(`${esc(entry.category || 'unknown')} | count=${entry.count ?? 1}`, entry.description || '', `first=${esc(fmt(entry.firstObservedAtUtc))} | last=${esc(fmt(entry.lastObservedAtUtc))}`)).join('') || '<div class="muted">No capability gaps recorded yet. The agent will populate this once it encounters unfulfillable requests.</div>';
-      $('selfRepairHistory').innerHTML = (summary.selfRepairHistory || []).map(entry => item(`${entry.appliedActions ?? 0} action(s) applied | ${entry.rejectedActions ?? 0} rejected`, entry.summary || '', `${esc(fmt(entry.atUtc))}${entry.rawModelReasoning ? ` | reasoning: ${esc(String(entry.rawModelReasoning).slice(0, 120))}` : ''}`)).join('') || '<div class="muted">No evolution cycles run yet. The agent runs self-repair when capability gaps or learning incidents exist.</div>';
     }
 
     function renderCommandConfig(commandConfig) {
@@ -4365,15 +4611,18 @@ static string BuildDashboardHtml() => """
     async function load() {
       localStorage.setItem('rustops.apiKey', keyInput.value.trim());
       try {
-        const [summary, _, llmSummary, llmConfig, commandConfig, consoleData, chatData] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config'), fetchJson('/agent/console-monitor').catch(() => ({})), fetchJson('/agent/player-chat/recent').catch(() => ({}))]);
+        const [summary, _, llmSummary, llmConfig, commandConfig, consoleData, chatData, adminCallData] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config'), fetchJson('/agent/console-monitor').catch(() => ({})), fetchJson('/agent/player-chat/recent').catch(() => ({})), fetchJson('/agent/player-chat/admin-calls').catch(() => ({}))]);
         $('stamp').textContent = `Updated ${fmt(summary.generatedAtUtc)} | API ${summary.host.bindUrl}`;
-        $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'configured via rustmgr'), metric('Online', summary.counts?.onlineServers ?? 0, 'currently running'), metric('Pending Actions', summary.counts?.pendingActions ?? 0, 'agent approval queue'), metric('Incidents', summary.counts?.incidents ?? 0, 'recent tracked issues'), metric('Outbox', summary.counts?.messageOutbox ?? 0, 'messages waiting for Steam'), metric('LLM Calls', (summary.llmInteractions || []).length, 'recent recorded interactions'), metric('Capability Gaps', summary.counts?.capabilityGaps ?? 0, 'unfulfilled request patterns'), metric('Evolution Runs', summary.counts?.selfRepairRuns ?? 0, 'agent improvement cycles')].join('');
+        $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'local configured'), metric('Online', summary.counts?.onlineServers ?? 0, 'running'), metric('Remote', summary.counts?.remoteServers ?? 0, 'agent-backed'), metric('Incidents', summary.counts?.incidents ?? 0, 'tracked issues'), metric('Admin Calls', summary.counts?.adminChatMessages ?? 0, 'from player chat'), metric('LLM Calls', summary.counts?.llmCallsCount ?? 0, 'total interactions')].join('');
         renderServers(summary.servers || []);
         renderAgent(summary);
+        renderRemoteAgentStatus();
         renderLlm(summary, llmSummary, llmConfig);
         renderCommandConfig(commandConfig);
         renderConsoleStats(consoleData);
         renderChatStats(chatData);
+        renderAdminCalls(adminCallData);
+        renderServerChatVolume(adminCallData);
       } catch (error) { alert(`Dashboard request failed: ${error.message}`); }
     }
 
@@ -4410,6 +4659,43 @@ static string BuildDashboardHtml() => """
         $('commandSaveStatus').textContent = `Saved ${new Date().toLocaleString()} | restart rustopsagent.service`;
         await load();
       } catch (error) { alert(`Failed to save command policy: ${error.message}`); }
+    }
+
+    async function loadTruncationStatus() {
+      try {
+        const status = await fetchJson('/agent/truncation-status');
+        $('truncationStatus').innerHTML = (status.items || []).map(item => item(esc(item.name), esc(item.path), `${bytes(item.sizeBytes)} | ${item.canTruncate ? 'truncate available' : 'not truncatable'}`)).join('') || '<div class="muted">No data to truncate.</div>';
+      } catch (error) {
+        $('truncationStatus').innerHTML = `<div class="muted">Failed to load status: ${error.message}</div>`;
+      }
+    }
+
+    async function truncateErrors() {
+      const dateVal = $('truncationDate').value;
+      if (!dateVal) { alert('Please select a date'); return; }
+      const beforeDate = new Date(dateVal + 'T00:00:00Z');
+      try {
+        $('truncationResult').textContent = 'Processing…';
+        const result = await fetchJson('/agent/truncate/errors', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ beforeDateUtc: beforeDate.toISOString(), dryRun: $('truncationDryRun').checked }) });
+        $('truncationResult').textContent = `${result.message || 'Success'}`;
+        await loadTruncationStatus();
+      } catch (error) {
+        $('truncationResult').textContent = `Error: ${error.message}`;
+      }
+    }
+
+    async function truncateIncidents() {
+      const dateVal = $('truncationDate').value;
+      if (!dateVal) { alert('Please select a date'); return; }
+      const beforeDate = new Date(dateVal + 'T00:00:00Z');
+      try {
+        $('truncationResult').textContent = 'Processing…';
+        const result = await fetchJson('/agent/truncate/incidents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ beforeDateUtc: beforeDate.toISOString(), dryRun: $('truncationDryRun').checked }) });
+        $('truncationResult').textContent = `${result.message || 'Success'}`;
+        await loadTruncationStatus();
+      } catch (error) {
+        $('truncationResult').textContent = `Error: ${error.message}`;
+      }
     }
 
     function renderConsoleStats(data) {
@@ -4513,6 +4799,9 @@ static string BuildDashboardHtml() => """
     $('cancelRemoteForm').addEventListener('click', hideRemoteForm);
     $('saveRemoteServer').addEventListener('click', saveRemoteServerForm);
     $('provisionServer').addEventListener('click', provisionServer);
+    $('addRemoteAgentBtn').addEventListener('click', showAddRemoteAgentModal);
+    $('truncateErrors').addEventListener('click', truncateErrors);
+    $('truncateIncidents').addEventListener('click', truncateIncidents);
     document.addEventListener('click', event => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
@@ -4528,7 +4817,7 @@ static string BuildDashboardHtml() => """
         submitIncidentFeedback(id, verdict, note);
       }
     });
-    if (keyInput.value) { load(); loadIncidentFeedback(); }
+    if (keyInput.value) { load(); loadIncidentFeedback(); loadTruncationStatus(); }
   </script>
 </body>
 </html>
@@ -5593,6 +5882,12 @@ public sealed class ServerConfig
 
 public sealed record RconConnectionInfo(string Host, ushort Port, string Password, bool WebRconEnabled);
 
+public sealed class TruncationRequest
+{
+    [JsonPropertyName("beforeDateUtc")] public DateTime? BeforeDateUtc { get; set; }
+    [JsonPropertyName("dryRun")] public bool DryRun { get; set; }
+}
+
 public sealed record RemoteServerEntry(
     string Name,
     string DisplayName,
@@ -5603,6 +5898,18 @@ public sealed record RemoteServerEntry(
     string AgentBaseUrl = "",
     string AgentApiKey = "",
     string AgentServerName = "");
+
+public sealed class RemoteAgentStatus
+{
+    public string ServerName { get; set; } = string.Empty;
+    public string AgentBaseUrl { get; set; } = string.Empty;
+    public bool IsReachable { get; set; }
+    public DateTime? LastHealthCheckAtUtc { get; set; }
+    public int? LastHealthCheckLatencyMs { get; set; }
+    public string? LastError { get; set; }
+    public int FailureCount { get; set; }
+    public int SuccessCount { get; set; }
+}
 
 internal sealed record IncidentFeedbackEntry(string? Verdict, string? Note, DateTime? AnsweredAtUtc);
 

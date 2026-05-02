@@ -143,6 +143,38 @@ internal sealed class PlayerChatKnowledge
     [JsonPropertyName("keyThemes")] public List<string> KeyThemes { get; set; } = new();
     [JsonPropertyName("constructiveFeedback")] public List<string> ConstructiveFeedback { get; set; } = new();
     [JsonPropertyName("analysedAtUtc")] public DateTime? AnalysedAtUtc { get; set; }
+    [JsonPropertyName("dailySummaries")] public List<DailyChatSummary> DailySummaries { get; set; } = new();
+    [JsonPropertyName("perServerVolume")] public Dictionary<string, ServerChatVolume> PerServerVolume { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    [JsonPropertyName("adminCalls")] public List<AdminCallEvent> AdminCalls { get; set; } = new();
+    [JsonPropertyName("lastDailySummaryDateUtc")] public DateTime? LastDailySummaryDateUtc { get; set; }
+}
+
+internal sealed class DailyChatSummary
+{
+    [JsonPropertyName("dateUtc")] public DateTime DateUtc { get; set; } = DateTime.UtcNow.Date.ToUniversalTime();
+    [JsonPropertyName("messageCount")] public int MessageCount { get; set; }
+    [JsonPropertyName("summary")] public string? Summary { get; set; }
+    [JsonPropertyName("keyTopics")] public List<string> KeyTopics { get; set; } = new();
+}
+
+internal sealed class ServerChatVolume
+{
+    [JsonPropertyName("serverName")] public string ServerName { get; set; } = string.Empty;
+    [JsonPropertyName("todayMessageCount")] public int TodayMessageCount { get; set; }
+    [JsonPropertyName("totalMessageCount")] public int TotalMessageCount { get; set; }
+    [JsonPropertyName("lastMessageAtUtc")] public DateTime? LastMessageAtUtc { get; set; }
+    [JsonPropertyName("activePlayerCount")] public int ActivePlayerCount { get; set; }
+}
+
+internal sealed class AdminCallEvent
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    [JsonPropertyName("serverName")] public string ServerName { get; set; } = string.Empty;
+    [JsonPropertyName("playerName")] public string PlayerName { get; set; } = string.Empty;
+    [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
+    [JsonPropertyName("callType")] public string CallType { get; set; } = string.Empty;
+    [JsonPropertyName("capturedAtUtc")] public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("acknowledged")] public bool Acknowledged { get; set; }
 }
 
 internal sealed class PlayerChatEntry
@@ -151,6 +183,7 @@ internal sealed class PlayerChatEntry
     [JsonPropertyName("playerName")] public string PlayerName { get; set; } = string.Empty;
     [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
     [JsonPropertyName("capturedAtUtc")] public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("isAdminCall")] public bool IsAdminCall { get; set; }
 }
 
 // Classifier learning types — persist admin corrections and synthesized routing rules.
