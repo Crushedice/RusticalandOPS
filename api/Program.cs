@@ -181,6 +181,17 @@ app.MapGet("/dashboard/summary", async () =>
 
     var memory = LoadAgentMemorySnapshot(agentPaths);
 
+    // Load and check remote agents
+    var remoteServersForSummary = LoadRemoteServers();
+    var remoteCount = remoteServersForSummary.Count;
+    var remoteOnlineCount = 0;
+    foreach (var remote in remoteServersForSummary.Where(r => !string.IsNullOrWhiteSpace(r.AgentBaseUrl)))
+    {
+        var healthResult = await TryProxyRemoteAgentAsync(remote.Name, HttpMethod.Get, "/health");
+        if (healthResult != null)
+            remoteOnlineCount++;
+    }
+
     return Results.Ok(new
     {
         generatedAtUtc = DateTime.UtcNow,
@@ -201,8 +212,8 @@ app.MapGet("/dashboard/summary", async () =>
         {
             servers = statuses.Length,
             onlineServers = statuses.Count(s => s.online),
-            remoteServers = 0,
-            remoteServersOnline = 0,
+            remoteServers = remoteCount,
+            remoteServersOnline = remoteOnlineCount,
             pendingActions = memory.PendingActions.Count,
             incidents = memory.RecentIncidents.Count,
             agentErrors = memory.AgentErrors.Count,
@@ -962,7 +973,93 @@ app.MapGet("/servers/remote/list", () =>
 
 app.MapGet("/servers/remote/agent-status", () =>
 {
-    return Results.Ok(remoteAgentStatus.Values.OrderBy(s => s.ServerName));
+    var remoteServers = LoadRemoteServers();
+    var agents = new List<object>();
+
+    foreach (var remote in remoteServers.Where(r => !string.IsNullOrWhiteSpace(r.AgentBaseUrl)))
+    {
+        var statusKey = remote.Name;
+        if (!remoteAgentStatus.ContainsKey(statusKey))
+            remoteAgentStatus[statusKey] = new RemoteAgentStatus
+            {
+                ServerName = remote.Name,
+                AgentBaseUrl = remote.AgentBaseUrl
+            };
+
+        var status = remoteAgentStatus[statusKey];
+        agents.Add(new
+        {
+            serverName = status.ServerName,
+            agentBaseUrl = status.AgentBaseUrl,
+            isReachable = status.IsReachable,
+            lastHealthCheckAtUtc = status.LastHealthCheckAtUtc,
+            lastHealthCheckLatencyMs = status.LastHealthCheckLatencyMs,
+            lastError = status.LastError,
+            successCount = status.SuccessCount,
+            failureCount = status.FailureCount
+        });
+    }
+
+    return Results.Ok(agents);
+});
+
+app.MapPost("/servers/remote/agent-register", async (HttpContext ctx) =>
+{
+    try
+    {
+        var doc = await JsonDocument.ParseAsync(ctx.Request.Body);
+        var root = doc.RootElement;
+        var name = root.TryGetProperty("name", out var n) ? n.GetString() : null;
+        var displayName = root.TryGetProperty("displayName", out var d) ? d.GetString() : null;
+        var baseUrl = root.TryGetProperty("agentBaseUrl", out var b) ? b.GetString() : null;
+        var apiKey = root.TryGetProperty("agentApiKey", out var a) ? a.GetString() : null;
+
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(baseUrl))
+            return Results.BadRequest(new ApiError("invalid_request", "name and agentBaseUrl are required"));
+
+        var newServer = new RemoteServerEntry(
+            Name: name,
+            DisplayName: displayName ?? name,
+            RconIp: "0.0.0.0",
+            RconPort: 28016,
+            RconPassword: "auto-registered",
+            GamePort: 0,
+            AgentBaseUrl: baseUrl,
+            AgentApiKey: apiKey ?? string.Empty,
+            AgentServerName: name
+        );
+
+        // Save to remote servers config
+        var remoteServersPath = Path.Combine(configDir, "remote-servers.json");
+        var remoteServers = LoadRemoteServers().ToList();
+        remoteServers.RemoveAll(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        remoteServers.Add(newServer);
+
+        var serversList = remoteServers.Select(s => new
+        {
+            name = s.Name,
+            displayName = s.DisplayName,
+            rconIp = s.RconIp,
+            rconPort = s.RconPort,
+            rconPassword = s.RconPassword,
+            gamePort = s.GamePort,
+            agentBaseUrl = s.AgentBaseUrl,
+            agentApiKey = s.AgentApiKey,
+            agentServerName = s.AgentServerName
+        });
+
+        var json = JsonSerializer.Serialize(new { servers = serversList }, JsonDefaults.Options);
+        File.WriteAllText(remoteServersPath, json);
+
+        // Test connection
+        var testResult = await TryProxyRemoteAgentAsync(name, HttpMethod.Get, "/health");
+
+        return Results.Ok(new { ok = true, message = $"Remote agent '{name}' registered successfully" });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("registration_failed", ex.Message));
+    }
 });
 
 app.MapPost("/servers/remote/{name}/check-health", async (string name) =>
