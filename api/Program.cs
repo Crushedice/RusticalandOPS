@@ -262,8 +262,10 @@ app.MapGet("/dashboard/summary", async () =>
                 s.queuedPlayers,
                 remote = false,
                 agentReachable = false,
+                agentAuthValid = false,
                 agentLastCheckAtUtc = (DateTime?)null,
-                agentLastCheckLatencyMs = (int?)null
+                agentLastCheckLatencyMs = (int?)null,
+                agentLastError = (string?)null
             })
             .Concat(remoteServersForSummary.Select(r =>
             {
@@ -300,8 +302,10 @@ app.MapGet("/dashboard/summary", async () =>
                     queuedPlayers = GetInt("queuedPlayers"),
                     remote = true,
                     agentReachable = agSt?.IsReachable ?? false,
+                    agentAuthValid = agSt?.IsAuthValid ?? false,
                     agentLastCheckAtUtc = agSt?.LastHealthCheckAtUtc,
-                    agentLastCheckLatencyMs = agSt?.LastHealthCheckLatencyMs
+                    agentLastCheckLatencyMs = agSt?.LastHealthCheckLatencyMs,
+                    agentLastError = agSt?.LastError
                 };
             }))
             .OrderBy(s => s.name, StringComparer.OrdinalIgnoreCase),
@@ -928,37 +932,60 @@ async Task CheckRemoteAgentHealthAsync(RemoteServerEntry remote)
         };
 
     var status = remoteAgentStatus[statusKey];
+    var agentKey = string.IsNullOrWhiteSpace(remote.AgentApiKey) ? apiKey : remote.AgentApiKey.Trim();
+    var baseUrl = remote.AgentBaseUrl.TrimEnd('/');
     var sw = System.Diagnostics.Stopwatch.StartNew();
     try
     {
-        var url = $"{remote.AgentBaseUrl.TrimEnd('/')}/health";
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
-        using var message = new HttpRequestMessage(HttpMethod.Get, url);
-        var agentKey = string.IsNullOrWhiteSpace(remote.AgentApiKey) ? apiKey : remote.AgentApiKey.Trim();
-        message.Headers.TryAddWithoutValidation("X-Api-Key", agentKey);
 
-        using var response = await http.SendAsync(message);
+        // Step 1: connectivity check via /health (unauthenticated)
+        using var healthMsg = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/health");
+        using var healthResp = await http.SendAsync(healthMsg);
         sw.Stop();
         status.LastHealthCheckLatencyMs = (int)sw.ElapsedMilliseconds;
         status.LastHealthCheckAtUtc = DateTime.UtcNow;
 
-        if (response.IsSuccessStatusCode)
+        if (!healthResp.IsSuccessStatusCode)
         {
-            status.IsReachable = true;
+            status.IsReachable = false;
+            status.IsAuthValid = false;
+            status.FailureCount++;
+            status.LastError = $"Health check HTTP {healthResp.StatusCode}";
+            return;
+        }
+        status.IsReachable = true;
+
+        // Step 2: auth check via /servers (authenticated)
+        using var http2 = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+        using var authMsg = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/servers");
+        authMsg.Headers.TryAddWithoutValidation("X-Api-Key", agentKey);
+        using var authResp = await http2.SendAsync(authMsg);
+
+        if (authResp.IsSuccessStatusCode)
+        {
+            status.IsAuthValid = true;
             status.SuccessCount++;
             status.LastError = null;
         }
+        else if (authResp.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            status.IsAuthValid = false;
+            status.FailureCount++;
+            status.LastError = "Authentication failed: check AgentApiKey in remote-servers.json matches RUSTOPS_REMOTE_AGENT_API_KEY on the remote host";
+        }
         else
         {
-            status.IsReachable = false;
+            status.IsAuthValid = false;
             status.FailureCount++;
-            status.LastError = $"HTTP {response.StatusCode}";
+            status.LastError = $"Auth check HTTP {authResp.StatusCode}";
         }
     }
     catch (Exception ex)
     {
         sw.Stop();
         status.IsReachable = false;
+        status.IsAuthValid = false;
         status.FailureCount++;
         status.LastError = ex.Message;
         status.LastHealthCheckAtUtc = DateTime.UtcNow;
@@ -1113,6 +1140,7 @@ app.MapGet("/servers/remote/agent-status", () =>
             serverName = status.ServerName,
             agentBaseUrl = status.AgentBaseUrl,
             isReachable = status.IsReachable,
+            isAuthValid = status.IsAuthValid,
             lastHealthCheckAtUtc = status.LastHealthCheckAtUtc,
             lastHealthCheckLatencyMs = status.LastHealthCheckLatencyMs,
             lastError = status.LastError,
@@ -1192,8 +1220,11 @@ app.MapPost("/servers/remote/{name}/check-health", async (string name) =>
     await CheckRemoteAgentHealthAsync(server);
     var status = remoteAgentStatus.TryGetValue(server.Name, out var st) ? st : null;
 
-    if (status?.IsReachable == true)
-        return Results.Ok(new { ok = true, latencyMs = status.LastHealthCheckLatencyMs });
+    if (status?.IsReachable == true && status.IsAuthValid == true)
+        return Results.Ok(new { ok = true, latencyMs = status.LastHealthCheckLatencyMs, authValid = true });
+
+    if (status?.IsReachable == true && status.IsAuthValid == false)
+        return Results.BadRequest(new ApiError("agent_auth_failed", status.LastError ?? "Remote agent authentication failed. Check API key."));
 
     return Results.BadRequest(new ApiError("agent_unreachable", status?.LastError ?? "Remote agent health check failed"));
 });
@@ -1263,9 +1294,13 @@ app.MapPost("/servers/remote/{name}/test", async (string name) =>
 
     if (HasRemoteAgent(server))
     {
-        var remoteResult = await TryProxyRemoteAgentAsync(name, HttpMethod.Get, "/health");
-        if (remoteResult is not null)
-            return remoteResult;
+        await CheckRemoteAgentHealthAsync(server);
+        var agSt = remoteAgentStatus.TryGetValue(server.Name, out var agentSt) ? agentSt : null;
+        if (agSt?.IsReachable == true && agSt.IsAuthValid == true)
+            return Results.Ok(new { ok = true, latencyMs = agSt.LastHealthCheckLatencyMs, authValid = true });
+        if (agSt?.IsReachable == true)
+            return Results.BadRequest(new ApiError("agent_auth_failed", agSt.LastError ?? "Authentication failed."));
+        return Results.BadRequest(new ApiError("agent_unreachable", agSt?.LastError ?? "Agent unreachable."));
     }
 
     try
@@ -1321,8 +1356,10 @@ app.MapGet("/servers/summary", async () =>
                 agentEnabled = false,
                 agentBaseUrl = remote.AgentBaseUrl,
                 agentReachable = agentStatus?.IsReachable ?? false,
+                agentAuthValid = agentStatus?.IsAuthValid ?? false,
                 agentLastCheckAtUtc = agentStatus?.LastHealthCheckAtUtc,
-                agentLastCheckLatencyMs = agentStatus?.LastHealthCheckLatencyMs
+                agentLastCheckLatencyMs = agentStatus?.LastHealthCheckLatencyMs,
+                agentLastError = agentStatus?.LastError
             });
             continue;
         }
@@ -1334,8 +1371,10 @@ app.MapGet("/servers/summary", async () =>
             remoteObject["agentEnabled"] = true;
             remoteObject["agentBaseUrl"] = remote.AgentBaseUrl;
             remoteObject["agentReachable"] = agentStatus?.IsReachable ?? false;
+            remoteObject["agentAuthValid"] = agentStatus?.IsAuthValid ?? false;
             remoteObject["agentLastCheckAtUtc"] = agentStatus?.LastHealthCheckAtUtc;
             remoteObject["agentLastCheckLatencyMs"] = agentStatus?.LastHealthCheckLatencyMs;
+            remoteObject["agentLastError"] = agentStatus?.LastError;
         }
 
         rows.Add(remoteStatus);
@@ -1678,6 +1717,13 @@ app.MapPost("/servers/provision", (ProvisionServerRequest request) =>
 // way to know what ports/identity a server is running without parsing JSON config.
 app.MapGet("/servers/{server}/meta", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/meta");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -1698,8 +1744,15 @@ app.MapGet("/servers/{server}/meta", async (string server) =>
 });
 
 // -- Oxide / plugin validation ------------------------------------------------
-app.MapGet("/servers/{server}/oxide/validate", (string server) =>
+app.MapGet("/servers/{server}/oxide/validate", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/oxide/validate");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     var cfg = LoadServerConfig(server);
     if (cfg is null)
         return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));    
@@ -1770,6 +1823,13 @@ app.MapGet("/servers/{server}/oxide/validate", (string server) =>
 
 app.MapGet("/servers/{server}/plugins/updates", async (string server, CancellationToken cancellationToken) =>
 {
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Get, "/servers/{server}/plugins/updates");
+        if (remoteResult is not null)
+            return remoteResult;
+    }
+
     var result = await CheckPluginUpdatesAsync(server, cancellationToken);
     return result is null
         ? Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."))
@@ -1786,6 +1846,13 @@ app.MapPost("/servers/{server}/plugins/install", async (string server, PluginIns
         downloadUri.Scheme is not ("http" or "https"))
     {
         return Results.BadRequest(new ApiError("invalid_request", "downloadUrl must be an absolute HTTP(S) URL."));
+    }
+
+    if (IsRemoteServerName(server))
+    {
+        var remoteResult = await TryProxyRemoteAgentAsync(server, HttpMethod.Post, "/servers/{server}/plugins/install", request);
+        if (remoteResult is not null)
+            return remoteResult;
     }
 
     try
@@ -4657,7 +4724,13 @@ static string BuildDashboardHtml() => """
       $('servers').innerHTML = (servers || []).map(server => {
         const isRemote = server.remote === true;
         const remoteBadge = isRemote ? ' <span class="pill" style="background:rgba(102,200,255,.12);color:var(--accent);">[REMOTE]</span>' : '';
-        const agentStatus = isRemote ? (server.agentReachable ? `agent-ok | ${server.agentLastCheckLatencyMs ?? '?'}ms` : 'agent-offline') : '';
+        const agentStatus = isRemote
+          ? (server.agentReachable
+              ? (server.agentAuthValid
+                  ? `● agent-ok | ${server.agentLastCheckLatencyMs ?? '?'}ms`
+                  : `● agent-unauth`)
+              : 'agent-offline')
+          : '';
         return `<tr><td><strong>${esc(server.name)}${remoteBadge}</strong><div class="tiny muted">${esc(server.hostname || 'hostname unavailable')}${agentStatus ? `<br/>${agentStatus}` : ''}</div></td><td>${pill(server.state)}</td><td>${esc(server.currentPlayers ?? (server.online ? '?' : '-'))}/${esc(server.maxPlayers ?? '?')}</td><td>${esc(dur(server.uptimeSeconds))}</td><td>${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(Math.round(server.memoryMb))} MB` : '-'}</td><td>${server.autoRestart ? 'on' : 'off'}</td><td>${esc(server.recentWarningCount ?? 0)}</td></tr>`;
       }).join('') || '<tr><td colspan="7" class="muted">No servers returned.</td></tr>';
       $('serverCards').innerHTML = (servers || []).map(server => {
@@ -4665,8 +4738,10 @@ static string BuildDashboardHtml() => """
         const remoteBadge = isRemote ? '<span class="chip" style="background:rgba(102,200,255,.10);border-color:rgba(102,200,255,.22);">[REMOTE]</span>' : '';
         const agentInfo = isRemote
           ? (server.agentReachable
-              ? `<span style="color:var(--accent);">● agent-ok</span> | ${server.agentLastCheckLatencyMs ?? '?'}ms latency<br/>`
-              : `<span style="color:var(--warn, #f59e0b);">● agent-offline</span><br/>`)
+              ? (server.agentAuthValid
+                  ? `<span style="color:var(--accent);">● agent-ok</span> | ${server.agentLastCheckLatencyMs ?? '?'}ms latency<br/>`
+                  : `<span style="color:#f59e0b;">● agent-reachable (auth failed)</span><br/>`)
+              : `<span style="color:#f59e0b;">● agent-offline</span><br/>`)
           : '';
         const memStr = server.memoryMb !== null && server.memoryMb !== undefined ? `${Math.round(server.memoryMb)} MB` : 'n/a';
         return `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(server.name)}</strong>${pill(server.state)}${remoteBadge}</div><div class="muted" style="margin-top:6px;">${esc(server.hostname || 'hostname unavailable')}</div>${agentInfo ? `<div class="tiny" style="margin-top:4px;">${agentInfo}</div>` : ''}<div class="tiny muted" style="margin-top:8px;">Map ${esc(server.map || 'n/a')} | Queue ${esc(server.queuedPlayers ?? 0)} | FPS ${esc(server.framerate != null ? Math.round(server.framerate) : 'n/a')}</div><div class="tiny muted" style="margin-top:8px;">PID ${esc(server.pid ?? '-')} | Uptime ${esc(dur(server.uptimeSeconds))} | Mem ${memStr} | ${server.queryOk ? 'query-ok' : (server.online ? 'query-missed' : 'offline')}</div><div class="chip-list">${(server.playerPreview || []).slice(0, 5).map(name => `<span class="chip">${esc(name)}</span>`).join('') || '<span class="muted tiny">No player names sampled.</span>'}</div></div>`;
@@ -4677,7 +4752,10 @@ static string BuildDashboardHtml() => """
       try {
         const agents = await fetchJson('/servers/remote/agent-status');
         const agentsList = (agents || []).map(agent => {
-          const statusPill = agent.isReachable ? `${pill('ok')} | ${agent.lastHealthCheckLatencyMs}ms` : pill('offline');
+          let statusPill;
+          if (!agent.isReachable) statusPill = pill('offline');
+          else if (!agent.isAuthValid) statusPill = `${pill('warn')} reachable | auth-failed | ${agent.lastHealthCheckLatencyMs ?? '?'}ms`;
+          else statusPill = `${pill('ok')} | ${agent.lastHealthCheckLatencyMs ?? '?'}ms`;
           const lastCheck = agent.lastHealthCheckAtUtc ? `| checked ${fmt(agent.lastHealthCheckAtUtc)}` : '| never checked';
           const errorInfo = agent.lastError ? `<br/><span class="muted" style="font-size:11px;">${esc(agent.lastError)}</span>` : '';
           return item(`${esc(agent.serverName)}`, `${agent.agentBaseUrl}`, `${statusPill} ${lastCheck}${errorInfo}`);
@@ -6121,6 +6199,7 @@ public sealed class RemoteAgentStatus
     public string ServerName { get; set; } = string.Empty;
     public string AgentBaseUrl { get; set; } = string.Empty;
     public bool IsReachable { get; set; }
+    public bool IsAuthValid { get; set; }
     public DateTime? LastHealthCheckAtUtc { get; set; }
     public int? LastHealthCheckLatencyMs { get; set; }
     public string? LastError { get; set; }

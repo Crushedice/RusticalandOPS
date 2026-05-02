@@ -1,4 +1,7 @@
+using System.Diagnostics;
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -76,9 +79,14 @@ try
             "server-config",
             "server-logs",
             "server-events",
+            "server-meta",
             "rcon-command",
             "rcon-query",
-            "moderation"
+            "moderation",
+            "oxide-validate",
+            "plugin-updates",
+            "plugin-install",
+            "process-stats"
         }
     }));
 
@@ -325,6 +333,121 @@ try
     app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest request) =>
         await ExecuteModerationAsync(server, $"unban {request.SteamId}"));
 
+    // -- Runtime meta -----------------------------------------------------------
+    app.MapGet("/servers/{server}/meta", async (string server) =>
+    {
+        if (!await IsKnownServerAsync(server))
+            return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
+
+        var metaPath = Path.Combine(runtimeDir, $"{server}.meta");
+        if (!File.Exists(metaPath))
+            return Results.NotFound(new ApiError("not_found", "Meta file not found. Run sync-config first."));
+
+        var lines = await File.ReadAllLinesAsync(metaPath);
+        var meta = lines
+            .Select(l => l.Split('=', 2))
+            .Where(p => p.Length == 2)
+            .ToDictionary(
+                p => p[0].Trim().ToLowerInvariant(),
+                p => p[1].Trim('"'));
+
+        return Results.Ok(meta);
+    });
+
+    // -- Oxide / plugin validation ---------------------------------------------
+    app.MapGet("/servers/{server}/oxide/validate", (string server) =>
+    {
+        var cfg = LoadServerConfig(server);
+        if (cfg is null)
+            return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+
+        var normalized = NormalizeConfig(server, cfg);
+        var oxideRoots = GetOxideRootCandidates(normalized);
+        var configPaths = oxideRoots
+            .Select(root => Path.Combine(root, "config"))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var pluginsPaths = oxideRoots
+            .Select(root => Path.Combine(root, "plugins"))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        string[] jsonFiles;
+        string[] pluginFiles;
+        try
+        {
+            jsonFiles = configPaths
+                .Where(Directory.Exists)
+                .SelectMany(path => Directory.GetFiles(path, "*.json", SearchOption.AllDirectories))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+
+            pluginFiles = pluginsPaths
+                .Where(Directory.Exists)
+                .SelectMany(path => Directory.GetFiles(path, "*.cs", SearchOption.AllDirectories))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return Results.Ok(new
+            {
+                server,
+                ok = false,
+                error = "access_denied",
+                note = ex.Message,
+                searchedPaths = new { oxideRoots, configPaths, pluginsPaths }
+            });
+        }
+
+        var jsonResults = jsonFiles.Select(ValidateJsonFile).ToList();
+        var pluginResults = pluginFiles.Select(ValidateOxidePluginFile).ToList();
+
+        return Results.Ok(new
+        {
+            server,
+            ok = jsonResults.All(r => r.Ok) && pluginResults.All(r => r.Ok),
+            searchedPaths = new { oxideRoots, configPaths, pluginsPaths },
+            jsonConfigCount = jsonFiles.Length,
+            pluginCount = pluginFiles.Length,
+            jsonConfigs = jsonResults,
+            plugins = pluginResults
+        });
+    });
+
+    app.MapGet("/servers/{server}/plugins/updates", async (string server, CancellationToken cancellationToken) =>
+    {
+        var result = await CheckPluginUpdatesAsync(server, configDir, cancellationToken);
+        return result is null
+            ? Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."))
+            : Results.Ok(result);
+    });
+
+    app.MapPost("/servers/{server}/plugins/install", async (string server, PluginInstallRequest request, CancellationToken cancellationToken) =>
+    {
+        if (string.IsNullOrWhiteSpace(request.PluginName))
+            return Results.BadRequest(new ApiError("invalid_request", "pluginName is required."));
+
+        if (string.IsNullOrWhiteSpace(request.DownloadUrl) ||
+            !Uri.TryCreate(request.DownloadUrl, UriKind.Absolute, out var downloadUri) ||
+            downloadUri.Scheme is not ("http" or "https"))
+        {
+            return Results.BadRequest(new ApiError("invalid_request", "downloadUrl must be an absolute HTTP(S) URL."));
+        }
+
+        try
+        {
+            var result = await InstallPluginAsync(server, request.PluginName, downloadUri, configDir, cancellationToken);
+            return result is null
+                ? Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."))
+                : Results.Ok(result);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return Results.StatusCode(StatusCodes.Status403Forbidden);
+        }
+    });
+
     await app.RunAsync();
 
     async Task<List<string>> ListServersAsync()
@@ -349,6 +472,18 @@ try
     async Task<object> GetStatusObjectAsync(string server)
     {
         var status = await executor.GetStatusAsync(server);
+        double? memoryMb = null;
+        int? uptimeSeconds = null;
+        if (status?.Pid.HasValue == true)
+        {
+            try
+            {
+                var proc = Process.GetProcessById(status.Pid.Value);
+                memoryMb = Math.Round(proc.WorkingSet64 / 1024.0 / 1024.0, 1);
+                uptimeSeconds = (int)(DateTime.UtcNow - proc.StartTime.ToUniversalTime()).TotalSeconds;
+            }
+            catch { /* process may have exited */ }
+        }
         return new
         {
             name = server,
@@ -358,6 +493,8 @@ try
             autoRestart = status?.AutoRestart ?? false,
             session = status?.Session ?? false,
             raw = status?.Raw ?? string.Empty,
+            memoryMb,
+            uptimeSeconds,
             remoteAgent = true
         };
     }
@@ -554,6 +691,307 @@ static string? ReadArgValue(string? additionalArgs, string key)
     return match.Success ? match.Groups["v"].Value : null;
 }
 
+static ServerConfig NormalizeConfig(string server, ServerConfig cfg) => new()
+{
+    Name                 = server,
+    ServerHostname       = cfg.ServerHostname?.Trim()       ?? string.Empty,
+    ServerDescription    = cfg.ServerDescription?.Trim()    ?? string.Empty,
+    ServerUrl            = cfg.ServerUrl?.Trim()            ?? string.Empty,
+    ServerLogoImage      = cfg.ServerLogoImage?.Trim()      ?? string.Empty,
+    ServerHeaderImage    = cfg.ServerHeaderImage?.Trim()    ?? string.Empty,
+    ServerTags           = cfg.ServerTags?.Trim()           ?? string.Empty,
+    ServerIdentity       = (cfg.ServerIdentity?.Trim() is { Length: > 0 } id) ? id : server,
+    ServerPort           = cfg.ServerPort,
+    RconPort             = cfg.RconPort,
+    AppPort              = cfg.AppPort,
+    ServerWorldSize      = cfg.ServerWorldSize,
+    ServerSeed           = cfg.ServerSeed,
+    ServerMaxPlayers     = cfg.ServerMaxPlayers <= 0 ? 100 : cfg.ServerMaxPlayers,
+    ServerLevel          = string.IsNullOrWhiteSpace(cfg.ServerLevel) ? "Procedural Map" : cfg.ServerLevel.Trim(),
+    ServerLevelUrl       = cfg.ServerLevelUrl?.Trim()       ?? string.Empty,
+    RconPassword         = cfg.RconPassword?.Trim()         ?? string.Empty,
+    ServerReportsServerEndpoint = cfg.ServerReportsServerEndpoint?.Trim() ?? string.Empty,
+    LogFile              = string.IsNullOrWhiteSpace(cfg.LogFile) ? "Log.txt" : RustOpsEnv.NormalizePath(cfg.LogFile.Trim()),
+    ServerEncryption     = string.IsNullOrWhiteSpace(cfg.ServerEncryption) ? "1" : cfg.ServerEncryption.Trim(),
+    BoomboxServerUrlList = cfg.BoomboxServerUrlList?.Trim() ?? string.Empty,
+    AdditionalArgs       = cfg.AdditionalArgs?.Trim()       ?? string.Empty,
+    ServerDir            = string.IsNullOrWhiteSpace(cfg.ServerDir) ? $"/srv/rust/{server}" : RustOpsEnv.NormalizePath(cfg.ServerDir.Trim()),
+    OxideDir             = string.IsNullOrWhiteSpace(cfg.OxideDir) ? string.Empty : RustOpsEnv.NormalizePath(cfg.OxideDir.Trim())
+};
+
+static List<string> GetOxideRootCandidates(ServerConfig normalized)
+{
+    if (!string.IsNullOrWhiteSpace(normalized.OxideDir))
+        return new List<string> { normalized.OxideDir.TrimEnd('/', '\\') };
+
+    var canonicalRoot = Environment.GetEnvironmentVariable("RUST_SERVER_ROOT") ?? "/srv/rust";
+    return new[]
+        {
+            Path.Combine(canonicalRoot, normalized.Name, "oxide"),
+            Path.Combine(normalized.ServerDir, "oxide"),
+            Path.Combine(normalized.ServerDir, normalized.ServerIdentity, "oxide"),
+            Path.Combine(normalized.ServerDir, "server", normalized.ServerIdentity, "oxide"),
+            Path.Combine(canonicalRoot, normalized.ServerIdentity, "oxide")
+        }
+        .Where(p => !string.IsNullOrWhiteSpace(p))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static ValidationResult ValidateJsonFile(string path)
+{
+    try
+    {
+        using var _ = JsonDocument.Parse(File.ReadAllText(path));
+        return new ValidationResult { Path = path, Ok = true };
+    }
+    catch (Exception ex)
+    {
+        return new ValidationResult { Path = path, Ok = false, Message = ex.Message };
+    }
+}
+
+static ValidationResult ValidateOxidePluginFile(string path)
+{
+    var text = File.ReadAllText(path);
+    var infoMatch = Regex.Match(
+        text,
+        "\\[\\s*Info\\s*\\(\\s*\"(?<name>[^\"]+)\"\\s*,\\s*\"(?<author>[^\"]+)\"\\s*,\\s*\"(?<version>[^\"]+)\"\\s*\\)\\s*\\]",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    var pluginName    = infoMatch.Success ? infoMatch.Groups["name"].Value.Trim()    : null;
+    var pluginAuthor  = infoMatch.Success ? infoMatch.Groups["author"].Value.Trim()  : null;
+    var pluginVersion = infoMatch.Success ? infoMatch.Groups["version"].Value.Trim() : null;
+    var pluginSlug    = !string.IsNullOrWhiteSpace(pluginName) ? ToPluginSlug(pluginName) : null;
+    var sourceHash    = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+    var commands      = ExtractPluginCommands(text);
+    var permissions   = ExtractPluginPermissions(text);
+    var hooks         = ExtractPluginHooks(text);
+    var configKeys    = ExtractPluginConfigKeys(text);
+
+    var hasPluginBase =
+        text.Contains(": RustPlugin",      StringComparison.Ordinal) ||
+        text.Contains(": CovalencePlugin", StringComparison.Ordinal) ||
+        text.Contains(": CSPlugin",        StringComparison.Ordinal);
+
+    if (!hasPluginBase)
+        return new ValidationResult { Path = path, Ok = false, Message = "Missing expected Oxide plugin base class.", PluginName = pluginName, PluginAuthor = pluginAuthor, PluginVersion = pluginVersion, PluginSlug = pluginSlug, SourceHash = sourceHash, Commands = commands, Permissions = permissions, Hooks = hooks, ConfigKeys = configKeys };
+
+    var open  = text.Count(c => c == '{');
+    var close = text.Count(c => c == '}');
+    if (open != close)
+        return new ValidationResult { Path = path, Ok = false, Message = $"Brace mismatch: {open} '{{' vs {close} '}}'.", PluginName = pluginName, PluginAuthor = pluginAuthor, PluginVersion = pluginVersion, PluginSlug = pluginSlug, SourceHash = sourceHash, Commands = commands, Permissions = permissions, Hooks = hooks, ConfigKeys = configKeys };
+
+    return new ValidationResult { Path = path, Ok = true, PluginName = pluginName, PluginAuthor = pluginAuthor, PluginVersion = pluginVersion, PluginSlug = pluginSlug, SourceHash = sourceHash, Commands = commands, Permissions = permissions, Hooks = hooks, ConfigKeys = configKeys };
+}
+
+static PluginMetadata ParsePluginMetadata(string path)
+{
+    var text = File.ReadAllText(path);
+    var infoMatch = Regex.Match(
+        text,
+        "\\[\\s*Info\\s*\\(\\s*\"(?<name>[^\"]+)\"\\s*,\\s*\"(?<author>[^\"]*)\"\\s*,\\s*\"(?<version>[^\"]+)\"\\s*\\)\\s*\\]",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    return infoMatch.Success
+        ? new PluginMetadata(infoMatch.Groups["name"].Value.Trim(), infoMatch.Groups["version"].Value.Trim())
+        : new PluginMetadata(Path.GetFileNameWithoutExtension(path), null);
+}
+
+static async Task<object?> CheckPluginUpdatesAsync(string server, string configDir, CancellationToken cancellationToken)
+{
+    var cfgPath = Path.Combine(configDir, $"{server}.json");
+    if (!File.Exists(cfgPath))
+        return null;
+
+    var cfg = JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(cfgPath), RemoteAgentJson.Options);
+    if (cfg is null)
+        return null;
+
+    var normalized = NormalizeConfig(server, cfg);
+    var candidates = GetOxideRootCandidates(normalized)
+        .Select(root => Path.Combine(root, "plugins"))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    string? pluginsDir;
+    try { pluginsDir = candidates.FirstOrDefault(Directory.Exists); }
+    catch (UnauthorizedAccessException ex)
+    {
+        return new { server, updates = Array.Empty<object>(), error = "access_denied", note = ex.Message, triedPaths = candidates };
+    }
+
+    if (pluginsDir is null)
+        return new { server, updates = Array.Empty<object>(), note = "plugins directory not found in any expected location", triedPaths = candidates };
+
+    List<PluginMetadata> plugins;
+    try
+    {
+        plugins = Directory.GetFiles(pluginsDir, "*.cs", SearchOption.TopDirectoryOnly)
+            .Select(ParsePluginMetadata)
+            .Where(p => !string.IsNullOrWhiteSpace(p.Name))
+            .ToList();
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return new { server, updates = Array.Empty<object>(), error = "access_denied", path = pluginsDir, note = $"Read permission denied for '{pluginsDir}'. Details: {ex.Message}", triedPaths = candidates };
+    }
+
+    var updates = new List<object>();
+    using var http = new HttpClient();
+    foreach (var plugin in plugins)
+    {
+        var searchName = Uri.EscapeDataString(plugin.Name!);
+        var url = $"https://umod.org/plugins/search.json?query={searchName}&page=1&sort=title&sortdir=asc&filter=rust";
+        string body;
+        try { body = await http.GetStringAsync(url, cancellationToken); }
+        catch (Exception ex)
+        {
+            updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found", reason = $"umod lookup failed: {ex.Message}" });
+            continue;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array || data.GetArrayLength() == 0)
+            {
+                updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found" });
+                continue;
+            }
+            var first = data[0];
+            var latest = first.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+            var current = plugin.Version;
+            var needsUpdate = !string.IsNullOrWhiteSpace(latest) && !string.Equals(latest, current, StringComparison.OrdinalIgnoreCase);
+            var downloadUrl = needsUpdate && first.TryGetProperty("download_url", out var dlNode) ? dlNode.GetString() : null;
+            updates.Add(new { plugin = plugin.Name, current, latest, downloadUrl, state = needsUpdate ? "update_available" : "current" });
+        }
+        catch (JsonException ex)
+        {
+            updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found", reason = $"umod parse failed: {ex.Message}" });
+        }
+    }
+
+    return new { server, pluginPath = pluginsDir, updates };
+}
+
+static async Task<object?> InstallPluginAsync(string server, string pluginName, Uri downloadUri, string configDir, CancellationToken cancellationToken)
+{
+    var cfgPath = Path.Combine(configDir, $"{server}.json");
+    if (!File.Exists(cfgPath))
+        return null;
+
+    var cfg = JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(cfgPath), RemoteAgentJson.Options);
+    if (cfg is null)
+        return null;
+
+    var normalized = NormalizeConfig(server, cfg);
+    var candidates = GetOxideRootCandidates(normalized)
+        .Select(root => Path.Combine(root, "plugins"))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    var pluginsDir = candidates.FirstOrDefault(Directory.Exists)
+        ?? Path.Combine(Environment.GetEnvironmentVariable("RUST_SERVER_ROOT") ?? "/srv/rust", normalized.Name, "oxide", "plugins");
+
+    try { Directory.CreateDirectory(pluginsDir); }
+    catch (UnauthorizedAccessException ex)
+    {
+        throw new UnauthorizedAccessException($"Write permission denied for '{pluginsDir}'. Details: {ex.Message}", ex);
+    }
+
+    var safeName = string.Concat(pluginName.Select(c => char.IsLetterOrDigit(c) || c is '_' or '-' ? c : '_'));
+    if (string.IsNullOrWhiteSpace(safeName))
+        safeName = "Plugin";
+
+    var destPath = Path.Combine(pluginsDir, $"{safeName}.cs");
+    try
+    {
+        using var http = new HttpClient();
+        var bytes = await http.GetByteArrayAsync(downloadUri, cancellationToken);
+        await File.WriteAllBytesAsync(destPath, bytes, cancellationToken);
+        return new { server, plugin = pluginName, installed = true, path = destPath, bytes = bytes.Length };
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        throw new UnauthorizedAccessException($"Write permission denied for '{destPath}'. Details: {ex.Message}", ex);
+    }
+}
+
+static List<PluginCommandReferenceView> ExtractPluginCommands(string source)
+{
+    var commands = new List<PluginCommandReferenceView>();
+    AddPluginAttributeCommands(commands, source, @"\[\s*ChatCommand\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]",    "ChatCommand");
+    AddPluginAttributeCommands(commands, source, @"\[\s*ConsoleCommand\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]", "ConsoleCommand");
+    AddPluginAttributeCommands(commands, source, @"\[\s*Command\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]",       "CovalenceCommand");
+    foreach (Match match in Regex.Matches(source, @"cmd\.AddChatCommand\s*\(\s*""(?<cmd>[^""]+)""\s*,\s*this\s*,\s*(?:nameof\s*\(\s*)?""?(?<handler>[A-Za-z_][A-Za-z0-9_]*)""?", RegexOptions.IgnoreCase))
+        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "ChatCommand", match.Groups["handler"].Value.Trim()));
+    foreach (Match match in Regex.Matches(source, @"AddCovalenceCommand\s*\(\s*""(?<cmd>[^""]+)""\s*,\s*(?:nameof\s*\(\s*)?""?(?<handler>[A-Za-z_][A-Za-z0-9_]*)""?", RegexOptions.IgnoreCase))
+        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "CovalenceCommand", match.Groups["handler"].Value.Trim()));
+    return commands
+        .GroupBy(c => $"{c.Type}:{c.Command}", StringComparer.OrdinalIgnoreCase)
+        .Select(g => g.First())
+        .OrderBy(c => c.Command, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static void AddPluginAttributeCommands(List<PluginCommandReferenceView> commands, string source, string pattern, string type)
+{
+    foreach (Match match in Regex.Matches(source, pattern, RegexOptions.IgnoreCase))
+        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), type, FindPluginHandlerAfter(source, match.Index + match.Length)));
+}
+
+static string FindPluginHandlerAfter(string source, int index)
+{
+    var tail  = source[Math.Min(index, source.Length)..];
+    var match = Regex.Match(tail, @"\b(?:private|public|protected|internal)?\s*(?:void|bool|object|string)\s+(?<handler>[A-Za-z_][A-Za-z0-9_]*)\s*\(", RegexOptions.IgnoreCase);
+    return match.Success ? match.Groups["handler"].Value.Trim() : string.Empty;
+}
+
+static List<string> ExtractPluginPermissions(string source)
+{
+    var patterns = new[]
+    {
+        @"permission\.RegisterPermission\s*\(\s*""(?<value>[^""]+)""",
+        @"permission\.UserHasPermission\s*\([^,]+,\s*""(?<value>[^""]+)""",
+        @"\.HasPermission\s*\(\s*""(?<value>[^""]+)"""
+    };
+    return patterns
+        .SelectMany(p => Regex.Matches(source, p, RegexOptions.IgnoreCase).Select(m => m.Groups["value"].Value.Trim()))
+        .Where(v => !string.IsNullOrWhiteSpace(v))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static List<string> ExtractPluginHooks(string source)
+{
+    var known = new[] { "OnServerInitialized", "Init", "Loaded", "Unload", "OnPlayerConnected", "OnPlayerDisconnected", "OnEntityDeath", "OnPlayerDeath", "OnUserChat", "CanBuild", "CanLootEntity" };
+    return known
+        .Where(hook => Regex.IsMatch(source, $@"\b(?:void|object|bool|string)\s+{Regex.Escape(hook)}\s*\(", RegexOptions.IgnoreCase))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(v => v, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static List<string> ExtractPluginConfigKeys(string source)
+{
+    var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (Match m in Regex.Matches(source, @"Config\s*\[\s*""(?<key>[^""]+)""\s*\]", RegexOptions.IgnoreCase))
+        keys.Add(m.Groups["key"].Value.Trim());
+    foreach (Match m in Regex.Matches(source, @"GetConfig\s*\(\s*""(?<key>[^""]+)""", RegexOptions.IgnoreCase))
+        keys.Add(m.Groups["key"].Value.Trim());
+    foreach (Match m in Regex.Matches(source, @"JsonProperty\s*\(\s*""(?<key>[^""]+)""\s*\)", RegexOptions.IgnoreCase))
+        keys.Add(m.Groups["key"].Value.Trim());
+    foreach (Match m in Regex.Matches(source, @"configData\.(?<key>[A-Za-z_][A-Za-z0-9_]*)", RegexOptions.IgnoreCase))
+        keys.Add(m.Groups["key"].Value.Trim());
+    return keys.OrderBy(v => v, StringComparer.OrdinalIgnoreCase).ToList();
+}
+
+static string ToPluginSlug(string input)
+{
+    var slug = Regex.Replace(input.Trim().ToLowerInvariant(), "[^a-z0-9]+", "-");
+    return slug.Trim('-');
+}
+
 static object? ParseTraceEvent(string line)
 {
     if (string.IsNullOrWhiteSpace(line))
@@ -630,6 +1068,31 @@ internal sealed class ModerationRequest
 {
     [JsonPropertyName("steamId")] public string SteamId { get; set; } = string.Empty;
     [JsonPropertyName("reason")] public string? Reason { get; set; }
+}
+
+internal sealed class PluginInstallRequest
+{
+    [JsonPropertyName("pluginName")]  public string PluginName  { get; set; } = string.Empty;
+    [JsonPropertyName("downloadUrl")] public string DownloadUrl { get; set; } = string.Empty;
+}
+
+internal sealed record PluginMetadata(string? Name, string? Version);
+internal sealed record PluginCommandReferenceView(string Command, string Type, string HandlerMethod);
+
+internal sealed class ValidationResult
+{
+    public string Path              { get; set; } = string.Empty;
+    public bool   Ok                { get; set; }
+    public string? Message          { get; set; }
+    public string? PluginName       { get; set; }
+    public string? PluginAuthor     { get; set; }
+    public string? PluginVersion    { get; set; }
+    public string? PluginSlug       { get; set; }
+    public string SourceHash        { get; set; } = string.Empty;
+    public List<PluginCommandReferenceView> Commands    { get; set; } = new();
+    public List<string>                    Permissions { get; set; } = new();
+    public List<string>                    Hooks       { get; set; } = new();
+    public List<string>                    ConfigKeys  { get; set; } = new();
 }
 
 internal sealed class ServerConfig
