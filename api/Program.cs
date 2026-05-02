@@ -184,16 +184,25 @@ app.MapGet("/dashboard/summary", async () =>
 
     var memory = LoadAgentMemorySnapshot(agentPaths);
 
-    // Load and check remote agents
+    // Load and check remote agents (parallel, 5s timeout so dashboard stays fast)
     var remoteServersForSummary = LoadRemoteServers();
     var remoteCount = remoteServersForSummary.Count;
-    var remoteOnlineCount = 0;
-    foreach (var remote in remoteServersForSummary.Where(r => !string.IsNullOrWhiteSpace(r.AgentBaseUrl)))
-    {
-        await CheckRemoteAgentHealthAsync(remote);
-        if (remoteAgentStatus.ContainsKey(remote.Name) && remoteAgentStatus[remote.Name].IsReachable)
-            remoteOnlineCount++;
-    }
+    await Task.WhenAll(remoteServersForSummary
+        .Where(r => !string.IsNullOrWhiteSpace(r.AgentBaseUrl))
+        .Select(r => CheckRemoteAgentHealthAsync(r)));
+
+    // For reachable agents, fetch live server data in parallel
+    var remoteStatusData = new Dictionary<string, JsonNode?>(StringComparer.OrdinalIgnoreCase);
+    await Task.WhenAll(remoteServersForSummary
+        .Where(r => remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable)
+        .Select(async r =>
+        {
+            var data = await TryReadRemoteAgentJsonAsync(r.Name, $"/servers/{Uri.EscapeDataString(RemoteAgentServerName(r))}/status");
+            lock (remoteStatusData) remoteStatusData[r.Name] = data;
+        }));
+
+    var remoteOnlineCount = remoteServersForSummary.Count(r =>
+        remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable);
 
     return Results.Ok(new
     {
@@ -229,8 +238,8 @@ app.MapGet("/dashboard/summary", async () =>
             sentOutbox = CountJsonFiles(agentPaths.SentOutboxPath),
             adminChatMessages = 0,
             llmCallsCount = memory.LlmInteractions.Count,
-            semanticMemorySize = 0,
-            pluginDbSize = 0
+            semanticMemorySize = File.Exists(agentPaths.SemanticMemoryDbPath) ? new FileInfo(agentPaths.SemanticMemoryDbPath).Length : 0,
+            pluginDbSize = File.Exists(agentPaths.PluginDbPath) ? new FileInfo(agentPaths.PluginDbPath).Length : 0
         },
         servers = statuses
             .Select(s => new
@@ -256,28 +265,44 @@ app.MapGet("/dashboard/summary", async () =>
                 agentLastCheckAtUtc = (DateTime?)null,
                 agentLastCheckLatencyMs = (int?)null
             })
-            .Concat(remoteServersForSummary.Select(r => new
+            .Concat(remoteServersForSummary.Select(r =>
             {
-                name = r.Name,
-                state = "remote",
-                online = false,
-                autoRestart = false,
-                pid = (int?)null,
-                recentWarningCount = 0,
-                currentPlayers = (int?)null,
-                maxPlayers = (int?)null,
-                playerPreview = new List<string>(),
-                uptimeSeconds = (long?)null,
-                memoryMb = (double?)null,
-                queryOk = false,
-                hostname = (string?)r.DisplayName,
-                map = (string?)null,
-                framerate = (double?)null,
-                queuedPlayers = (int?)null,
-                remote = true,
-                agentReachable = remoteAgentStatus.ContainsKey(r.Name) && remoteAgentStatus[r.Name].IsReachable,
-                agentLastCheckAtUtc = remoteAgentStatus.ContainsKey(r.Name) ? remoteAgentStatus[r.Name].LastHealthCheckAtUtc : null,
-                agentLastCheckLatencyMs = remoteAgentStatus.ContainsKey(r.Name) ? remoteAgentStatus[r.Name].LastHealthCheckLatencyMs : null
+                var agSt = remoteAgentStatus.TryGetValue(r.Name, out var s) ? s : null;
+                var liveData = remoteStatusData.TryGetValue(r.Name, out var d) ? d : null;
+                var liveObj = liveData as System.Text.Json.Nodes.JsonObject;
+
+                string GetStr(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<string>() ?? "" : "";
+                bool GetBool(string key, bool def = false) => liveObj?.TryGetPropertyValue(key, out var v) == true ? (v?.GetValue<bool?>() ?? def) : def;
+                int? GetInt(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<int?>() : null;
+                long? GetLong(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<long?>() : null;
+                double? GetDbl(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<double?>() : null;
+
+                var isOnline = liveData != null && GetBool("online");
+                var liveState = liveData != null ? (GetStr("state") is { Length: > 0 } st ? st : "remote") : "remote";
+
+                return new
+                {
+                    name = r.Name,
+                    state = liveState,
+                    online = isOnline,
+                    autoRestart = GetBool("autoRestart"),
+                    pid = GetInt("pid"),
+                    recentWarningCount = 0,
+                    currentPlayers = GetInt("currentPlayers"),
+                    maxPlayers = GetInt("maxPlayers"),
+                    playerPreview = new List<string>(),
+                    uptimeSeconds = GetLong("uptimeSeconds"),
+                    memoryMb = GetDbl("memoryMb"),
+                    queryOk = GetBool("queryOk"),
+                    hostname = (string?)(liveData != null ? GetStr("hostname") : r.DisplayName),
+                    map = (string?)(liveData != null ? GetStr("map") : null),
+                    framerate = GetDbl("framerate"),
+                    queuedPlayers = GetInt("queuedPlayers"),
+                    remote = true,
+                    agentReachable = agSt?.IsReachable ?? false,
+                    agentLastCheckAtUtc = agSt?.LastHealthCheckAtUtc,
+                    agentLastCheckLatencyMs = agSt?.LastHealthCheckLatencyMs
+                };
             }))
             .OrderBy(s => s.name, StringComparer.OrdinalIgnoreCase),
         mailboxes = new[]
@@ -907,7 +932,7 @@ async Task CheckRemoteAgentHealthAsync(RemoteServerEntry remote)
     try
     {
         var url = $"{remote.AgentBaseUrl.TrimEnd('/')}/health";
-        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
         using var message = new HttpRequestMessage(HttpMethod.Get, url);
         var agentKey = string.IsNullOrWhiteSpace(remote.AgentApiKey) ? apiKey : remote.AgentApiKey.Trim();
         message.Headers.TryAddWithoutValidation("X-Api-Key", agentKey);
@@ -1164,37 +1189,13 @@ app.MapPost("/servers/remote/{name}/check-health", async (string name) =>
     if (server == null || string.IsNullOrWhiteSpace(server.AgentBaseUrl))
         return Results.NotFound(new ApiError("not_found", "Remote server not found or has no agent"));
 
-    var statusKey = server.Name;
-    if (!remoteAgentStatus.ContainsKey(statusKey))
-        remoteAgentStatus[statusKey] = new RemoteAgentStatus { ServerName = server.Name, AgentBaseUrl = server.AgentBaseUrl };
+    await CheckRemoteAgentHealthAsync(server);
+    var status = remoteAgentStatus.TryGetValue(server.Name, out var st) ? st : null;
 
-    var status = remoteAgentStatus[statusKey];
-    var sw = System.Diagnostics.Stopwatch.StartNew();
-    try
-    {
-        var remoteResult = await TryProxyRemoteAgentAsync(name, HttpMethod.Get, "/health");
-        sw.Stop();
+    if (status?.IsReachable == true)
+        return Results.Ok(new { ok = true, latencyMs = status.LastHealthCheckLatencyMs });
 
-        if (remoteResult is not null)
-        {
-            status.IsReachable = true;
-            status.LastHealthCheckAtUtc = DateTime.UtcNow;
-            status.LastHealthCheckLatencyMs = (int)sw.ElapsedMilliseconds;
-            status.SuccessCount++;
-            status.LastError = null;
-            return Results.Ok(new { ok = true, latencyMs = sw.ElapsedMilliseconds });
-        }
-    }
-    catch (Exception ex)
-    {
-        sw.Stop();
-        status.IsReachable = false;
-        status.LastError = ex.Message;
-        status.FailureCount++;
-        status.LastHealthCheckAtUtc = DateTime.UtcNow;
-    }
-
-    return Results.BadRequest(new ApiError("agent_unreachable", "Remote agent health check failed"));
+    return Results.BadRequest(new ApiError("agent_unreachable", status?.LastError ?? "Remote agent health check failed"));
 });
 
 app.MapPost("/servers/remote", (RemoteServerEntry server) =>
@@ -3047,7 +3048,15 @@ static AgentRuntimePaths ResolveAgentRuntimePaths(string agentSettingsPath, stri
         LogRulesPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_LOG_RULES_PATH") ?? agentSettings?.Monitor?.LogRulesPath,
             agentBaseDir,
-            Path.Combine(defaultAgentRootDir, "agent-log-rules.json"))
+            Path.Combine(defaultAgentRootDir, "agent-log-rules.json")),
+        SemanticMemoryDbPath = RustOpsEnv.ResolveConfiguredPath(
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_SEMANTIC_MEMORY_DB") ?? agentSettings?.Memory?.DatabasePath,
+            agentBaseDir,
+            Path.Combine(defaultAgentRootDir, "data", "semantic-memory.db")),
+        PluginDbPath = RustOpsEnv.ResolveConfiguredPath(
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_PLUGIN_DB") ?? agentSettings?.Plugins?.ReferenceIndexDatabasePath,
+            agentBaseDir,
+            Path.Combine(defaultAgentRootDir, "data", "plugin-reference-index.db"))
     };
 }
 
@@ -4371,6 +4380,7 @@ static string BuildDashboardHtml() => """
     .running,.active,.ok { background:rgba(85,211,138,.16); color:var(--good); }
     .offline,.failed,.inactive { background:rgba(255,111,97,.14); color:var(--bad); }
     .unknown,.pending,.degraded,.starting { background:rgba(244,185,92,.14); color:var(--warn); }
+    .remote { background:rgba(102,200,255,.12); color:var(--accent); }
     table { width:100%; border-collapse:collapse; }
     th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(39,64,87,.7); vertical-align:top; font-size:14px; }
     .item { padding:12px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:rgba(21,36,52,.55); }
@@ -4516,7 +4526,7 @@ static string BuildDashboardHtml() => """
     const dur = value => { const seconds = Number(value); if (!Number.isFinite(seconds)) return 'n/a'; const d = Math.floor(seconds / 86400); const h = Math.floor((seconds % 86400) / 3600); const m = Math.floor((seconds % 3600) / 60); return d > 0 ? `${d}d ${h}h ${m}m` : (h > 0 ? `${h}h ${m}m` : `${m}m`); };
     const bytes = value => { const n = Number(value); if (!Number.isFinite(n) || n <= 0) return 'n/a'; if (n >= 1073741824) return `${(n / 1073741824).toFixed(2)} GB`; if (n >= 1048576) return `${(n / 1048576).toFixed(1)} MB`; return `${Math.round(n / 1024)} KB`; };
     const metric = (label, value, hint = '') => `<div class="card"><div class="muted">${esc(label)}</div><div style="font-size:30px;font-weight:800;margin-top:6px;">${esc(value)}</div>${hint ? `<div class="tiny muted" style="margin-top:8px;">${esc(hint)}</div>` : ''}</div>`;
-    const pill = state => { const s = (state || 'unknown').toLowerCase(); const cls = ['running','offline','failed','pending','active','inactive','degraded','ok','starting'].includes(s) ? s : 'unknown'; return `<span class="pill ${cls}">${esc(state || 'unknown')}</span>`; };
+    const pill = state => { const s = (state || 'unknown').toLowerCase(); const cls = ['running','offline','failed','pending','active','inactive','degraded','ok','starting','remote'].includes(s) ? s : 'unknown'; return `<span class="pill ${cls}">${esc(state || 'unknown')}</span>`; };
     const item = (title, body, meta = '') => `<div class="item"><div style="font-weight:700;">${esc(title)}</div><div class="muted" style="margin-top:6px;">${esc(body || '')}</div>${meta ? `<div style="margin-top:8px;font-size:12px;color:var(--muted);">${meta}</div>` : ''}</div>`;
     const kv = (label, value) => `<div class="item"><div class="muted tiny">${esc(label)}</div><div style="margin-top:6px;font-weight:700;">${esc(value ?? 'n/a')}</div></div>`;
 
@@ -4647,14 +4657,19 @@ static string BuildDashboardHtml() => """
       $('servers').innerHTML = (servers || []).map(server => {
         const isRemote = server.remote === true;
         const remoteBadge = isRemote ? ' <span class="pill" style="background:rgba(102,200,255,.12);color:var(--accent);">[REMOTE]</span>' : '';
-        const agentStatus = isRemote ? (server.agentReachable ? `agent-ok | ${server.agentLastCheckLatencyMs}ms` : 'agent-offline') : '';
-        return `<tr><td><strong>${esc(server.name)}${remoteBadge}</strong><div class="tiny muted">${esc(server.hostname || 'hostname unavailable')}${agentStatus ? `<br/>${agentStatus}` : ''}</div></td><td>${pill(server.state)}</td><td>${esc(server.currentPlayers ?? (server.online ? '?' : '-'))}/${esc(server.maxPlayers ?? '?')}</td><td>${esc(dur(server.uptimeSeconds))}</td><td>${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : '-'}</td><td>${server.autoRestart ? 'on' : 'off'}</td><td>${esc(server.recentWarningCount ?? 0)}</td></tr>`;
+        const agentStatus = isRemote ? (server.agentReachable ? `agent-ok | ${server.agentLastCheckLatencyMs ?? '?'}ms` : 'agent-offline') : '';
+        return `<tr><td><strong>${esc(server.name)}${remoteBadge}</strong><div class="tiny muted">${esc(server.hostname || 'hostname unavailable')}${agentStatus ? `<br/>${agentStatus}` : ''}</div></td><td>${pill(server.state)}</td><td>${esc(server.currentPlayers ?? (server.online ? '?' : '-'))}/${esc(server.maxPlayers ?? '?')}</td><td>${esc(dur(server.uptimeSeconds))}</td><td>${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(Math.round(server.memoryMb))} MB` : '-'}</td><td>${server.autoRestart ? 'on' : 'off'}</td><td>${esc(server.recentWarningCount ?? 0)}</td></tr>`;
       }).join('') || '<tr><td colspan="7" class="muted">No servers returned.</td></tr>';
       $('serverCards').innerHTML = (servers || []).map(server => {
         const isRemote = server.remote === true;
         const remoteBadge = isRemote ? '<span class="chip" style="background:rgba(102,200,255,.10);border-color:rgba(102,200,255,.22);">[REMOTE]</span>' : '';
-        const agentInfo = isRemote && server.agentReachable ? `Agent: ${esc(server.agentLastCheckLatencyMs)}ms ago<br/>` : (isRemote ? 'Agent: offline<br/>' : '');
-        return `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(server.name)}</strong>${pill(server.state)}${remoteBadge}</div><div class="muted" style="margin-top:6px;">${esc(server.hostname || 'hostname unavailable')}</div>${agentInfo ? `<div class="tiny muted" style="margin-top:4px;">${agentInfo}</div>` : ''}<div class="tiny muted" style="margin-top:8px;">Map ${esc(server.map || 'n/a')} | Queue ${esc(server.queuedPlayers ?? 0)} | FPS ${esc(server.framerate ?? 'n/a')}</div><div class="tiny muted" style="margin-top:8px;">PID ${esc(server.pid ?? '-')} | Uptime ${esc(dur(server.uptimeSeconds))} | Mem ${server.memoryMb !== null && server.memoryMb !== undefined ? `${esc(server.memoryMb)} MB` : 'n/a'} | ${server.queryOk ? 'query-ok' : (server.online ? 'query-missed' : 'offline')}</div><div class="chip-list">${(server.playerPreview || []).slice(0, 5).map(name => `<span class="chip">${esc(name)}</span>`).join('') || '<span class="muted tiny">No player names sampled.</span>'}</div></div>`;
+        const agentInfo = isRemote
+          ? (server.agentReachable
+              ? `<span style="color:var(--accent);">● agent-ok</span> | ${server.agentLastCheckLatencyMs ?? '?'}ms latency<br/>`
+              : `<span style="color:var(--warn, #f59e0b);">● agent-offline</span><br/>`)
+          : '';
+        const memStr = server.memoryMb !== null && server.memoryMb !== undefined ? `${Math.round(server.memoryMb)} MB` : 'n/a';
+        return `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(server.name)}</strong>${pill(server.state)}${remoteBadge}</div><div class="muted" style="margin-top:6px;">${esc(server.hostname || 'hostname unavailable')}</div>${agentInfo ? `<div class="tiny" style="margin-top:4px;">${agentInfo}</div>` : ''}<div class="tiny muted" style="margin-top:8px;">Map ${esc(server.map || 'n/a')} | Queue ${esc(server.queuedPlayers ?? 0)} | FPS ${esc(server.framerate != null ? Math.round(server.framerate) : 'n/a')}</div><div class="tiny muted" style="margin-top:8px;">PID ${esc(server.pid ?? '-')} | Uptime ${esc(dur(server.uptimeSeconds))} | Mem ${memStr} | ${server.queryOk ? 'query-ok' : (server.online ? 'query-missed' : 'offline')}</div><div class="chip-list">${(server.playerPreview || []).slice(0, 5).map(name => `<span class="chip">${esc(name)}</span>`).join('') || '<span class="muted tiny">No player names sampled.</span>'}</div></div>`;
       }).join('') || '<div class="muted">No live query data available.</div>';
     }
 
@@ -4725,8 +4740,8 @@ static string BuildDashboardHtml() => """
         kv('Last LLM use', fmt(runtime.lastLlmInteractionAtUtc)),
         kv('State file', `${stateStatus}${state.sizeBytes ? ` | ${bytes(state.sizeBytes)}` : ''}`),
         kv('State save', fmt(state.lastSavedAtUtc || state.lastWriteAtUtc)),
-        kv('Semantic memory DB', summary.counts?.semanticMemorySize ? bytes(summary.counts.semanticMemorySize) : 'measuring...'),
-        kv('Plugin DB', summary.counts?.pluginDbSize ? bytes(summary.counts.pluginDbSize) : 'measuring...')
+        kv('Semantic memory DB', summary.counts?.semanticMemorySize != null ? (summary.counts.semanticMemorySize > 0 ? bytes(summary.counts.semanticMemorySize) : 'not found') : 'n/a'),
+        kv('Plugin DB', summary.counts?.pluginDbSize != null ? (summary.counts.pluginDbSize > 0 ? bytes(summary.counts.pluginDbSize) : 'not found') : 'n/a')
       ].join('');
       $('incidents').innerHTML = (summary.recentIncidents || []).map(entry => item(`${entry.serverName} | ${entry.title || entry.category || 'incident'}`, entry.summary || '', esc(fmt(entry.createdAtUtc)))).join('') || '<div class="muted">No incidents recorded.</div>';
       $('actions').innerHTML = (summary.recentActions || []).map(entry => item(`${entry.serverName} | ${entry.actionType}`, entry.summary || '', `${esc(fmt(entry.executedAtUtc))} | ${entry.success ? 'success' : 'failed'} | ${esc(entry.trigger)}`)).join('') || '<div class="muted">No recent actions.</div>';
@@ -5783,6 +5798,8 @@ public sealed class AgentRuntimePaths
     public string MessageOutboxPath { get; set; } = string.Empty;
     public string SentOutboxPath { get; set; } = string.Empty;
     public string LogRulesPath { get; set; } = string.Empty;
+    public string SemanticMemoryDbPath { get; set; } = string.Empty;
+    public string PluginDbPath { get; set; } = string.Empty;
 }
 
 public class AgentLlmConfigUpdate
@@ -5893,6 +5910,7 @@ public sealed class LlmLoadedModelView
 public sealed class AgentSettingsFileView
 {
     [JsonPropertyName("memory")] public AgentSettingsMemoryView? Memory { get; set; }
+    [JsonPropertyName("plugins")] public AgentSettingsPluginsView? Plugins { get; set; }
     [JsonPropertyName("inbox")] public AgentSettingsInboxView? Inbox { get; set; }
     [JsonPropertyName("outbox")] public AgentSettingsOutboxView? Outbox { get; set; }
     [JsonPropertyName("monitor")] public AgentSettingsMonitorView? Monitor { get; set; }
@@ -5907,6 +5925,12 @@ public sealed class AgentSettingsMemoryView
 {
     [JsonPropertyName("statePath")] public string? StatePath { get; set; }
     [JsonPropertyName("neoCortexRoot")] public string? NeoCortexRoot { get; set; }
+    [JsonPropertyName("databasePath")] public string? DatabasePath { get; set; }
+}
+
+public sealed class AgentSettingsPluginsView
+{
+    [JsonPropertyName("referenceIndexDatabasePath")] public string? ReferenceIndexDatabasePath { get; set; }
 }
 
 public sealed class AgentSettingsInboxView
