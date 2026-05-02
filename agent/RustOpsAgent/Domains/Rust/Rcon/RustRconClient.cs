@@ -49,6 +49,14 @@ internal sealed class RustRconClient : IRconClient
 
     private async Task<string> SendInternalAsync(string message, int identifier, CancellationToken cancellationToken)
     {
+        // Check if the receive loop has failed; if so, propagate the exception instead of timing out.
+        if (_receiveTask?.IsFaulted == true)
+        {
+            throw new InvalidOperationException(
+                "RCON receive loop has failed. Cannot process command.",
+                _receiveTask.Exception?.InnerException ?? _receiveTask.Exception);
+        }
+
         var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[identifier] = tcs;
 
@@ -86,60 +94,90 @@ internal sealed class RustRconClient : IRconClient
 
     private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
-        var buffer = new byte[64 * 1024];
-        while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
+        try
         {
-            using var frameStream = new MemoryStream();
-            WebSocketReceiveResult result;
-            do
+            var buffer = new byte[64 * 1024];
+            while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
             {
-                result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                using var frameStream = new MemoryStream();
+                WebSocketReceiveResult result;
+                try
+                {
+                    result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                }
+                catch (WebSocketException ex)
+                {
+                    RustOpsSentry.CaptureException(
+                        ex,
+                        "WebSocket error during RCON receive loop.",
+                        "agent.rcon",
+                        extras: new Dictionary<string, object?> { ["socketState"] = _socket.State.ToString() });
+                    throw;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Cancellation is expected during shutdown or timeout
+                    return;
+                }
+
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
                     return;
                 }
 
                 frameStream.Write(buffer, 0, result.Count);
-            } while (!result.EndOfMessage);
-
-            var payload = Encoding.UTF8.GetString(frameStream.ToArray());
-            if (string.IsNullOrWhiteSpace(payload))
-            {
-                continue;
-            }
-            try
-            {
-                using var doc = JsonDocument.Parse(payload);
-                var root = doc.RootElement;
-                var id = root.TryGetProperty("Identifier", out var idNode) && idNode.ValueKind == JsonValueKind.Number
-                    ? idNode.GetInt32()
-                    : -1;
-                var message = root.TryGetProperty("Message", out var messageNode)
-                    ? messageNode.ToString()
-                    : payload;
-
-                if (id >= 0 && _pending.TryGetValue(id, out var tcs))
+                if (!result.EndOfMessage)
                 {
-                    tcs.TrySetResult(message);
+                    continue;
                 }
-                else
+
+                var payload = Encoding.UTF8.GetString(frameStream.ToArray());
+                if (string.IsNullOrWhiteSpace(payload))
                 {
-                    UnsolicitedMessage?.Invoke(message);
+                    continue;
                 }
-            }
-            catch (Exception ex)
-            {
-                RustOpsSentry.CaptureMessage(
-                    "Failed to parse RCON payload as JSON. Forwarding raw message as unsolicited output.",
-                    "agent.rcon",
-                    SentryLevel.Warning,
-                    extras: new Dictionary<string, object?>
+                try
+                {
+                    using var doc = JsonDocument.Parse(payload);
+                    var root = doc.RootElement;
+                    var id = root.TryGetProperty("Identifier", out var idNode) && idNode.ValueKind == JsonValueKind.Number
+                        ? idNode.GetInt32()
+                        : -1;
+                    var message = root.TryGetProperty("Message", out var messageNode)
+                        ? messageNode.ToString()
+                        : payload;
+
+                    if (id >= 0 && _pending.TryGetValue(id, out var tcs))
                     {
-                        ["payloadPreview"] = payload.Length > 500 ? payload[..500] : payload,
-                        ["exception"] = ex.Message
-                    });
-                UnsolicitedMessage?.Invoke(payload);
+                        tcs.TrySetResult(message);
+                    }
+                    else
+                    {
+                        UnsolicitedMessage?.Invoke(message);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    RustOpsSentry.CaptureMessage(
+                        "Failed to parse RCON payload as JSON. Forwarding raw message as unsolicited output.",
+                        "agent.rcon",
+                        SentryLevel.Warning,
+                        extras: new Dictionary<string, object?>
+                        {
+                            ["payloadPreview"] = payload.Length > 500 ? payload[..500] : payload,
+                            ["exception"] = ex.Message
+                        });
+                    UnsolicitedMessage?.Invoke(payload);
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureException(
+                ex,
+                "RCON receive loop terminated with exception.",
+                "agent.rcon");
+            throw;
         }
     }
 

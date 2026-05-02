@@ -1005,7 +1005,19 @@ async Task CheckRemoteAgentHealthAsync(RemoteServerEntry remote)
         };
 
     var status = remoteAgentStatus[statusKey];
-    var agentKey = string.IsNullOrWhiteSpace(remote.AgentApiKey) ? apiKey : remote.AgentApiKey.Trim();
+
+    // AgentApiKey is required; never fall back to main API key
+    if (string.IsNullOrWhiteSpace(remote.AgentApiKey))
+    {
+        status.IsReachable = false;
+        status.IsAuthValid = false;
+        status.FailureCount++;
+        status.LastError = "AgentApiKey not configured in remote-servers.json";
+        status.LastHealthCheckAtUtc = DateTime.UtcNow;
+        return;
+    }
+
+    var agentKey = remote.AgentApiKey.Trim();
     var baseUrl = remote.AgentBaseUrl.TrimEnd('/');
     var sw = System.Diagnostics.Stopwatch.StartNew();
     try
@@ -1236,8 +1248,8 @@ app.MapPost("/servers/remote/agent-register", async (HttpContext ctx) =>
         var baseUrl = root.TryGetProperty("agentBaseUrl", out var b) ? b.GetString() : null;
         var apiKey = root.TryGetProperty("agentApiKey", out var a) ? a.GetString() : null;
 
-        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(baseUrl))
-            return Results.BadRequest(new ApiError("invalid_request", "name and agentBaseUrl are required"));
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(apiKey))
+            return Results.BadRequest(new ApiError("invalid_request", "name, agentBaseUrl, and agentApiKey are required"));
 
         var newServer = new RemoteServerEntry(
             Name: name,
@@ -1247,7 +1259,7 @@ app.MapPost("/servers/remote/agent-register", async (HttpContext ctx) =>
             RconPassword: "auto-registered",
             GamePort: 0,
             AgentBaseUrl: baseUrl,
-            AgentApiKey: apiKey ?? string.Empty,
+            AgentApiKey: apiKey,
             AgentServerName: name
         );
 
