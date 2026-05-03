@@ -1888,6 +1888,14 @@ internal static class RustToolHelper
 internal static class RustDirectRconHelper
 {
     private static readonly ConcurrentDictionary<string, PersistentRconSession> Sessions = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, (Uri Uri, string Password)> RemoteOverrides = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Register a remote server's RCON credentials at startup so the agent can connect directly.</summary>
+    public static void RegisterRemoteServer(string server, Uri uri, string password)
+    {
+        RemoteOverrides[server] = (uri, password);
+        RustOpsSentry.AddBreadcrumb($"Registered remote RCON for '{server}' at {uri.Host}:{uri.Port}", "agent.rcon");
+    }
 
     public static IReadOnlyList<string> GetRollingLog(string server)
     {
@@ -1952,6 +1960,10 @@ internal static class RustDirectRconHelper
 
     private static (Uri Uri, string Password)? LoadConnection(string server)
     {
+        // Check pre-registered remote server credentials first (populated at startup from API).
+        if (RemoteOverrides.TryGetValue(server, out var remote))
+            return remote;
+
         var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG");
         if (string.IsNullOrWhiteSpace(configRoot))
         {
@@ -1961,9 +1973,7 @@ internal static class RustDirectRconHelper
         }
         var configPath = Path.Combine(configRoot, $"{server}.json");
         if (!File.Exists(configPath))
-        {
             return null;
-        }
 
         using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
         return LoadConnectionFromConfig(cfg.RootElement);

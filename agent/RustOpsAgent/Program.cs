@@ -1,3 +1,4 @@
+using System.Text.Json;
 ﻿using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Sentry;
@@ -169,36 +170,34 @@ Action<string, string, string?> serverStatusNotifier = (adminId, message, server
 var serverKnowledge = new ServerKnowledgeCatalog();
 Console.WriteLine($"[agent] Server knowledge loaded: {serverKnowledge.GetSnapshot().Variables.Count} variables, {serverKnowledge.GetSnapshot().Commands.Count} commands");
 
-// Initialize persistent RCON connections for both local and remote servers
-var rconConfigDir = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG");
-if (string.IsNullOrWhiteSpace(rconConfigDir))
-{
-    rconConfigDir = Environment.OSVersion.Platform == PlatformID.Win32NT
-        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "rustmgr", "config")
-        : "/opt/rust-manager/config";
-}
-
-var rconConfigLoader = new RconConfigurationLoader(rconConfigDir, apiClient);
+// Register remote server RCON credentials so the agent can connect directly to them.
+// Local servers are handled lazily by RustDirectRconHelper reading their config files.
 try
 {
-    var rconConfigs = await rconConfigLoader.LoadAllConfigurationsAsync(CancellationToken.None);
-    if (rconConfigs.Count > 0)
+    using var rconConfigResponse = await apiClient.GetAsync("/servers/remote/rcon-config", CancellationToken.None);
+    var root = rconConfigResponse.RootElement;
+    var count = 0;
+    if (root.ValueKind == JsonValueKind.Array)
     {
-        var rconPool = new RconSessionPool();
-        await rconPool.InitializeAsync(rconConfigs);
-        Console.WriteLine($"[agent] Initialized persistent RCON connections for {rconConfigs.Count} servers");
-        RustOpsSentry.AddBreadcrumb($"Persistent RCON pool initialized for {rconConfigs.Count} servers", "startup");
+        foreach (var entry in root.EnumerateArray())
+        {
+            var name = entry.TryGetProperty("name", out var n) ? n.GetString() : null;
+            var ip = entry.TryGetProperty("rconIp", out var ipEl) ? ipEl.GetString() : null;
+            var port = entry.TryGetProperty("rconPort", out var portEl) && portEl.ValueKind == JsonValueKind.Number ? portEl.GetInt32() : 0;
+            var password = entry.TryGetProperty("rconPassword", out var pwdEl) ? pwdEl.GetString() : null;
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(ip) || port <= 0 || string.IsNullOrWhiteSpace(password))
+                continue;
+            var uri = new Uri($"ws://{ip}:{port}/{Uri.EscapeDataString(password)}");
+            RustDirectRconHelper.RegisterRemoteServer(name, uri, password);
+            count++;
+        }
     }
-    else
-    {
-        Console.WriteLine("[agent] No RCON configurations found. Remote agent RCON or local server configurations may not be available.");
-        RustOpsSentry.AddBreadcrumb("No RCON configurations found during initialization", "startup");
-    }
+    Console.WriteLine($"[agent] Registered direct RCON for {count} remote server(s).");
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"[agent] WARNING: Failed to initialize persistent RCON connections: {ex.Message}");
-    RustOpsSentry.CaptureException(ex, "Failed to initialize persistent RCON pool", "startup");
+    Console.WriteLine($"[agent] WARNING: Could not load remote RCON config from API: {ex.Message}");
+    RustOpsSentry.CaptureException(ex, "Failed to load remote RCON config", "startup");
 }
 
 var handlers = new List<IToolHandler>
