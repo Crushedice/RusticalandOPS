@@ -1204,6 +1204,21 @@ app.MapGet("/servers/remote/list", () =>
     }));
 });
 
+// Internal endpoint for main agent to fetch RCON configuration for remote servers
+app.MapGet("/servers/remote/rcon-config", () =>
+{
+    var remoteServers = LoadRemoteServers();
+    return Results.Ok(remoteServers
+        .Where(s => !string.IsNullOrWhiteSpace(s.RconPassword) && s.RconPort > 0)
+        .Select(s => new
+        {
+            name = s.Name,
+            rconIp = s.RconIp,
+            rconPort = s.RconPort,
+            rconPassword = s.RconPassword
+        }));
+});
+
 app.MapGet("/servers/remote/agent-status", () =>
 {
     var remoteServers = LoadRemoteServers();

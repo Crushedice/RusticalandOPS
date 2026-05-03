@@ -5,6 +5,7 @@ using RustOpsAgent.Core;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
 using RustOpsAgent.Domains.Rust;
+using RustOpsAgent.Domains.Rust.Rcon;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
@@ -167,6 +168,38 @@ Action<string, string, string?> serverStatusNotifier = (adminId, message, server
 // Shared server knowledge catalog for convar/command lookups across chat and RCON handlers
 var serverKnowledge = new ServerKnowledgeCatalog();
 Console.WriteLine($"[agent] Server knowledge loaded: {serverKnowledge.GetSnapshot().Variables.Count} variables, {serverKnowledge.GetSnapshot().Commands.Count} commands");
+
+// Initialize persistent RCON connections for both local and remote servers
+var rconConfigDir = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG");
+if (string.IsNullOrWhiteSpace(rconConfigDir))
+{
+    rconConfigDir = Environment.OSVersion.Platform == PlatformID.Win32NT
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "rustmgr", "config")
+        : "/opt/rust-manager/config";
+}
+
+var rconConfigLoader = new RconConfigurationLoader(rconConfigDir, apiClient);
+try
+{
+    var rconConfigs = await rconConfigLoader.LoadAllConfigurationsAsync(CancellationToken.None);
+    if (rconConfigs.Count > 0)
+    {
+        var rconPool = new RconSessionPool();
+        await rconPool.InitializeAsync(rconConfigs);
+        Console.WriteLine($"[agent] Initialized persistent RCON connections for {rconConfigs.Count} servers");
+        RustOpsSentry.AddBreadcrumb($"Persistent RCON pool initialized for {rconConfigs.Count} servers", "startup");
+    }
+    else
+    {
+        Console.WriteLine("[agent] No RCON configurations found. Remote agent RCON or local server configurations may not be available.");
+        RustOpsSentry.AddBreadcrumb("No RCON configurations found during initialization", "startup");
+    }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[agent] WARNING: Failed to initialize persistent RCON connections: {ex.Message}");
+    RustOpsSentry.CaptureException(ex, "Failed to initialize persistent RCON pool", "startup");
+}
 
 var handlers = new List<IToolHandler>
 {
