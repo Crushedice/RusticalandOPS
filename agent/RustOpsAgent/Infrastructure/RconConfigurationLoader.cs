@@ -93,7 +93,7 @@ internal sealed class RconConfigurationLoader
                     continue;
                 }
 
-                var rconUri = new Uri($"tcp://{rconIp?.Trim().Trim('"')}:{rconPort}");
+                var rconUri = new Uri($"ws://{rconIp?.Trim().Trim('"')}:{rconPort}/{Uri.EscapeDataString(rconPassword)}");
                 configs.Add((fileName, rconUri, rconPassword));
                 RustOpsSentry.AddBreadcrumb($"Loaded local RCON config for '{fileName}'", "rcon");
             }
@@ -142,7 +142,7 @@ internal sealed class RconConfigurationLoader
                             continue;
                         }
 
-                        var rconUri = new Uri($"tcp://{rconIp.Trim()}:{rconPort}");
+                        var rconUri = new Uri($"ws://{rconIp.Trim()}:{rconPort}/{Uri.EscapeDataString(rconPassword)}");
                         configs.Add((name, rconUri, rconPassword));
                         RustOpsSentry.AddBreadcrumb($"Loaded remote RCON config for '{name}' via API", "rcon");
                     }

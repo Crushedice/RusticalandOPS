@@ -1,87 +1,177 @@
-﻿using System.Net;
-using CoreRCON;
+using System.Collections.Concurrent;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
 using Sentry;
 
 namespace RustOpsAgent.Domains.Rust.Rcon;
 
+/// <summary>
+/// Rust WebRCON client. Rust uses WebSocket-based RCON (rcon.web 1), not the
+/// Source Engine binary protocol. Authentication happens via the password in the
+/// WebSocket URL path: ws://host:port/{password}
+/// </summary>
 internal sealed class RustRconClient : IRconClient
 {
-    private RCON? _rcon;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly ClientWebSocket _socket = new();
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<string>> _pending = new();
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private int _nextId = 10;
+    private CancellationTokenSource? _receiveCts;
+    private Task? _receiveTask;
 
     public event Action<string>? UnsolicitedMessage;
 
     public async Task ConnectAsync(Uri uri, string password, CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken);
+        // Rust WebRCON authenticates via the password in the URL path: ws://host:port/{password}
+        // Build the correct WebSocket URI with password in path if not already present.
+        var connectUri = uri;
+        if (string.IsNullOrWhiteSpace(uri.AbsolutePath) || uri.AbsolutePath == "/")
+        {
+            connectUri = new Uri($"ws://{uri.Host}:{uri.Port}/{Uri.EscapeDataString(password)}");
+        }
+
+        await _socket.ConnectAsync(connectUri, cancellationToken);
+
+        _receiveCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _receiveTask = Task.Run(() => ReceiveLoopAsync(_receiveCts.Token), CancellationToken.None);
+
+        RustOpsSentry.AddBreadcrumb($"WebRCON connected to {uri.Host}:{uri.Port}", "agent.rcon");
+    }
+
+    public Task<string> SendCommandAsync(string command, CancellationToken cancellationToken)
+    {
+        var id = Interlocked.Increment(ref _nextId);
+        return SendInternalAsync(command, id, cancellationToken);
+    }
+
+    private async Task<string> SendInternalAsync(string message, int identifier, CancellationToken cancellationToken)
+    {
+        if (_receiveTask?.IsFaulted == true)
+        {
+            throw new InvalidOperationException(
+                "WebRCON receive loop has failed.",
+                _receiveTask.Exception?.InnerException ?? _receiveTask.Exception);
+        }
+
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pending[identifier] = tcs;
+
+        var payload = JsonSerializer.Serialize(new
+        {
+            Identifier = identifier,
+            Message = message,
+            Name = "WebRcon"
+        });
+
+        var bytes = Encoding.UTF8.GetBytes(payload);
+        await _sendLock.WaitAsync(cancellationToken);
         try
         {
-            var addresses = await Dns.GetHostAddressesAsync(uri.Host, cancellationToken);
-            var address = addresses.FirstOrDefault(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
-
-            if (address is null)
-            {
-                throw new InvalidOperationException($"Could not resolve hostname '{uri.Host}' to an IPv4 address");
-            }
-
-            var port = (ushort)(uri.Port > 0 ? uri.Port : 28016);
-            _rcon = new RCON(address, port, password);
-
-            await _rcon.ConnectAsync();
-            RustOpsSentry.AddBreadcrumb($"RCON connected to {uri.Host}:{port}", "agent.rcon");
-        }
-        catch (Exception ex)
-        {
-            RustOpsSentry.CaptureException(
-                ex,
-                "Failed to connect to RCON server",
-                "agent.rcon",
-                extras: new Dictionary<string, object?>
-                {
-                    ["host"] = uri.Host,
-                    ["port"] = uri.Port
-                });
-            throw;
+            await _socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, cancellationToken);
         }
         finally
         {
-            _gate.Release();
+            _sendLock.Release();
+        }
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
+
+        try
+        {
+            return await tcs.Task;
+        }
+        finally
+        {
+            _pending.TryRemove(identifier, out _);
         }
     }
 
-    public async Task<string> SendCommandAsync(string command, CancellationToken cancellationToken)
+    private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
-        if (_rcon is null)
-        {
-            throw new InvalidOperationException("RCON is not connected. Call ConnectAsync first.");
-        }
-
-        await _gate.WaitAsync(cancellationToken);
+        var buffer = new byte[64 * 1024];
         try
         {
-            return await _rcon.SendCommandAsync(command);
+            while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
+            {
+                using var frame = new MemoryStream();
+                WebSocketReceiveResult result;
+                try
+                {
+                    result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                }
+                catch (OperationCanceledException) { return; }
+                catch (WebSocketException ex)
+                {
+                    RustOpsSentry.CaptureException(ex, "WebRCON socket error in receive loop.", "agent.rcon");
+                    throw;
+                }
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                    return;
+
+                frame.Write(buffer, 0, result.Count);
+                if (!result.EndOfMessage)
+                    continue;
+
+                var raw = Encoding.UTF8.GetString(frame.ToArray());
+                if (string.IsNullOrWhiteSpace(raw))
+                    continue;
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(raw);
+                    var root = doc.RootElement;
+                    var id = root.TryGetProperty("Identifier", out var idEl) && idEl.ValueKind == JsonValueKind.Number
+                        ? idEl.GetInt32() : -1;
+                    var msg = root.TryGetProperty("Message", out var msgEl) ? msgEl.ToString() : raw;
+
+                    if (id >= 0 && _pending.TryGetValue(id, out var tcs))
+                        tcs.TrySetResult(msg);
+                    else
+                        UnsolicitedMessage?.Invoke(msg);
+                }
+                catch
+                {
+                    UnsolicitedMessage?.Invoke(raw);
+                }
+            }
         }
-        finally
+        catch (Exception ex)
         {
-            _gate.Release();
+            RustOpsSentry.CaptureException(ex, "WebRCON receive loop terminated.", "agent.rcon");
+            foreach (var kv in _pending)
+                kv.Value.TrySetException(ex);
+            throw;
         }
     }
 
     public async ValueTask DisposeAsync()
     {
-        await _gate.WaitAsync();
-        try
+        foreach (var kv in _pending)
+            kv.Value.TrySetCanceled();
+        _pending.Clear();
+
+        _receiveCts?.Cancel();
+
+        if (_receiveTask is not null)
         {
-            if (_rcon is not null)
-            {
-                _rcon.Dispose();
-                _rcon = null;
-            }
+            try { await _receiveTask; }
+            catch { /* expected on cancel */ }
         }
-        finally
+
+        _receiveCts?.Dispose();
+        _sendLock.Dispose();
+
+        if (_socket.State == WebSocketState.Open)
         {
-            _gate.Release();
-            _gate.Dispose();
+            try { await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None); }
+            catch { /* best effort */ }
         }
+
+        _socket.Dispose();
     }
 }
