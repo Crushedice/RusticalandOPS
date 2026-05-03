@@ -97,11 +97,16 @@ internal sealed class RustRconClient : IRconClient
         {
             while (!cancellationToken.IsCancellationRequested && _socket.State == WebSocketState.Open)
             {
-                using var frame = new MemoryStream();
+                using var ms = new MemoryStream();
                 WebSocketReceiveResult result;
                 try
                 {
-                    result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                    do
+                    {
+                        result = await _socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                        if (result.MessageType == WebSocketMessageType.Close) return;
+                        ms.Write(buffer, 0, result.Count);
+                    } while (!result.EndOfMessage);
                 }
                 catch (OperationCanceledException) { return; }
                 catch (WebSocketException ex)
@@ -110,14 +115,7 @@ internal sealed class RustRconClient : IRconClient
                     throw;
                 }
 
-                if (result.MessageType == WebSocketMessageType.Close)
-                    return;
-
-                frame.Write(buffer, 0, result.Count);
-                if (!result.EndOfMessage)
-                    continue;
-
-                var raw = Encoding.UTF8.GetString(frame.ToArray());
+                var raw = Encoding.UTF8.GetString(ms.ToArray());
                 if (string.IsNullOrWhiteSpace(raw))
                     continue;
 

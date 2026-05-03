@@ -1,11 +1,12 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
+using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
-using CoreRCON;
 using Microsoft.AspNetCore.Http.Json;
 
 RustOpsEnv.LoadFromDefaultLocations();
@@ -1136,7 +1137,12 @@ internal sealed class RustRcon : IAsyncDisposable
     private readonly string _host;
     private readonly ushort _port;
     private readonly string _password;
-    private RCON? _rcon;
+    private ClientWebSocket? _ws;
+    private Task? _receiveTask;
+    private CancellationTokenSource? _cts;
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<string>> _pending = new();
+    private int _nextId = 1;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     public RustRcon(string host, ushort port, string password)
     {
@@ -1147,34 +1153,94 @@ internal sealed class RustRcon : IAsyncDisposable
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
-        var address = await ResolveAddressAsync(_host, cancellationToken);
-        _rcon = new RCON(address, _port, _password);
-        await _rcon.ConnectAsync();
+        _ws = new ClientWebSocket();
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var uri = new Uri($"ws://{_host}:{_port}/{Uri.EscapeDataString(_password)}");
+        await _ws.ConnectAsync(uri, cancellationToken);
+        _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), CancellationToken.None);
     }
 
-    public async Task<string> SendAndReceiveAsync(string command)
+    public async Task<string> SendAndReceiveAsync(string command, CancellationToken cancellationToken = default)
     {
-        if (_rcon is null)
+        if (_ws is null)
             throw new InvalidOperationException("RCON is not connected.");
 
-        return await _rcon.SendCommandAsync(command);
+        var id = Interlocked.Increment(ref _nextId);
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pending[id] = tcs;
+
+        var payload = JsonSerializer.Serialize(new { Identifier = id, Message = command, Name = "WebRcon" });
+        await _sendLock.WaitAsync(cancellationToken);
+        try
+        {
+            await _ws.SendAsync(Encoding.UTF8.GetBytes(payload), WebSocketMessageType.Text, true, cancellationToken);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
+        try
+        {
+            return await tcs.Task;
+        }
+        finally
+        {
+            _pending.TryRemove(id, out _);
+        }
     }
 
-    private static async Task<IPAddress> ResolveAddressAsync(string host, CancellationToken cancellationToken)
+    private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
     {
-        if (IPAddress.TryParse(host, out var address))
-            return address;
+        var buffer = new byte[64 * 1024];
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested && _ws!.State == WebSocketState.Open)
+            {
+                using var ms = new MemoryStream();
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                    if (result.MessageType == WebSocketMessageType.Close) return;
+                    ms.Write(buffer, 0, result.Count);
+                } while (!result.EndOfMessage);
 
-        var addresses = await Dns.GetHostAddressesAsync(host, cancellationToken);
-        return addresses.FirstOrDefault(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            ?? addresses.FirstOrDefault()
-            ?? throw new InvalidOperationException($"Could not resolve host '{host}'.");
+                var raw = Encoding.UTF8.GetString(ms.ToArray());
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(raw);
+                    var id = doc.RootElement.TryGetProperty("Identifier", out var idEl) ? idEl.GetInt32() : -1;
+                    var msg = doc.RootElement.TryGetProperty("Message", out var msgEl) ? msgEl.ToString() : raw;
+                    if (id >= 0 && _pending.TryGetValue(id, out var tcs))
+                        tcs.TrySetResult(msg);
+                }
+                catch { /* ignore unsolicited/unparseable messages */ }
+            }
+        }
+        catch (OperationCanceledException) { /* expected on shutdown */ }
+        catch (Exception ex)
+        {
+            foreach (var kv in _pending)
+                kv.Value.TrySetException(ex);
+        }
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        _rcon?.Dispose();
-        return ValueTask.CompletedTask;
+        _cts?.Cancel();
+        if (_receiveTask is not null)
+            try { await _receiveTask; } catch { }
+        _cts?.Dispose();
+        _sendLock.Dispose();
+        if (_ws?.State == WebSocketState.Open)
+            try { await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None); } catch { }
+        _ws?.Dispose();
     }
 }
 
