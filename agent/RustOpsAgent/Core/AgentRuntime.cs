@@ -116,18 +116,95 @@ internal sealed class AgentRuntime
     {
         try
         {
+            // Try to parse as a chat line first
             var parsed = TryParseChatLine(rawMessage);
-            if (parsed is null)
+            if (parsed is not null)
+            {
+                var playerChat = _neoCortex.LoadPlayerChat();
+                RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
+                _neoCortex.SavePlayerChat(playerChat);
+                return; // Chat lines don't also go to console error tracking
+            }
+
+            // Record non-chat lines to console monitor (errors, warnings, etc.)
+            if (!_config.ConsoleMonitor.Enabled)
                 return;
 
-            var playerChat = _neoCortex.LoadPlayerChat();
-            RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
-            _neoCortex.SavePlayerChat(playerChat);
+            var consoleMonitor = _neoCortex.LoadConsoleMonitor();
+            if (!consoleMonitor.Servers.TryGetValue(server, out var serverConsole))
+            {
+                serverConsole = new ServerConsoleState();
+                consoleMonitor.Servers[server] = serverConsole;
+            }
+
+            var consoleSignalLine = ExtractConsoleSignalLine(rawMessage);
+            var category = consoleSignalLine is null ? "info" : ClassifyConsoleLine(consoleSignalLine.ToLowerInvariant());
+
+            if (category is "error" or "warning")
+            {
+                if (IsPurePlayerConnectionNoise(consoleSignalLine!))
+                    return;
+
+                var key = NormalizeErrorKey(consoleSignalLine!);
+                var existing = serverConsole.RecentErrors
+                    .FirstOrDefault(e => string.Equals(e.Message, key, StringComparison.OrdinalIgnoreCase));
+
+                if (existing is not null)
+                {
+                    existing.Count++;
+                    existing.LastSeenAtUtc = DateTime.UtcNow;
+                    if (string.IsNullOrWhiteSpace(existing.SampleLine) || IsBetterConsoleSample(consoleSignalLine!, existing.SampleLine))
+                    {
+                        existing.SampleLine = TrimSingleLine(consoleSignalLine!, 600);
+                    }
+                }
+                else
+                {
+                    existing = new ConsoleErrorEntry
+                    {
+                        Message = key,
+                        SampleLine = TrimSingleLine(consoleSignalLine!, 600),
+                        Category = category,
+                        FirstSeenAtUtc = DateTime.UtcNow,
+                        LastSeenAtUtc = DateTime.UtcNow
+                    };
+                    serverConsole.RecentErrors.Add(existing);
+                }
+
+                serverConsole.TotalErrorsIngested++;
+                serverConsole.ErrorCountSinceLastAlert++;
+
+                // Trim recent errors to a reasonable size
+                serverConsole.RecentErrors = serverConsole.RecentErrors
+                    .OrderByDescending(e => e.LastSeenAtUtc)
+                    .Take(100)
+                    .ToList();
+
+                consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
+                _neoCortex.SaveConsoleMonitor(consoleMonitor);
+            }
+            else if (category is "info" or "debug")
+            {
+                // Track repeating info/debug messages
+                var key = NormalizeErrorKey(rawMessage);
+                serverConsole.RepeatingMessages.TryGetValue(key, out var cnt);
+                serverConsole.RepeatingMessages[key] = cnt + 1;
+
+                // Keep repeating map bounded
+                if (serverConsole.RepeatingMessages.Count > 200)
+                {
+                    var oldestKey = serverConsole.RepeatingMessages.OrderBy(kv => kv.Value).First().Key;
+                    serverConsole.RepeatingMessages.Remove(oldestKey);
+                }
+
+                consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
+                _neoCortex.SaveConsoleMonitor(consoleMonitor);
+            }
         }
         catch (Exception ex)
         {
-            // Never let a chat-capture failure affect the RCON receive loop.
-            RustOpsSentry.CaptureException(ex, "Remote RCON chat capture failed.", "agent.chat-monitor",
+            // Never let a chat-capture or console-monitor failure affect the RCON receive loop.
+            RustOpsSentry.CaptureException(ex, "Remote RCON message processing failed.", "agent.chat-monitor",
                 extras: new Dictionary<string, object?> { ["server"] = server });
         }
     }

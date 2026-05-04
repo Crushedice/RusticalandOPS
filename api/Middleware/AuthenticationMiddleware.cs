@@ -11,8 +11,10 @@ public class AuthenticationMiddleware
 
     public async Task InvokeAsync(HttpContext context)
     {
-        // Allow /health without auth
-        if (context.Request.Path == "/health")
+        // Allow /health, /ui, and / without auth
+        if (context.Request.Path.StartsWithSegments("/health") ||
+            context.Request.Path.StartsWithSegments("/ui") ||
+            context.Request.Path == "/")
         {
             await _next(context);
             return;
