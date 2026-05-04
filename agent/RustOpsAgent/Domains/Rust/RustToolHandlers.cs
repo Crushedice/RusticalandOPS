@@ -1428,23 +1428,93 @@ internal sealed class RustPluginToolHandler : IToolHandler
         if (records.Count == 0)
             return null;
 
-        var lines = records.Take(8).Select(record =>
-        {
-            var commands = record.Commands
-                .Select(command => command.Type == "ConsoleCommand"
-                    ? command.Command.TrimStart('/')
-                    : "/" + command.Command.TrimStart('/'))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(10)
-                .ToList();
-            var commandText = commands.Count == 0 ? "none detected" : string.Join(", ", commands);
-            var permissions = record.Permissions.Count == 0 ? string.Empty : $" Permissions: {string.Join(", ", record.Permissions.Take(10))}.";
-            return $"{record.PluginName}: commands {commandText}.{permissions}";
-        });
+        var msgLower = context.Message.ToLowerInvariant();
+        var wantsChatCommands = msgLower.Contains("chat") && msgLower.Contains("command");
+        var wantsConsoleCommands = msgLower.Contains("console") && msgLower.Contains("command");
+        var wantsPermissions = msgLower.Contains("permission");
+        var wantsHooks = msgLower.Contains("hook");
+        var wantsConfig = msgLower.Contains("config");
 
+        var lines = new List<string>();
+
+        // If searching for a specific feature type, show only relevant results
+        foreach (var record in records.Take(8))
+        {
+            var section = new List<string>();
+
+            if (wantsChatCommands)
+            {
+                var chatCmds = record.Commands
+                    .Where(cmd => cmd.Type == "ChatCommand")
+                    .Select(cmd => "/" + cmd.Command.TrimStart('/'))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (chatCmds.Count > 0)
+                {
+                    section.Add($"{record.PluginName}: {string.Join(", ", chatCmds)}");
+                }
+            }
+            else if (wantsConsoleCommands)
+            {
+                var consoleCmds = record.Commands
+                    .Where(cmd => cmd.Type == "ConsoleCommand")
+                    .Select(cmd => cmd.Command.TrimStart('/'))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (consoleCmds.Count > 0)
+                {
+                    section.Add($"{record.PluginName}: {string.Join(", ", consoleCmds)}");
+                }
+            }
+            else if (wantsPermissions)
+            {
+                if (record.Permissions.Count > 0)
+                {
+                    section.Add($"{record.PluginName}: {string.Join(", ", record.Permissions.Take(8))}");
+                }
+            }
+            else if (wantsHooks)
+            {
+                if (record.Hooks.Count > 0)
+                {
+                    section.Add($"{record.PluginName}: {string.Join(", ", record.Hooks.Take(8))}");
+                }
+            }
+            else if (wantsConfig)
+            {
+                if (record.ConfigKeys.Count > 0)
+                {
+                    section.Add($"{record.PluginName}: {string.Join(", ", record.ConfigKeys.Take(8))}");
+                }
+            }
+            else
+            {
+                // Generic response: show available types cleanly
+                var chatCmds = record.Commands.Where(cmd => cmd.Type == "ChatCommand").ToList();
+                var consoleCmds = record.Commands.Where(cmd => cmd.Type == "ConsoleCommand").ToList();
+                var pluginLine = $"{record.PluginName}:";
+                if (chatCmds.Count > 0)
+                    pluginLine += $" chat=[{string.Join(", ", chatCmds.Select(c => "/" + c.Command.TrimStart('/')).Take(4))}]";
+                if (consoleCmds.Count > 0)
+                    pluginLine += $" console=[{string.Join(", ", consoleCmds.Select(c => c.Command.TrimStart('/')).Take(4))}]";
+                if (record.Permissions.Count > 0)
+                    pluginLine += $" perms=[{string.Join(", ", record.Permissions.Take(2))}]";
+                section.Add(pluginLine);
+            }
+
+            lines.AddRange(section);
+        }
+
+        if (lines.Count == 0)
+            return new ToolExecutionResult(
+                true,
+                $"Found {records.Count} plugin(s) but none had matching {(wantsChatCommands ? "chat commands" : wantsConsoleCommands ? "console commands" : wantsPermissions ? "permissions" : wantsHooks ? "hooks" : wantsConfig ? "config keys" : "data")}.",
+                ErrorCode: "authoritative_catalog");
+
+        var title = wantsChatCommands ? "Chat Commands:" : wantsConsoleCommands ? "Console Commands:" : wantsPermissions ? "Permissions:" : wantsHooks ? "Hooks:" : wantsConfig ? "Config Keys:" : "Plugin Reference:";
         return new ToolExecutionResult(
             true,
-            string.Join('\n', lines),
+            $"{title}\n{string.Join('\n', lines)}",
             Payload: new { source = "plugin-reference-index", count = records.Count },
             ErrorCode: "authoritative_catalog");
     }
@@ -1452,23 +1522,25 @@ internal sealed class RustPluginToolHandler : IToolHandler
     private static bool LooksLikeGeneralPluginReferenceQuestion(string message)
     {
         var lowered = message.ToLowerInvariant();
-        var asksReference =
-            lowered.Contains("what", StringComparison.Ordinal) ||
-            lowered.Contains("which", StringComparison.Ordinal) ||
-            lowered.Contains("how", StringComparison.Ordinal) ||
+
+        // Check if it's asking about plugin features (not live server state)
+        var asksFeature =
             lowered.Contains("command", StringComparison.Ordinal) ||
             lowered.Contains("permission", StringComparison.Ordinal) ||
             lowered.Contains("hook", StringComparison.Ordinal) ||
-            lowered.Contains("config key", StringComparison.Ordinal);
+            lowered.Contains("config", StringComparison.Ordinal);
 
+        // Don't match questions about what's currently active on the server
         var asksLiveServerState =
             lowered.Contains("active", StringComparison.Ordinal) ||
             lowered.Contains("loaded", StringComparison.Ordinal) ||
             lowered.Contains("installed", StringComparison.Ordinal) ||
             lowered.Contains("enabled", StringComparison.Ordinal) ||
-            lowered.Contains("on server", StringComparison.Ordinal);
+            lowered.Contains("on server", StringComparison.Ordinal) ||
+            lowered.Contains("running", StringComparison.Ordinal);
 
-        return lowered.Contains("plugin", StringComparison.Ordinal) && asksReference && !asksLiveServerState;
+        return (lowered.Contains("plugin", StringComparison.Ordinal) || lowered.Contains("command", StringComparison.Ordinal))
+            && asksFeature && !asksLiveServerState;
     }
 
 }
@@ -1890,12 +1962,76 @@ internal static class RustDirectRconHelper
     private static readonly ConcurrentDictionary<string, PersistentRconSession> Sessions = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, (Uri Uri, string Password)> RemoteOverrides = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Fires whenever any persistent RCON session receives an unsolicited message.
+    /// (server, message). Used by chat monitoring for remote servers that have no log file
+    /// to poll. Subscribe BEFORE warming sessions so initial messages are not missed.
+    /// </summary>
+    public static event Action<string, string>? UnsolicitedMessageReceived;
+
     /// <summary>Register a remote server's RCON credentials at startup so the agent can connect directly.</summary>
     public static void RegisterRemoteServer(string server, Uri uri, string password)
     {
         RemoteOverrides[server] = (uri, password);
         RustOpsSentry.AddBreadcrumb($"Registered remote RCON for '{server}' at {uri.Host}:{uri.Port}", "agent.rcon");
     }
+
+    /// <summary>
+    /// Eagerly create + connect a persistent RCON session for a server. Required for chat
+    /// monitoring on remote servers (we need the WebSocket open to receive chat events
+    /// before any command is sent). Returns the diagnostic outcome so callers can log
+    /// a useful message instead of just "failed".
+    /// </summary>
+    public static async Task<RconWarmupOutcome> WarmupAsync(string server, CancellationToken cancellationToken)
+    {
+        var connection = LoadConnection(server);
+        if (connection is null)
+            return new RconWarmupOutcome(false, "no RCON credentials registered", null);
+
+        var endpoint = $"{connection.Value.Uri.Host}:{connection.Value.Uri.Port}";
+        var session = GetOrCreateSession(server, connection.Value.Uri, connection.Value.Password);
+
+        // Skip if already connected (avoids redundant work and websocket churn on periodic re-warmup).
+        if (session.IsConnected)
+            return new RconWarmupOutcome(true, $"already connected to {endpoint}", endpoint);
+
+        // Hard 7-second timeout — TCP can otherwise hang for ~21–75 seconds on unreachable hosts.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(7));
+
+        try
+        {
+            await session.EnsureConnectedAsync(cts.Token);
+            return new RconWarmupOutcome(true, $"connected to {endpoint}", endpoint);
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            return new RconWarmupOutcome(false, $"timeout connecting to {endpoint} (7s) — host unreachable or firewalled", endpoint);
+        }
+        catch (System.Net.Sockets.SocketException ex) when (ex.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionRefused)
+        {
+            return new RconWarmupOutcome(false,
+                $"connection refused at {endpoint} — port closed. Check rconPort and that the server is running with WebRCON enabled (+rcon.web 1).",
+                endpoint);
+        }
+        catch (System.Net.WebSockets.WebSocketException ex)
+        {
+            return new RconWarmupOutcome(false,
+                $"websocket handshake failed at {endpoint} — server reachable but not speaking WebRCON. Add '+rcon.web 1' to additionalArgs. ({ex.Message})",
+                endpoint);
+        }
+        catch (Exception ex)
+        {
+            return new RconWarmupOutcome(false, $"connect failed at {endpoint}: {ex.Message}", endpoint);
+        }
+    }
+
+    /// <summary>Outcome of a warmup attempt — used for diagnostic logging.</summary>
+    public sealed record RconWarmupOutcome(bool Success, string Message, string? Endpoint);
+
+    /// <summary>Names of remote servers that have credentials registered.</summary>
+    public static IReadOnlyList<string> GetRegisteredRemoteServerNames() =>
+        RemoteOverrides.Keys.ToList();
 
     public static IReadOnlyList<string> GetRollingLog(string server)
     {
@@ -1949,6 +2085,17 @@ internal static class RustDirectRconHelper
             }
 
             var created = new PersistentRconSession(uri, password);
+            // Forward unsolicited messages with the server name attached so subscribers
+            // (e.g., chat monitor) know which server emitted the message.
+            created.UnsolicitedMessageReceived += msg =>
+            {
+                try { UnsolicitedMessageReceived?.Invoke(server, msg); }
+                catch (Exception ex)
+                {
+                    RustOpsSentry.CaptureException(ex, "Static UnsolicitedMessageReceived handler faulted.", "agent.rcon");
+                }
+            };
+
             if (Sessions.TryAdd(server, created))
             {
                 return created;

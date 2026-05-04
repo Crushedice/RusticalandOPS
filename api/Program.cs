@@ -1,13 +1,14 @@
 ﻿using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http;
+using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
-using CoreRCON;
 using Microsoft.AspNetCore.Http.Json;
 using Sentry;
 
@@ -27,6 +28,8 @@ builder.Services.Configure<JsonOptions>(options =>
 
 var app = builder.Build();
 var rustMgr = new RustMgrExecutor();
+var rconConnections = new PersistentRconConnections();
+app.Lifetime.ApplicationStopping.Register(() => _ = Task.Run(rconConnections.DisposeAsync));
 
 // -- Configuration ------------------------------------------------------------
 // API key: set RUSTMGR_API_KEY env var. Falls back to "changeme" for dev only.
@@ -209,7 +212,7 @@ app.MapGet("/dashboard/summary", async () =>
         // Only query players + serverinfo if the server is actually running
         var isOnline = (statusData as System.Text.Json.Nodes.JsonObject)
             ?.TryGetPropertyValue("online", out var onlineNode) == true
-            && onlineNode?.GetValue<bool?>() == true;
+            && TryGetJsonBool(onlineNode) == true;
 
         if (isOnline)
         {
@@ -223,8 +226,27 @@ app.MapGet("/dashboard/summary", async () =>
         }
     }));
 
+    // RCON-only remote servers (no agent URL): fetch live data via direct WebRCON. Without
+    // this, they appear in the list but show as offline with no players/map/uptime.
+    var rconOnlyServers = remoteServersForSummary
+        .Where(r => string.IsNullOrWhiteSpace(r.AgentBaseUrl)
+                    && !string.IsNullOrWhiteSpace(r.RconIp)
+                    && r.RconPort > 0
+                    && !string.IsNullOrWhiteSpace(r.RconPassword))
+        .ToList();
+
+    await Task.WhenAll(rconOnlyServers.Select(async r =>
+    {
+        var (status, info, players) = await TryFetchRconOnlyLiveDataAsync(r);
+        if (status is not null)  lock (remoteStatusData) remoteStatusData[r.Name] = status;
+        if (info   is not null)  lock (remoteInfoData)   remoteInfoData[r.Name]   = info;
+        if (players is not null) lock (remotePlayerData) remotePlayerData[r.Name] = players;
+    }));
+
+    // "Online" for the dashboard counter: agent-reachable OR (RCON-only with live data fetched).
     var remoteOnlineCount = remoteServersForSummary.Count(r =>
-        remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable && agSt.IsAuthValid);
+        (remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable && agSt.IsAuthValid)
+        || remoteStatusData.ContainsKey(r.Name));
 
     return Results.Ok(new
     {
@@ -258,7 +280,7 @@ app.MapGet("/dashboard/summary", async () =>
             chatInbox = CountJsonFiles(agentPaths.ChatInboxPath),
             messageOutbox = CountJsonFiles(agentPaths.MessageOutboxPath),
             sentOutbox = CountJsonFiles(agentPaths.SentOutboxPath),
-            adminChatMessages = 0,
+            adminChatMessages = CountAdminChatMessages(agentPaths),
             llmCallsCount = memory.LlmInteractions.Count,
             semanticMemorySize = File.Exists(agentPaths.SemanticMemoryDbPath) ? new FileInfo(agentPaths.SemanticMemoryDbPath).Length : 0,
             pluginDbSize = File.Exists(agentPaths.PluginDbPath) ? new FileInfo(agentPaths.PluginDbPath).Length : 0
@@ -301,16 +323,16 @@ app.MapGet("/dashboard/summary", async () =>
                 var infoObj   = infoData   as System.Text.Json.Nodes.JsonObject;
 
                 // helpers over status object
-                string  GetStr (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<string>()  ?? "" : "";
-                bool    GetBool(string key, bool def = false) => liveObj?.TryGetPropertyValue(key, out var v) == true ? (v?.GetValue<bool?>() ?? def) : def;
-                int?    GetInt (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<int?>()    : null;
-                long?   GetLong(string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<long?>()   : null;
-                double? GetDbl (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<double?>() : null;
+                string  GetStr (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? TryGetJsonString(v) ?? "" : "";
+                bool    GetBool(string key, bool def = false) => liveObj?.TryGetPropertyValue(key, out var v) == true ? TryGetJsonBool(v) ?? def : def;
+                int?    GetInt (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? TryGetJsonInt(v)    : null;
+                long?   GetLong(string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? TryGetJsonLong(v)   : null;
+                double? GetDbl (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? TryGetJsonDouble(v) : null;
 
                 // helpers over serverinfo (infoObj can be array of players or object)
-                string? InfoStr(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<string>()  : null;
-                int?    InfoInt(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<int?>()    : null;
-                double? InfoDbl(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<double?>() : null;
+                string? InfoStr(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? TryGetJsonString(v)  : null;
+                int?    InfoInt(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? TryGetJsonInt(v)    : null;
+                double? InfoDbl(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? TryGetJsonDouble(v) : null;
 
                 // player list (remote agent returns raw JSON array or object with array property)
                 List<string> BuildPlayerPreview()
@@ -828,16 +850,13 @@ app.MapGet("/agent/player-chat/admin-calls", () =>
     try
     {
         var content = File.ReadAllText(chatPath);
-        var doc = JsonDocument.Parse(content);
-        var root = doc.RootElement;
-        var adminCalls = root.TryGetProperty("adminCalls", out var ac) ? ac : default(JsonElement);
-        var perServerVolume = root.TryGetProperty("perServerVolume", out var psv) ? psv : default(JsonElement);
-        var dailySummaries = root.TryGetProperty("dailySummaries", out var ds) ? ds : default(JsonElement);
+        var root = JsonNode.Parse(content) as JsonObject ?? new JsonObject();
+        EnsureDerivedChatStats(root);
         return Results.Ok(new
         {
-            adminCalls = (object)(adminCalls.ValueKind != JsonValueKind.Null ? adminCalls : JsonDocument.Parse("[]").RootElement),
-            perServerVolume = (object)(perServerVolume.ValueKind != JsonValueKind.Null ? perServerVolume : JsonDocument.Parse("{}").RootElement),
-            dailySummaries = (object)(dailySummaries.ValueKind != JsonValueKind.Null ? dailySummaries : JsonDocument.Parse("[]").RootElement)
+            adminCalls = root["adminCalls"] ?? new JsonArray(),
+            perServerVolume = root["perServerVolume"] ?? new JsonObject(),
+            dailySummaries = root["dailySummaries"] ?? new JsonArray()
         });
     }
     catch (Exception ex)
@@ -1120,6 +1139,67 @@ async Task<IResult?> TryProxyRemoteAgentAsync(
     {
         CaptureHandledApiException(ex, "Remote agent proxy failed.", server, path);
         return Results.BadRequest(new ApiError("remote_agent_error", ex.Message));
+    }
+}
+
+// Fetches live status / serverinfo / playerlist for an RCON-only remote server (no agent).
+// Uses the same persistent WebRCON client as command execution. Returns a synthesized status object on success or
+// failure so the dashboard always renders the row with a clear state.
+async Task<(JsonNode? Status, JsonNode? Info, JsonNode? Players)> TryFetchRconOnlyLiveDataAsync(RemoteServerEntry r)
+{
+    var ip = r.RconIp?.Trim() ?? string.Empty;
+    var password = r.RconPassword?.Trim() ?? string.Empty;
+    if (string.IsNullOrWhiteSpace(ip) || r.RconPort <= 0 || r.RconPort > 65535 || string.IsNullOrWhiteSpace(password))
+    {
+        return (new JsonObject { ["online"] = false, ["state"] = "rcon-misconfigured" }, null, null);
+    }
+
+    // Hard 4s timeout — dashboard summary should never block waiting on an unreachable host.
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+    try
+    {
+        var endpoint = new RconConnectionInfo(ip, (ushort)r.RconPort, password, true);
+
+        // serverinfo returns a JSON object with Hostname, MaxPlayers, Players, Queued, Map, Framerate, Uptime, Memory, etc.
+        var infoRaw = await SendPersistentRconAsync(endpoint, "serverinfo", cts.Token);
+        JsonNode? info = null;
+        try { info = string.IsNullOrWhiteSpace(infoRaw) ? null : JsonNode.Parse(infoRaw); }
+        catch { /* serverinfo may not be JSON on some plugin loadouts; leave null */ }
+
+        // playerlist returns a JSON array of {SteamID, DisplayName, Ping, Address, ...}
+        var playersRaw = await SendPersistentRconAsync(endpoint, "playerlist", cts.Token);
+        JsonNode? players = null;
+        try { players = string.IsNullOrWhiteSpace(playersRaw) ? null : JsonNode.Parse(playersRaw); }
+        catch { /* tolerate non-JSON output */ }
+
+        // Synthesize a status object so the dashboard summary path treats this server as "online".
+        var status = new JsonObject
+        {
+            ["online"] = true,
+            ["state"] = "rcon-online",
+            ["hostname"] = (info as JsonObject)?["Hostname"]?.GetValue<string>() ?? r.DisplayName,
+            ["map"] = (info as JsonObject)?["Map"]?.GetValue<string>(),
+            ["framerate"] = TryGetJsonDoubleProperty(info as JsonObject, "Framerate"),
+            ["queuedPlayers"] = TryGetJsonIntProperty(info as JsonObject, "Queued"),
+            ["uptimeSeconds"] = TryGetJsonLongProperty(info as JsonObject, "Uptime"),
+            ["memoryMb"] = TryGetJsonLongProperty(info as JsonObject, "Memory")
+        };
+
+        return (status, info, players);
+    }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+    {
+        return (new JsonObject { ["online"] = false, ["state"] = "rcon-timeout" }, null, null);
+    }
+    catch (System.Net.Sockets.SocketException ex) when (ex.SocketErrorCode == System.Net.Sockets.SocketError.ConnectionRefused)
+    {
+        // Don't capture to Sentry — connection refused on a remote we can't control is expected noise.
+        return (new JsonObject { ["online"] = false, ["state"] = "rcon-port-closed" }, null, null);
+    }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "RCON-only remote live data fetch failed.", r.Name);
+        return (new JsonObject { ["online"] = false, ["state"] = "rcon-unreachable" }, null, null);
     }
 }
 
@@ -1406,10 +1486,9 @@ app.MapPost("/servers/remote/{name}/test", async (string name) =>
     try
     {
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-        await using var rcon = new RustRcon(server.RconIp, (ushort)server.RconPort, server.RconPassword);
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        await rcon.ConnectAsync(cts.Token);
-        var reply = await rcon.SendAndReceiveAsync("status", cts.Token);
+        var endpoint = new RconConnectionInfo(server.RconIp, (ushort)server.RconPort, server.RconPassword, true);
+        var reply = await SendPersistentRconAsync(endpoint, "status", cts.Token);
         sw.Stop();
         return Results.Ok(new { ok = true, latencyMs = sw.ElapsedMilliseconds });
     }
@@ -2056,9 +2135,7 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
 
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var reply = await rcon.SendAndReceiveAsync(command);
+        var reply = await SendPersistentRconAsync(endpoint, command);
         return Results.Ok(new
         {
             ok = true,
@@ -2133,9 +2210,7 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
     string? directReply;
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        directReply = await rcon.SendAndReceiveAsync(command);
+        directReply = await SendPersistentRconAsync(endpoint, command);
     }
     catch (Exception ex)
     {
@@ -2369,9 +2444,7 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
 
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var directReply = await rcon.SendAndReceiveAsync("serverinfo");
+        var directReply = await SendPersistentRconAsync(endpoint, "serverinfo");
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse serverinfo response."))
@@ -2411,9 +2484,7 @@ app.MapGet("/servers/{server}/players", async (string server) =>
 
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var directReply = await rcon.SendAndReceiveAsync("playerlist");
+        var directReply = await SendPersistentRconAsync(endpoint, "playerlist");
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse playerlist response."))
@@ -2453,9 +2524,7 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
 
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var directReply = await rcon.SendAndReceiveAsync("bans");
+        var directReply = await SendPersistentRconAsync(endpoint, "bans");
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse bans response."))
@@ -2501,9 +2570,7 @@ app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest re
     
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var reply = await rcon.SendAndReceiveAsync(command);
+        var reply = await SendPersistentRconAsync(endpoint, command);
         return Results.Ok(new
         {
             ok = true,
@@ -2548,9 +2615,7 @@ app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest req
 
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var reply = await rcon.SendAndReceiveAsync(command);
+        var reply = await SendPersistentRconAsync(endpoint, command);
         return Results.Ok(new
         {
             ok = true,
@@ -2594,9 +2659,7 @@ app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest r
 
     try
     {
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var reply = await rcon.SendAndReceiveAsync(command);
+        var reply = await SendPersistentRconAsync(endpoint, command);
         return Results.Ok(new
         {
             ok = true,
@@ -2636,6 +2699,9 @@ RconConnectionInfo? TryResolveRconConnectionInfo(string server, ServerConfig? cf
 
     return null;
 }
+
+Task<string> SendPersistentRconAsync(RconConnectionInfo endpoint, string command, CancellationToken cancellationToken = default) =>
+    rconConnections.SendAndReceiveAsync(endpoint.Host, endpoint.Port, endpoint.Password, command, cancellationToken);
 
 app.Run();
 }
@@ -2681,6 +2747,9 @@ static string BuildRustMgrError(CommandExecutionResult result)
 
 static async Task<bool> IsValidServerAsync(string server)
 {
+    if (IsRemoteServerConfigured(server))
+        return true;
+
     if (File.Exists(GetConfigPath(server)))
         return true;
 
@@ -2688,6 +2757,28 @@ static async Task<bool> IsValidServerAsync(string server)
     var names  = (result.StdOut ?? string.Empty)
         .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     return names.Contains(server, StringComparer.OrdinalIgnoreCase);
+}
+
+static bool IsRemoteServerConfigured(string server)
+{
+    var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
+    var path = Path.Combine(configRoot, "remote-servers.json");
+    if (!File.Exists(path))
+        return false;
+
+    try
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        return doc.RootElement.TryGetProperty("servers", out var servers) &&
+               servers.ValueKind == JsonValueKind.Array &&
+               servers.EnumerateArray().Any(entry =>
+                   entry.TryGetProperty("name", out var nameNode) &&
+                   string.Equals(nameNode.GetString(), server, StringComparison.OrdinalIgnoreCase));
+    }
+    catch
+    {
+        return false;
+    }
 }
 
 // Parses the structured output rustmgr status actually emits:
@@ -3063,6 +3154,251 @@ static void SaveServerConfig(ServerConfig config)
 
 static int CountJsonFiles(string path) =>
     Directory.Exists(path) ? Directory.GetFiles(path, "*.json").Length : 0;
+
+static int CountAdminChatMessages(AgentRuntimePaths agentPaths)
+{
+    var chatPath = Path.Combine(agentPaths.NeoCortexRoot, "chat", "knowledge.json");
+    if (!File.Exists(chatPath))
+        return 0;
+
+    try
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(chatPath));
+        return doc.RootElement.TryGetProperty("adminCalls", out var calls) && calls.ValueKind == JsonValueKind.Array
+            ? calls.GetArrayLength()
+            : 0;
+    }
+    catch
+    {
+        return 0;
+    }
+}
+
+static void EnsureDerivedChatStats(JsonObject root)
+{
+    var recent = root["recentMessages"] as JsonArray;
+    if (recent is null || recent.Count == 0)
+        return;
+
+    if (root["adminCalls"] is not JsonArray adminCalls || adminCalls.Count == 0)
+    {
+        adminCalls = new JsonArray();
+        foreach (var msg in recent.OfType<JsonObject>())
+        {
+            var message = msg["message"]?.GetValue<string>() ?? string.Empty;
+            if (!LooksLikeAdminCall(message, out var callType))
+                continue;
+
+            adminCalls.Add(new JsonObject
+            {
+                ["id"] = Guid.NewGuid().ToString("N"),
+                ["serverName"] = msg["serverName"]?.GetValue<string>() ?? string.Empty,
+                ["playerName"] = msg["playerName"]?.GetValue<string>() ?? string.Empty,
+                ["message"] = message,
+                ["callType"] = callType,
+                ["capturedAtUtc"] = TryGetJsonDateTime(msg["capturedAtUtc"]) ?? DateTime.UtcNow,
+                ["acknowledged"] = false
+            });
+        }
+        root["adminCalls"] = adminCalls;
+    }
+
+    if (root["perServerVolume"] is JsonObject volume && volume.Count > 0)
+        return;
+
+    var todayUtc = DateTime.UtcNow.Date;
+    var grouped = recent
+        .OfType<JsonObject>()
+        .Select(msg => new
+        {
+            Server = msg["serverName"]?.GetValue<string>() ?? string.Empty,
+            Player = msg["playerName"]?.GetValue<string>() ?? string.Empty,
+            CapturedAt = TryGetJsonDateTime(msg["capturedAtUtc"]) ?? DateTime.MinValue
+        })
+        .Where(msg => !string.IsNullOrWhiteSpace(msg.Server))
+        .GroupBy(msg => msg.Server, StringComparer.OrdinalIgnoreCase);
+
+    volume = new JsonObject();
+    foreach (var group in grouped)
+    {
+        var messages = group.ToList();
+        var today = messages.Where(m => m.CapturedAt.Date == todayUtc).ToList();
+        volume[group.Key] = new JsonObject
+        {
+            ["serverName"] = group.Key,
+            ["todayMessageCount"] = today.Count,
+            ["totalMessageCount"] = messages.Count,
+            ["lastMessageAtUtc"] = messages.Max(m => m.CapturedAt),
+            ["activePlayerCount"] = today.Select(m => m.Player).Where(p => !string.IsNullOrWhiteSpace(p)).Distinct(StringComparer.OrdinalIgnoreCase).Count()
+        };
+    }
+    root["perServerVolume"] = volume;
+}
+
+static bool LooksLikeAdminCall(string message, out string callType)
+{
+    var text = message.Trim().ToLowerInvariant();
+    callType = string.Empty;
+
+    if (text.Contains("admin") || text.Contains("mod ") || text.Contains("moderator"))
+    {
+        callType = "admin-request";
+        return true;
+    }
+
+    if (text.Contains("cheater") || text.Contains("hacker") || text.Contains("aimbot") ||
+        text.Contains("esp") || text.Contains("scripting") || text.Contains("script user"))
+    {
+        callType = "cheater-report";
+        return true;
+    }
+
+    if (text.Contains("help") || text.Contains("stuck") || text.Contains("bug") ||
+        text.Contains("glitch") || text.Contains("not working") || text.Contains("can't") ||
+        text.Contains("cant "))
+    {
+        callType = "help-request";
+        return true;
+    }
+
+    if (text.Contains("grief") || text.Contains("toxic") || text.Contains("racist") ||
+        text.Contains("harass") || text.Contains("insult"))
+    {
+        callType = "player-report";
+        return true;
+    }
+
+    return false;
+}
+
+static string? TryGetJsonString(JsonNode? node)
+{
+    if (node is not JsonValue value)
+        return null;
+
+    try
+    {
+        return value.TryGetValue<string>(out var stringValue) ? stringValue : value.ToJsonString();
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+static bool? TryGetJsonBool(JsonNode? node)
+{
+    if (node is not JsonValue value)
+        return null;
+
+    try
+    {
+        if (value.TryGetValue<bool>(out var boolValue))
+            return boolValue;
+        if (value.TryGetValue<string>(out var stringValue) && bool.TryParse(stringValue, out var parsed))
+            return parsed;
+    }
+    catch { }
+
+    return null;
+}
+
+static DateTime? TryGetJsonDateTime(JsonNode? node)
+{
+    if (node is not JsonValue value)
+        return null;
+
+    try
+    {
+        if (value.TryGetValue<DateTime>(out var dateValue))
+            return dateValue;
+        if (value.TryGetValue<string>(out var stringValue) && DateTime.TryParse(stringValue, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsed))
+            return parsed;
+    }
+    catch { }
+
+    return null;
+}
+
+static int? TryGetJsonInt(JsonNode? node)
+{
+    if (node is not JsonValue value)
+        return null;
+
+    try
+    {
+        if (value.TryGetValue<int>(out var intValue))
+            return intValue;
+        if (value.TryGetValue<long>(out var longValue))
+            return (int)Math.Clamp(longValue, int.MinValue, int.MaxValue);
+        if (value.TryGetValue<double>(out var doubleValue))
+            return (int)Math.Clamp(doubleValue, int.MinValue, int.MaxValue);
+        if (value.TryGetValue<string>(out var stringValue) && int.TryParse(stringValue, out var parsed))
+            return parsed;
+    }
+    catch { }
+
+    return null;
+}
+
+static long? TryGetJsonLong(JsonNode? node)
+{
+    if (node is not JsonValue value)
+        return null;
+
+    try
+    {
+        if (value.TryGetValue<long>(out var longValue))
+            return longValue;
+        if (value.TryGetValue<int>(out var intValue))
+            return intValue;
+        if (value.TryGetValue<double>(out var doubleValue))
+            return (long)doubleValue;
+        if (value.TryGetValue<string>(out var stringValue) && long.TryParse(stringValue, out var parsed))
+            return parsed;
+    }
+    catch { }
+
+    return null;
+}
+
+static double? TryGetJsonDouble(JsonNode? node)
+{
+    if (node is not JsonValue value)
+        return null;
+
+    try
+    {
+        if (value.TryGetValue<double>(out var doubleValue))
+            return doubleValue;
+        if (value.TryGetValue<float>(out var floatValue))
+            return floatValue;
+        if (value.TryGetValue<int>(out var intValue))
+            return intValue;
+        if (value.TryGetValue<long>(out var longValue))
+            return longValue;
+        if (value.TryGetValue<string>(out var stringValue) && double.TryParse(stringValue, out var parsed))
+            return parsed;
+    }
+    catch { }
+
+    return null;
+}
+
+static int? TryGetJsonIntProperty(JsonObject? obj, string propertyName)
+{
+    return TryGetJsonInt(obj?[propertyName]);
+}
+
+static long? TryGetJsonLongProperty(JsonObject? obj, string propertyName)
+{
+    return TryGetJsonLong(obj?[propertyName]);
+}
+
+static double? TryGetJsonDoubleProperty(JsonObject? obj, string propertyName)
+{
+    return TryGetJsonDouble(obj?[propertyName]);
+}
 
 static long GetDirSize(string path)
 {
@@ -6309,18 +6645,84 @@ public sealed class RemoteAgentStatus
 
 internal sealed record IncidentFeedbackEntry(string? Verdict, string? Note, DateTime? AnsweredAtUtc);
 
-/// <summary>
-/// Lightweight RCON wrapper for Rust server console interaction.
-/// Supports fire-and-forget commands and awaited reply matching.
-/// </summary>
-public sealed class RustRcon : IAsyncDisposable
+internal sealed class PersistentRconConnections
 {
-    private RCON? _rcon;
+    private readonly ConcurrentDictionary<RconConnectionKey, RconConnectionSlot> _connections = new();
+
+    public async Task<string> SendAndReceiveAsync(
+        string host,
+        ushort port,
+        string password,
+        string command,
+        CancellationToken cancellationToken = default)
+    {
+        var key = new RconConnectionKey(host.Trim(), port, password);
+        var slot = _connections.GetOrAdd(key, _ => new RconConnectionSlot());
+
+        await slot.Lock.WaitAsync(cancellationToken);
+        try
+        {
+            slot.Client ??= new RustRcon(key.Host, key.Port, key.Password);
+            if (!slot.Client.IsConnected)
+                await slot.Client.ConnectAsync(cancellationToken);
+
+            try
+            {
+                return await slot.Client.SendAndReceiveAsync(command, cancellationToken);
+            }
+            catch
+            {
+                await slot.DisposeClientAsync();
+                slot.Client = new RustRcon(key.Host, key.Port, key.Password);
+                await slot.Client.ConnectAsync(cancellationToken);
+                return await slot.Client.SendAndReceiveAsync(command, cancellationToken);
+            }
+        }
+        finally
+        {
+            slot.Lock.Release();
+        }
+    }
+
+    public async Task DisposeAsync()
+    {
+        foreach (var slot in _connections.Values)
+            await slot.DisposeClientAsync();
+
+        _connections.Clear();
+    }
+
+    private sealed record RconConnectionKey(string Host, ushort Port, string Password);
+
+    private sealed class RconConnectionSlot
+    {
+        public SemaphoreSlim Lock { get; } = new(1, 1);
+        public RustRcon? Client { get; set; }
+
+        public async Task DisposeClientAsync()
+        {
+            if (Client is not null)
+            {
+                await Client.DisposeAsync();
+                Client = null;
+            }
+        }
+    }
+}
+
+internal sealed class RustRcon : IAsyncDisposable
+{
     private readonly string _host;
     private readonly ushort _port;
     private readonly string _password;
+    private ClientWebSocket? _ws;
+    private Task? _receiveTask;
+    private CancellationTokenSource? _cts;
+    private readonly ConcurrentDictionary<int, TaskCompletionSource<string>> _pending = new();
+    private int _nextId = 1;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
 
-    public bool IsConnected { get; private set; }
+    public bool IsConnected => _ws?.State == WebSocketState.Open;
 
     public RustRcon(string host, ushort port, string password)
     {
@@ -6329,75 +6731,121 @@ public sealed class RustRcon : IAsyncDisposable
         _password = password;
     }
 
-    public async Task ConnectAsync(CancellationToken ct = default)
+    public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
-        var address = await ResolveAddressAsync(_host, ct);
-        _rcon = new RCON(address, _port, _password);
-        await _rcon.ConnectAsync();
-        IsConnected = true;
-        _rcon.OnDisconnected += () => IsConnected = false;
+        await DisposeSocketAsync();
+
+        _ws = new ClientWebSocket();
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var uri = new Uri($"ws://{_host}:{_port}/{Uri.EscapeDataString(_password)}");
+        await _ws.ConnectAsync(uri, cancellationToken);
+        _receiveTask = Task.Run(() => ReceiveLoopAsync(_cts.Token), CancellationToken.None);
     }
 
-    /// <summary>Fire-and-forget. Does not wait for a response.</summary>
-    public async Task SendAsync(string command)
+    public async Task<string> SendAndReceiveAsync(string command, CancellationToken cancellationToken = default)
     {
-        EnsureConnected();
-        await _rcon!.SendCommandAsync(command);
-    }
+        if (!IsConnected)
+            throw new InvalidOperationException("RCON is not connected.");
 
-    /// <summary>
-    /// Sends a command and returns the direct response string.
-    /// Note: RCON responses are best-effort � not all commands echo a reply.
-    /// </summary>
-    public async Task<string> SendAndReceiveAsync(string command, CancellationToken ct = default)
-    {
-        EnsureConnected();
-        return await _rcon!.SendCommandAsync(command);
-    }
+        var id = Interlocked.Increment(ref _nextId);
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pending[id] = tcs;
 
-    /// <summary>
-    /// Sends a command and waits until a console log line matching
-    /// <paramref name="filter"/> appears, or the timeout elapses.
-    /// </summary>
-    public async Task<string?> SendAndWaitForLogAsync(
-        string command,
-        Func<string, bool> filter,
-        TimeSpan? timeout = null,
-        CancellationToken ct = default)
-    {
-        EnsureConnected();
-        var reply = await _rcon!.SendCommandAsync(command);
-        if (string.IsNullOrWhiteSpace(reply))
-            return null;
-        return filter(reply) ? reply : null;
-    }
-
-    private void EnsureConnected()
-    {
-        if (_rcon is null || !IsConnected)
-            throw new InvalidOperationException("RCON is not connected. Call ConnectAsync() first.");
-    }
-
-    private static async Task<IPAddress> ResolveAddressAsync(string host, CancellationToken ct)
-    {
-        if (IPAddress.TryParse(host, out var address))
-            return address;
-
-        var resolved = await Dns.GetHostAddressesAsync(host, ct);
-        return resolved.FirstOrDefault(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-            ?? resolved.FirstOrDefault()
-            ?? throw new InvalidOperationException($"Could not resolve host '{host}'.");
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        if (_rcon is not null)
+        var payload = JsonSerializer.Serialize(new { Identifier = id, Message = command, Name = "WebRcon" });
+        await _sendLock.WaitAsync(cancellationToken);
+        try
         {
-            IsConnected = false;
-            _rcon.Dispose();
-            _rcon = null;
+            await _ws!.SendAsync(Encoding.UTF8.GetBytes(payload), WebSocketMessageType.Text, true, cancellationToken);
+        }
+        finally
+        {
+            _sendLock.Release();
         }
 
-        return ValueTask.CompletedTask;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
+        try
+        {
+            return await tcs.Task;
+        }
+        finally
+        {
+            _pending.TryRemove(id, out _);
+        }
+    }
+
+    private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
+    {
+        var buffer = new byte[64 * 1024];
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested && _ws!.State == WebSocketState.Open)
+            {
+                using var ms = new MemoryStream();
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await _ws.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                    if (result.MessageType == WebSocketMessageType.Close)
+                        return;
+
+                    ms.Write(buffer, 0, result.Count);
+                } while (!result.EndOfMessage);
+
+                var raw = Encoding.UTF8.GetString(ms.ToArray());
+                if (string.IsNullOrWhiteSpace(raw))
+                    continue;
+
+                try
+                {
+                    using var doc = JsonDocument.Parse(raw);
+                    var id = doc.RootElement.TryGetProperty("Identifier", out var idEl) ? idEl.GetInt32() : -1;
+                    var msg = doc.RootElement.TryGetProperty("Message", out var msgEl) ? msgEl.ToString() : raw;
+                    if (id >= 0 && _pending.TryGetValue(id, out var tcs))
+                        tcs.TrySetResult(msg);
+                }
+                catch
+                {
+                    // Ignore unsolicited or malformed console messages.
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown/reconnect.
+        }
+        catch (Exception ex)
+        {
+            foreach (var kv in _pending)
+                kv.Value.TrySetException(ex);
+        }
+    }
+
+    private async Task DisposeSocketAsync()
+    {
+        _cts?.Cancel();
+        if (_receiveTask is not null)
+        {
+            try { await _receiveTask; } catch { }
+            _receiveTask = null;
+        }
+
+        _cts?.Dispose();
+        _cts = null;
+
+        if (_ws?.State == WebSocketState.Open)
+        {
+            try { await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None); } catch { }
+        }
+
+        _ws?.Dispose();
+        _ws = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await DisposeSocketAsync();
+        _sendLock.Dispose();
     }
 }

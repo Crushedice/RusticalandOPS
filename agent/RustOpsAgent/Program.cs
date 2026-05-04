@@ -172,6 +172,7 @@ Console.WriteLine($"[agent] Server knowledge loaded: {serverKnowledge.GetSnapsho
 
 // Register remote server RCON credentials so the agent can connect directly to them.
 // Local servers are handled lazily by RustDirectRconHelper reading their config files.
+var remoteServerNamesForWarmup = new List<string>();
 try
 {
     using var rconConfigResponse = await apiClient.GetAsync("/servers/remote/rcon-config", CancellationToken.None);
@@ -181,14 +182,35 @@ try
     {
         foreach (var entry in root.EnumerateArray())
         {
-            var name = entry.TryGetProperty("name", out var n) ? n.GetString() : null;
-            var ip = entry.TryGetProperty("rconIp", out var ipEl) ? ipEl.GetString() : null;
+            var name = entry.TryGetProperty("name", out var n) ? n.GetString()?.Trim() : null;
+            var ip = entry.TryGetProperty("rconIp", out var ipEl) ? ipEl.GetString()?.Trim() : null;
             var port = entry.TryGetProperty("rconPort", out var portEl) && portEl.ValueKind == JsonValueKind.Number ? portEl.GetInt32() : 0;
             var password = entry.TryGetProperty("rconPassword", out var pwdEl) ? pwdEl.GetString() : null;
-            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(ip) || port <= 0 || string.IsNullOrWhiteSpace(password))
+            if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(ip) || string.IsNullOrWhiteSpace(password))
+            {
+                Console.WriteLine($"[agent] Skipping remote RCON entry: missing name/ip/password.");
                 continue;
-            var uri = new Uri($"ws://{ip}:{port}/{Uri.EscapeDataString(password)}");
-            RustDirectRconHelper.RegisterRemoteServer(name, uri, password);
+            }
+            if (port <= 0 || port > 65535)
+            {
+                Console.WriteLine($"[agent] Skipping remote RCON for '{name}': port {port} is out of range (1–65535).");
+                continue;
+            }
+            // Build the WebRCON URI. Host stays raw (Uri handles IPv4/IPv6/hostnames),
+            // password is path-escaped because some Rust servers ship long random
+            // passwords with characters like '+' or '/'.
+            Uri uri;
+            try
+            {
+                uri = new Uri($"ws://{ip}:{port}/{Uri.EscapeDataString(password.Trim())}");
+            }
+            catch (UriFormatException ex)
+            {
+                Console.WriteLine($"[agent] Skipping remote RCON for '{name}': invalid host '{ip}' ({ex.Message}).");
+                continue;
+            }
+            RustDirectRconHelper.RegisterRemoteServer(name, uri, password.Trim());
+            remoteServerNamesForWarmup.Add(name);
             count++;
         }
     }
@@ -224,6 +246,26 @@ var executor = new ActionExecutor(registry, semanticMemory);
 var composer = new ResponseComposer(composeKernel, effectiveComposeSettings);
 
 var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel);
+
+// Eagerly open RCON sessions to remote servers so the chat-monitor subscriber (registered
+// inside AgentRuntime's ctor) starts receiving unsolicited messages immediately. Without
+// this, sessions are only created lazily on the first command — meaning chat from before
+// the first admin interaction would be lost.
+//
+// Failed warmups are NOT fatal — the server may be temporarily down, behind a firewall,
+// or have WebRCON disabled. AgentRuntime periodically re-warms (see WarmupRemoteSessionsAsync)
+// so chat starts flowing as soon as the server becomes reachable.
+if (remoteServerNamesForWarmup.Count > 0)
+{
+    var warmupTasks = remoteServerNamesForWarmup
+        .Select(async name =>
+        {
+            var outcome = await RustDirectRconHelper.WarmupAsync(name, CancellationToken.None);
+            Console.WriteLine($"[agent] RCON warmup {name}: {outcome.Message}");
+        })
+        .ToList();
+    _ = Task.WhenAll(warmupTasks); // fire-and-forget so startup isn't blocked
+}
 
 Console.CancelKeyPress += (_, e) =>
 {

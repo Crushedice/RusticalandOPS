@@ -5,6 +5,7 @@ using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
 using RustOpsAgent.Domains.Rust;
+using RustOpsAgent.Domains.Rust.Rcon;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
@@ -75,6 +76,60 @@ internal sealed class AgentRuntime
         _api = api;
         _deepKernel = kernel;
         (_staticIgnorePatterns, _incidentPatterns, _startupIgnorePatterns) = LoadStaticLogRules(config.Monitor.LogRulesPath);
+
+        // Capture player chat from remote servers via direct RCON unsolicited messages.
+        // Local servers still use the log-polling path; remote servers have no log file
+        // accessible to the API, so RCON is the only source of their chat stream.
+        if (_config.ConsoleMonitor.Enabled)
+        {
+            RustDirectRconHelper.UnsolicitedMessageReceived += OnRemoteRconUnsolicited;
+        }
+    }
+
+    private DateTime _lastRemoteRconWarmupAtUtc = DateTime.MinValue;
+
+    // Periodically re-warm RCON sessions to remote servers. If a server was offline at agent
+    // startup, was restarted, or its WebSocket got dropped, this re-establishes the chat
+    // stream as soon as it's reachable again. Throttled to once per minute to avoid hammering
+    // unreachable hosts.
+    private async Task ReconnectRemoteRconSessionsAsync(CancellationToken cancellationToken)
+    {
+        if (DateTime.UtcNow - _lastRemoteRconWarmupAtUtc < TimeSpan.FromMinutes(1))
+            return;
+        _lastRemoteRconWarmupAtUtc = DateTime.UtcNow;
+
+        var servers = RustDirectRconHelper.GetRegisteredRemoteServerNames();
+        if (servers.Count == 0)
+            return;
+
+        foreach (var server in servers)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var outcome = await RustDirectRconHelper.WarmupAsync(server, cancellationToken);
+            // Only log failures and recoveries, not "already connected" — that would spam the log.
+            if (!outcome.Success)
+                Console.WriteLine($"[agent] RCON reconnect {server}: {outcome.Message}");
+        }
+    }
+
+    private void OnRemoteRconUnsolicited(string server, string rawMessage)
+    {
+        try
+        {
+            var parsed = TryParseChatLine(rawMessage);
+            if (parsed is null)
+                return;
+
+            var playerChat = _neoCortex.LoadPlayerChat();
+            RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
+            _neoCortex.SavePlayerChat(playerChat);
+        }
+        catch (Exception ex)
+        {
+            // Never let a chat-capture failure affect the RCON receive loop.
+            RustOpsSentry.CaptureException(ex, "Remote RCON chat capture failed.", "agent.chat-monitor",
+                extras: new Dictionary<string, object?> { ["server"] = server });
+        }
     }
 
     public void RequestStop() => _stop = true;
@@ -104,6 +159,7 @@ internal sealed class AgentRuntime
 
                 await SafeExecuteAsync(() => ProcessChatInboxAsync(cancellationToken), "chat-processing", cancellationToken);
                 await SafeExecuteAsync(() => ObserveServersAsync(cancellationToken), "server-observation", cancellationToken);
+                await SafeExecuteAsync(() => ReconnectRemoteRconSessionsAsync(cancellationToken), "remote-rcon-reconnect", cancellationToken);
                 await SafeExecuteAsync(() => ReviewIncidentsAsync(cancellationToken), "incident-review", cancellationToken);
                 await SafeExecuteAsync(() => AnalyzePlayerSentimentAsync(cancellationToken), "sentiment-analysis", cancellationToken);
                 await SafeExecuteAsync(() => ProcessPlayerChatForStandInAsync(cancellationToken), "stand-in-admin", cancellationToken);
@@ -814,8 +870,13 @@ internal sealed class AgentRuntime
             try
             {
                 if (!_remoteServers.Contains(server))
+                {
                     await ObserveServerHealthAsync(server, cancellationToken);
-                await ObserveServerLogsAsync(server, cancellationToken);
+                    await ObserveServerLogsAsync(server, cancellationToken);
+                }
+                // Remote servers: chat comes via RCON (OnRemoteRconUnsolicited); logs are not
+                // accessible. The remote agent (if present) handles its own log monitoring,
+                // and RCON-only servers have no log file at all.
             }
             catch (Exception ex)
             {
@@ -933,6 +994,95 @@ internal sealed class AgentRuntime
         return (playerName, chatMessage);
     }
 
+    private void RecordPlayerChat(PlayerChatKnowledge chat, string server, string player, string message, DateTime capturedAtUtc)
+    {
+        var isAdminCall = TryClassifyAdminCall(message, out var callType);
+        chat.RecentMessages.Add(new PlayerChatEntry
+        {
+            ServerName = server,
+            PlayerName = player,
+            Message = message,
+            CapturedAtUtc = capturedAtUtc,
+            IsAdminCall = isAdminCall
+        });
+        chat.RecentMessages = chat.RecentMessages
+            .TakeLast(_config.ConsoleMonitor.MaxChatMessages)
+            .ToList();
+
+        if (!chat.PerServerVolume.TryGetValue(server, out var volume))
+        {
+            volume = new ServerChatVolume { ServerName = server };
+            chat.PerServerVolume[server] = volume;
+        }
+
+        var todayUtc = capturedAtUtc.Date;
+        if (volume.LastMessageAtUtc?.Date != todayUtc)
+            volume.TodayMessageCount = 0;
+
+        volume.TotalMessageCount++;
+        volume.TodayMessageCount++;
+        volume.LastMessageAtUtc = capturedAtUtc;
+        volume.ActivePlayerCount = chat.RecentMessages
+            .Where(m => m.CapturedAtUtc.Date == todayUtc && m.ServerName.Equals(server, StringComparison.OrdinalIgnoreCase))
+            .Select(m => m.PlayerName)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Count();
+
+        if (isAdminCall)
+        {
+            chat.AdminCalls.Add(new AdminCallEvent
+            {
+                ServerName = server,
+                PlayerName = player,
+                Message = message,
+                CallType = callType,
+                CapturedAtUtc = capturedAtUtc,
+                Acknowledged = false
+            });
+            chat.AdminCalls = chat.AdminCalls
+                .OrderBy(e => e.CapturedAtUtc)
+                .TakeLast(100)
+                .ToList();
+        }
+    }
+
+    private static bool TryClassifyAdminCall(string message, out string callType)
+    {
+        var text = message.Trim().ToLowerInvariant();
+        callType = string.Empty;
+
+        if (text.Contains("admin") || text.Contains("mod ") || text.Contains("moderator"))
+        {
+            callType = "admin-request";
+            return true;
+        }
+
+        if (text.Contains("cheater") || text.Contains("hacker") || text.Contains("aimbot") ||
+            text.Contains("esp") || text.Contains("scripting") || text.Contains("script user"))
+        {
+            callType = "cheater-report";
+            return true;
+        }
+
+        if (text.Contains("help") || text.Contains("stuck") || text.Contains("bug") ||
+            text.Contains("glitch") || text.Contains("not working") || text.Contains("can't") ||
+            text.Contains("cant "))
+        {
+            callType = "help-request";
+            return true;
+        }
+
+        if (text.Contains("grief") || text.Contains("toxic") || text.Contains("racist") ||
+            text.Contains("harass") || text.Contains("insult"))
+        {
+            callType = "player-report";
+            return true;
+        }
+
+        return false;
+    }
+
     private async Task ObserveServerLogsAsync(string server, CancellationToken cancellationToken)
     {
         var isFirstScan = !_logOffsets.ContainsKey(server);
@@ -1021,13 +1171,7 @@ internal sealed class AgentRuntime
                 var parsed = TryParseChatLine(line);
                 if (parsed.HasValue && playerChat is not null)
                 {
-                    playerChat.RecentMessages.Add(new PlayerChatEntry
-                    {
-                        ServerName = server,
-                        PlayerName = parsed.Value.Player,
-                        Message = parsed.Value.Message,
-                        CapturedAtUtc = DateTime.UtcNow
-                    });
+                    RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
                     chatChanged = true;
                     continue; // chat lines don't also go to the error console
                 }

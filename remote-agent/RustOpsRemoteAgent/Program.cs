@@ -38,6 +38,8 @@ try
 
     var executor = new RustMgrExecutor(rustMgrPath);
     var app = builder.Build();
+    var rconConnections = new PersistentRconConnections();
+    app.Lifetime.ApplicationStopping.Register(() => _ = Task.Run(rconConnections.DisposeAsync));
     app.Urls.Clear();
     app.Urls.Add(bindUrl);
 
@@ -589,9 +591,7 @@ try
     {
         var cfg = LoadServerConfig(server) ?? throw new InvalidOperationException($"No config found for '{server}'.");
         var endpoint = ResolveRconConnectionInfo(server, cfg);
-        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
-        await rcon.ConnectAsync();
-        var reply = await rcon.SendAndReceiveAsync(command);
+        var reply = await rconConnections.SendAndReceiveAsync(endpoint.Host, endpoint.Port, endpoint.Password, command);
         return new RconCommandResult(endpoint.Host, endpoint.Port, reply);
     }
 
@@ -1060,6 +1060,71 @@ internal sealed record RconCommandResult(string Host, ushort Port, string Reply)
 internal sealed record LogEntry(DateTime? Timestamp, string Level, string Message, int Index);
 internal sealed record TextSlice(bool Exists, long StartOffset, long EndOffset, bool Truncated, bool Reset, string Content);
 
+internal sealed class PersistentRconConnections
+{
+    private readonly ConcurrentDictionary<RconConnectionKey, RconConnectionSlot> _connections = new();
+
+    public async Task<string> SendAndReceiveAsync(
+        string host,
+        ushort port,
+        string password,
+        string command,
+        CancellationToken cancellationToken = default)
+    {
+        var key = new RconConnectionKey(host.Trim(), port, password);
+        var slot = _connections.GetOrAdd(key, _ => new RconConnectionSlot());
+
+        await slot.Lock.WaitAsync(cancellationToken);
+        try
+        {
+            slot.Client ??= new RustRcon(key.Host, key.Port, key.Password);
+            if (!slot.Client.IsConnected)
+                await slot.Client.ConnectAsync(cancellationToken);
+
+            try
+            {
+                return await slot.Client.SendAndReceiveAsync(command, cancellationToken);
+            }
+            catch
+            {
+                await slot.DisposeClientAsync();
+                slot.Client = new RustRcon(key.Host, key.Port, key.Password);
+                await slot.Client.ConnectAsync(cancellationToken);
+                return await slot.Client.SendAndReceiveAsync(command, cancellationToken);
+            }
+        }
+        finally
+        {
+            slot.Lock.Release();
+        }
+    }
+
+    public async Task DisposeAsync()
+    {
+        foreach (var slot in _connections.Values)
+            await slot.DisposeClientAsync();
+
+        _connections.Clear();
+    }
+
+    private sealed record RconConnectionKey(string Host, ushort Port, string Password);
+
+    private sealed class RconConnectionSlot
+    {
+        public SemaphoreSlim Lock { get; } = new(1, 1);
+        public RustRcon? Client { get; set; }
+
+        public async Task DisposeClientAsync()
+        {
+            if (Client is not null)
+            {
+                await Client.DisposeAsync();
+                Client = null;
+            }
+        }
+    }
+}
+
 internal sealed class ServerCommandRequest
 {
     [JsonPropertyName("command")] public string Command { get; set; } = string.Empty;
@@ -1151,8 +1216,12 @@ internal sealed class RustRcon : IAsyncDisposable
         _password = password;
     }
 
+    public bool IsConnected => _ws?.State == WebSocketState.Open;
+
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
+        await DisposeSocketAsync();
+
         _ws = new ClientWebSocket();
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var uri = new Uri($"ws://{_host}:{_port}/{Uri.EscapeDataString(_password)}");
@@ -1162,7 +1231,7 @@ internal sealed class RustRcon : IAsyncDisposable
 
     public async Task<string> SendAndReceiveAsync(string command, CancellationToken cancellationToken = default)
     {
-        if (_ws is null)
+        if (!IsConnected)
             throw new InvalidOperationException("RCON is not connected.");
 
         var id = Interlocked.Increment(ref _nextId);
@@ -1173,7 +1242,7 @@ internal sealed class RustRcon : IAsyncDisposable
         await _sendLock.WaitAsync(cancellationToken);
         try
         {
-            await _ws.SendAsync(Encoding.UTF8.GetBytes(payload), WebSocketMessageType.Text, true, cancellationToken);
+            await _ws!.SendAsync(Encoding.UTF8.GetBytes(payload), WebSocketMessageType.Text, true, cancellationToken);
         }
         finally
         {
@@ -1231,16 +1300,29 @@ internal sealed class RustRcon : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    private async Task DisposeSocketAsync()
     {
         _cts?.Cancel();
         if (_receiveTask is not null)
+        {
             try { await _receiveTask; } catch { }
+            _receiveTask = null;
+        }
+
         _cts?.Dispose();
-        _sendLock.Dispose();
+        _cts = null;
+
         if (_ws?.State == WebSocketState.Open)
             try { await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None); } catch { }
+
         _ws?.Dispose();
+        _ws = null;
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await DisposeSocketAsync();
+        _sendLock.Dispose();
     }
 }
 

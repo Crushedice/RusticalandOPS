@@ -16,18 +16,45 @@ internal sealed class PersistentRconSession : IAsyncDisposable
 
     public string ConnectionEndpoint => $"{_uri.Host}:{_uri.Port}";
 
+    /// <summary>
+    /// Fires for every unsolicited message received on this RCON connection.
+    /// Used by chat monitoring to capture player chat without polling logs.
+    /// </summary>
+    public event Action<string>? UnsolicitedMessageReceived;
+
     public bool Matches(Uri uri, string password) =>
         Uri.Compare(_uri, uri, UriComponents.AbsoluteUri, UriFormat.SafeUnescaped, StringComparison.OrdinalIgnoreCase) == 0 &&
         string.Equals(_password, password, StringComparison.Ordinal);
 
     public IReadOnlyList<string> Snapshot() => _monitor.Snapshot();
 
+    /// <summary>True if the WebSocket has been opened and not torn down.</summary>
+    public bool IsConnected => _client is not null;
+
+    /// <summary>
+    /// Force the session to connect now (instead of waiting for the first command).
+    /// Required for chat monitoring — we need the WebSocket open to receive chat events.
+    /// Honours the supplied cancellation token so the caller can impose a timeout.
+    /// </summary>
+    public async Task EnsureConnectedAsync(CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await EnsureConnectedAsync_NoLock(cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public async Task<string> SendCommandAsync(string command, CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            await EnsureConnectedAsync(cancellationToken);
+            await EnsureConnectedAsync_NoLock(cancellationToken);
 
             try
             {
@@ -39,7 +66,7 @@ internal sealed class PersistentRconSession : IAsyncDisposable
                     $"Persistent RCON command failed, reconnecting and retrying once. uri={_uri} command={command} error={ex.Message}",
                     "agent.rcon");
                 await ResetClientAsync();
-                await EnsureConnectedAsync(cancellationToken);
+                await EnsureConnectedAsync_NoLock(cancellationToken);
                 return await _client!.SendCommandAsync(command, cancellationToken);
             }
         }
@@ -63,7 +90,9 @@ internal sealed class PersistentRconSession : IAsyncDisposable
         }
     }
 
-    private async Task EnsureConnectedAsync(CancellationToken cancellationToken)
+    // Caller must hold _gate. Renamed (was EnsureConnectedAsync) to make the locking
+    // contract explicit — taking the gate while already holding it would deadlock.
+    private async Task EnsureConnectedAsync_NoLock(CancellationToken cancellationToken)
     {
         if (_client is not null)
         {
@@ -72,21 +101,21 @@ internal sealed class PersistentRconSession : IAsyncDisposable
 
         var client = new RustRconClient();
         _monitor.Attach(client);
+        client.UnsolicitedMessage += ForwardUnsolicited;
 
         try
         {
             await client.ConnectAsync(_uri, _password, cancellationToken);
             _client = client;
         }
-        catch (Exception ex)
+        catch
         {
             _monitor.Detach(client);
+            client.UnsolicitedMessage -= ForwardUnsolicited;
             await client.DisposeAsync();
-            RustOpsSentry.CaptureException(
-                ex,
-                "Failed to establish persistent RCON session.",
-                "agent.rcon",
-                extras: new Dictionary<string, object?> { ["uri"] = _uri.ToString() });
+            // No Sentry capture here — connection failures are expected for unreachable
+            // remote servers. The caller (WarmupAsync / SendCommandAsync) decides how to
+            // surface the error to the operator.
             throw;
         }
     }
@@ -101,6 +130,20 @@ internal sealed class PersistentRconSession : IAsyncDisposable
         var client = _client;
         _client = null;
         _monitor.Detach(client);
+        client.UnsolicitedMessage -= ForwardUnsolicited;
         await client.DisposeAsync();
+    }
+
+    private void ForwardUnsolicited(string message)
+    {
+        try
+        {
+            UnsolicitedMessageReceived?.Invoke(message);
+        }
+        catch (Exception ex)
+        {
+            // Subscriber faults must not break the receive loop.
+            RustOpsSentry.CaptureException(ex, "UnsolicitedMessageReceived subscriber faulted.", "agent.rcon");
+        }
     }
 }

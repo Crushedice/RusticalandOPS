@@ -392,48 +392,369 @@ internal sealed class RustChatToolHandler : IToolHandler
 
     private async Task<ToolExecutionResult?> TryHandlePluginReferenceQuestionAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        if (_pluginReferenceIndexer is null || !LooksLikePluginReferenceQuestion(context.Message))
-        {
+        if (_pluginReferenceIndexer is null)
             return null;
+
+        var intent = ParsePluginQueryIntent(context.Message);
+        if (intent.Kind == PluginQueryKind.None)
+            return null;
+
+        // Extract meaningful keywords (filter stopwords, intent words) so we search with what the
+        // user actually wants, not the full sentence which produces tons of false positives.
+        var keywords = ExtractMeaningfulKeywords(context.Message);
+        if (keywords.Count == 0)
+            return null; // Question is too vague — let LLM handle it instead of dumping random data
+
+        // Search the index with each keyword and merge results (avoids the "search the whole sentence" anti-pattern)
+        var allRecords = new Dictionary<string, PluginReferenceRecord>(StringComparer.OrdinalIgnoreCase);
+        foreach (var keyword in keywords)
+        {
+            var hits = await _pluginReferenceIndexer.SearchAsync(keyword, cancellationToken);
+            foreach (var hit in hits)
+                allRecords.TryAdd(hit.Id, hit);
         }
 
-        var records = await _pluginReferenceIndexer.SearchAsync(context.Message, cancellationToken);
-        if (records.Count == 0)
+        if (allRecords.Count == 0)
         {
-            return null;
+            return new ToolExecutionResult(
+                true,
+                $"I don't see any indexed plugin matching: {string.Join(", ", keywords)}. Try `/plugin-index refresh` if the index is stale, or rephrase with the plugin name.",
+                ErrorCode: "authoritative_catalog");
         }
 
-        var includeAdmin = !LooksPlayerFacing(context.Message);
+        // Score relevance: how many keywords appear in plugin name / commands / description
+        var scored = allRecords.Values
+            .Select(record => new
+            {
+                Record = record,
+                Score = ScorePluginRelevance(record, keywords, intent)
+            })
+            .Where(item => item.Score > 0)
+            .OrderByDescending(item => item.Score)
+            .Take(5)
+            .Select(item => item.Record)
+            .ToList();
+
+        if (scored.Count == 0)
+        {
+            return new ToolExecutionResult(
+                true,
+                $"Found {allRecords.Count} indexed plugin(s) but none had a strong match for: {string.Join(", ", keywords)}. Be more specific or use the plugin name.",
+                ErrorCode: "authoritative_catalog");
+        }
+
+        var formatted = FormatByIntent(scored, intent, keywords);
         return new ToolExecutionResult(
             true,
-            FormatPluginSearch(records, includeAdmin),
-            Payload: new { source = "plugin-reference-index", count = records.Count },
+            formatted,
+            Payload: new { source = "plugin-reference-index", matched = scored.Count, total = allRecords.Count, intent = intent.Kind.ToString() },
             ErrorCode: "authoritative_catalog");
     }
 
-    private static bool LooksLikePluginReferenceQuestion(string message)
+    // ---- Intent parsing ----------------------------------------------------------------------
+
+    private enum PluginQueryKind { None, ChatCommands, ConsoleCommands, AnyCommand, Permissions, Hooks, ConfigKeys, PluginSummary }
+
+    private sealed record PluginQueryIntent(PluginQueryKind Kind, bool PlayerFacingOnly);
+
+    private static PluginQueryIntent ParsePluginQueryIntent(string message)
     {
         var lowered = message.ToLowerInvariant();
-        return lowered.Contains("command", StringComparison.Ordinal) ||
-               lowered.Contains("permission", StringComparison.Ordinal) ||
-               lowered.Contains("oxide plugin", StringComparison.Ordinal) ||
-               lowered.Contains("umod plugin", StringComparison.Ordinal) ||
-               lowered.Contains("plugin", StringComparison.Ordinal) ||
-               lowered.Contains("hook", StringComparison.Ordinal) ||
-               lowered.Contains("config key", StringComparison.Ordinal) ||
-               lowered.Contains("chat command", StringComparison.Ordinal) ||
-               lowered.Contains("console command", StringComparison.Ordinal);
+
+        // Must be a question or a request
+        var isQuestion =
+            lowered.Contains("?", StringComparison.Ordinal) ||
+            lowered.StartsWith("what", StringComparison.Ordinal) ||
+            lowered.StartsWith("which", StringComparison.Ordinal) ||
+            lowered.StartsWith("is there", StringComparison.Ordinal) ||
+            lowered.StartsWith("are there", StringComparison.Ordinal) ||
+            lowered.StartsWith("does ", StringComparison.Ordinal) ||
+            lowered.StartsWith("do ", StringComparison.Ordinal) ||
+            lowered.StartsWith("can ", StringComparison.Ordinal) ||
+            lowered.StartsWith("how ", StringComparison.Ordinal) ||
+            lowered.Contains("show me", StringComparison.Ordinal) ||
+            lowered.Contains("list ", StringComparison.Ordinal);
+
+        // Must reference plugin / oxide concepts OR a feature class. Note: "command" alone is
+        // accepted because questions like "what commands can players use from X" are common.
+        // The relevance-scoring step filters out plugins that don't actually match the keywords.
+        var hasPluginContext =
+            lowered.Contains("plugin", StringComparison.Ordinal) ||
+            lowered.Contains("oxide", StringComparison.Ordinal) ||
+            lowered.Contains("umod", StringComparison.Ordinal) ||
+            lowered.Contains("command", StringComparison.Ordinal) ||
+            lowered.Contains("hook", StringComparison.Ordinal) ||
+            lowered.Contains("permission", StringComparison.Ordinal) ||
+            lowered.Contains("config key", StringComparison.Ordinal);
+
+        if (!isQuestion || !hasPluginContext)
+            return new PluginQueryIntent(PluginQueryKind.None, false);
+
+        // Don't fire for live-server-state questions ("is plugin X loaded?")
+        if (lowered.Contains("loaded", StringComparison.Ordinal) ||
+            lowered.Contains("installed", StringComparison.Ordinal) ||
+            lowered.Contains("running", StringComparison.Ordinal) ||
+            lowered.Contains("enabled", StringComparison.Ordinal) ||
+            lowered.Contains("active on", StringComparison.Ordinal))
+            return new PluginQueryIntent(PluginQueryKind.None, false);
+
+        var playerFacing =
+            lowered.Contains("player-facing", StringComparison.Ordinal) ||
+            lowered.Contains("player safe", StringComparison.Ordinal) ||
+            lowered.Contains("players use", StringComparison.Ordinal) ||
+            lowered.Contains("what commands can players", StringComparison.Ordinal);
+
+        // Pick the most specific category
+        if (lowered.Contains("chat command", StringComparison.Ordinal))
+            return new PluginQueryIntent(PluginQueryKind.ChatCommands, playerFacing);
+        if (lowered.Contains("console command", StringComparison.Ordinal))
+            return new PluginQueryIntent(PluginQueryKind.ConsoleCommands, playerFacing);
+        if (lowered.Contains("permission", StringComparison.Ordinal))
+            return new PluginQueryIntent(PluginQueryKind.Permissions, playerFacing);
+        if (lowered.Contains("hook", StringComparison.Ordinal))
+            return new PluginQueryIntent(PluginQueryKind.Hooks, playerFacing);
+        if (lowered.Contains("config key", StringComparison.Ordinal) || lowered.Contains("config option", StringComparison.Ordinal))
+            return new PluginQueryIntent(PluginQueryKind.ConfigKeys, playerFacing);
+        if (lowered.Contains("command", StringComparison.Ordinal))
+            return new PluginQueryIntent(PluginQueryKind.AnyCommand, playerFacing);
+
+        return new PluginQueryIntent(PluginQueryKind.PluginSummary, playerFacing);
     }
 
-    private static bool LooksPlayerFacing(string message)
+    // ---- Keyword extraction (semantic search instead of full-sentence search) -----------------
+
+    private static readonly HashSet<string> PluginQueryStopwords = new(StringComparer.OrdinalIgnoreCase)
     {
-        var lowered = message.ToLowerInvariant();
-        return lowered.Contains("player-facing", StringComparison.Ordinal) ||
-               lowered.Contains("player safe", StringComparison.Ordinal) ||
-               lowered.Contains("players use", StringComparison.Ordinal) ||
-               lowered.Contains("what commands can players", StringComparison.Ordinal);
+        "the","a","an","is","are","was","were","be","been","being",
+        "do","does","did","done","can","could","should","would","may","might","must",
+        "have","has","had","get","got","getting","make","made",
+        "what","which","who","when","where","why","how","whose","whom",
+        "this","that","these","those","there","here",
+        "and","or","but","not","no","yes","so","if","then","than","as","also","too","very","just","only","still","even",
+        "i","me","my","mine","you","your","yours","we","us","our","they","them","their",
+        "to","of","in","on","at","by","for","with","from","into","over","under","up","down","out","off","about",
+        "it","its","one","some","any","all","each","every","other","another","such","same",
+        "command","commands","plugin","plugins","permission","permissions","hook","hooks","config","key","keys",
+        "chat","console","oxide","umod","admin","player","players","server",
+        "show","tell","list","find","know","want","need","like",
+        "use","using","run","running","work","works","working"
+    };
+
+    private static List<string> ExtractMeaningfulKeywords(string message)
+    {
+        var tokens = System.Text.RegularExpressions.Regex
+            .Split(message, @"[^A-Za-z0-9_\.\-]+")
+            .Select(token => token.Trim())
+            .Where(token => token.Length >= 3)
+            .Where(token => !PluginQueryStopwords.Contains(token))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .ToList();
+
+        return tokens;
     }
 
+    // ---- Relevance scoring -------------------------------------------------------------------
+
+    private static int ScorePluginRelevance(PluginReferenceRecord record, IReadOnlyList<string> keywords, PluginQueryIntent intent)
+    {
+        var score = 0;
+        foreach (var keyword in keywords)
+        {
+            // Plugin name match — strongest signal
+            if (record.PluginName.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                score += 10;
+
+            // Command-name match — strong signal
+            foreach (var command in record.Commands)
+            {
+                if (command.Command.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                    score += 6;
+            }
+
+            // Description match — medium signal
+            if (!string.IsNullOrWhiteSpace(record.Description) &&
+                record.Description.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                score += 3;
+
+            // Permission / hook / config match — weak signal
+            if (record.Permissions.Any(permission => permission.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+                score += 2;
+            if (record.Hooks.Any(hook => hook.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+                score += 1;
+            if (record.ConfigKeys.Any(configKey => configKey.Contains(keyword, StringComparison.OrdinalIgnoreCase)))
+                score += 1;
+        }
+
+        // Bonus: plugin actually has the kind of thing being asked about
+        switch (intent.Kind)
+        {
+            case PluginQueryKind.ChatCommands:
+                if (record.Commands.Any(command => command.Type == "ChatCommand")) score += 2;
+                break;
+            case PluginQueryKind.ConsoleCommands:
+                if (record.Commands.Any(command => command.Type == "ConsoleCommand")) score += 2;
+                break;
+            case PluginQueryKind.Permissions:
+                if (record.Permissions.Count > 0) score += 2;
+                break;
+            case PluginQueryKind.Hooks:
+                if (record.Hooks.Count > 0) score += 2;
+                break;
+            case PluginQueryKind.ConfigKeys:
+                if (record.ConfigKeys.Count > 0) score += 2;
+                break;
+        }
+
+        return score;
+    }
+
+    // ---- Formatting (intent-aware, ordered, deduplicated) ------------------------------------
+
+    private static string FormatByIntent(IReadOnlyList<PluginReferenceRecord> records, PluginQueryIntent intent, IReadOnlyList<string> keywords)
+    {
+        var sections = new List<string>();
+        var keywordHint = $"(searched for: {string.Join(", ", keywords)})";
+
+        foreach (var record in records)
+        {
+            var block = FormatRecordForIntent(record, intent, keywords);
+            if (!string.IsNullOrWhiteSpace(block))
+                sections.Add(block);
+        }
+
+        if (sections.Count == 0)
+            return $"No matching {DescribeKind(intent.Kind)} found {keywordHint}.";
+
+        var header = intent.Kind switch
+        {
+            PluginQueryKind.ChatCommands => "Matching chat commands",
+            PluginQueryKind.ConsoleCommands => "Matching console commands",
+            PluginQueryKind.AnyCommand => "Matching commands",
+            PluginQueryKind.Permissions => "Matching permissions",
+            PluginQueryKind.Hooks => "Matching hooks",
+            PluginQueryKind.ConfigKeys => "Matching config keys",
+            _ => "Matching plugins"
+        };
+
+        return $"{header} {keywordHint}:\n\n{string.Join("\n\n", sections)}";
+    }
+
+    private static string FormatRecordForIntent(PluginReferenceRecord record, PluginQueryIntent intent, IReadOnlyList<string> keywords)
+    {
+        // For each section, prefer items that match a keyword (highlights why the result was chosen)
+        bool MatchesKeyword(string text) => keywords.Any(keyword => text.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+
+        var pluginHeader = $"**{record.PluginName}**" + (string.IsNullOrWhiteSpace(record.Version) ? string.Empty : $" v{record.Version}");
+
+        switch (intent.Kind)
+        {
+            case PluginQueryKind.ChatCommands:
+            {
+                var commands = record.Commands
+                    .Where(command => command.Type == "ChatCommand")
+                    .Where(command => !intent.PlayerFacingOnly || !PluginReferenceIndexer.LooksAdminOnly(command))
+                    .OrderByDescending(command => MatchesKeyword(command.Command))
+                    .ThenBy(command => command.Command, StringComparer.OrdinalIgnoreCase)
+                    .Distinct()
+                    .Take(8)
+                    .Select(command => "  - /" + command.Command.TrimStart('/') +
+                        (string.IsNullOrWhiteSpace(command.RequiredPermission) ? string.Empty : $" (perm: {command.RequiredPermission})"))
+                    .ToList();
+                return commands.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', commands)}";
+            }
+
+            case PluginQueryKind.ConsoleCommands:
+            {
+                var commands = record.Commands
+                    .Where(command => command.Type == "ConsoleCommand")
+                    .Where(command => !intent.PlayerFacingOnly || !PluginReferenceIndexer.LooksAdminOnly(command))
+                    .OrderByDescending(command => MatchesKeyword(command.Command))
+                    .ThenBy(command => command.Command, StringComparer.OrdinalIgnoreCase)
+                    .Distinct()
+                    .Take(8)
+                    .Select(command => "  - " + command.Command.TrimStart('/'))
+                    .ToList();
+                return commands.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', commands)}";
+            }
+
+            case PluginQueryKind.AnyCommand:
+            {
+                var chatCmds = record.Commands
+                    .Where(command => command.Type == "ChatCommand")
+                    .Where(command => !intent.PlayerFacingOnly || !PluginReferenceIndexer.LooksAdminOnly(command))
+                    .Select(command => "/" + command.Command.TrimStart('/'))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                var consoleCmds = record.Commands
+                    .Where(command => command.Type == "ConsoleCommand")
+                    .Where(command => !intent.PlayerFacingOnly || !PluginReferenceIndexer.LooksAdminOnly(command))
+                    .Select(command => command.Command.TrimStart('/'))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                if (chatCmds.Count == 0 && consoleCmds.Count == 0) return string.Empty;
+                var lines = new List<string> { pluginHeader };
+                if (chatCmds.Count > 0) lines.Add("  chat: " + string.Join(", ", chatCmds.Take(6)));
+                if (consoleCmds.Count > 0) lines.Add("  console: " + string.Join(", ", consoleCmds.Take(6)));
+                return string.Join('\n', lines);
+            }
+
+            case PluginQueryKind.Permissions:
+            {
+                var perms = record.Permissions
+                    .OrderByDescending(MatchesKeyword)
+                    .ThenBy(permission => permission, StringComparer.OrdinalIgnoreCase)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(8)
+                    .Select(permission => "  - " + permission)
+                    .ToList();
+                return perms.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', perms)}";
+            }
+
+            case PluginQueryKind.Hooks:
+            {
+                var hooks = record.Hooks
+                    .OrderByDescending(MatchesKeyword)
+                    .ThenBy(hook => hook, StringComparer.OrdinalIgnoreCase)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(8)
+                    .Select(hook => "  - " + hook)
+                    .ToList();
+                return hooks.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', hooks)}";
+            }
+
+            case PluginQueryKind.ConfigKeys:
+            {
+                var configKeys = record.ConfigKeys
+                    .OrderByDescending(MatchesKeyword)
+                    .ThenBy(key => key, StringComparer.OrdinalIgnoreCase)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(8)
+                    .Select(key => "  - " + key)
+                    .ToList();
+                return configKeys.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', configKeys)}";
+            }
+
+            default:
+            {
+                var description = string.IsNullOrWhiteSpace(record.Description) ? "(no description in plugin metadata)" : record.Description;
+                var chatCount = record.Commands.Count(command => command.Type == "ChatCommand");
+                var consoleCount = record.Commands.Count(command => command.Type == "ConsoleCommand");
+                return $"{pluginHeader}\n  {description}\n  chat-cmds={chatCount}, console-cmds={consoleCount}, perms={record.Permissions.Count}";
+            }
+        }
+    }
+
+    private static string DescribeKind(PluginQueryKind kind) => kind switch
+    {
+        PluginQueryKind.ChatCommands => "chat commands",
+        PluginQueryKind.ConsoleCommands => "console commands",
+        PluginQueryKind.AnyCommand => "commands",
+        PluginQueryKind.Permissions => "permissions",
+        PluginQueryKind.Hooks => "hooks",
+        PluginQueryKind.ConfigKeys => "config keys",
+        _ => "plugins"
+    };
+
+    // Kept for /plugin-index slash commands (admin-only debugging path) — formats raw search results.
     private static string FormatPluginSearch(IReadOnlyList<PluginReferenceRecord> records, bool includeAdmin)
     {
         var lines = new List<string>();
@@ -448,7 +769,7 @@ internal sealed class RustChatToolHandler : IToolHandler
             var permissions = includeAdmin
                 ? string.Join(", ", record.Permissions.Take(10))
                 : string.Empty;
-            var hooks = includeAdmin ? $" Hooks: {string.Join(", ", record.Hooks.Take(8))}." : string.Empty;
+            var hooks = includeAdmin && record.Hooks.Count > 0 ? $" Hooks: {string.Join(", ", record.Hooks.Take(8))}." : string.Empty;
             var permissionText = includeAdmin && !string.IsNullOrWhiteSpace(permissions) ? $" Permissions: {permissions}." : string.Empty;
             lines.Add($"{record.PluginName}: commands {FormatList(commands)}.{permissionText}{hooks}");
         }
