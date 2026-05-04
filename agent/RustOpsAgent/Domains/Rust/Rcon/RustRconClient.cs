@@ -125,7 +125,18 @@ internal sealed class RustRconClient : IRconClient
                     var root = doc.RootElement;
                     var id = root.TryGetProperty("Identifier", out var idEl) && idEl.ValueKind == JsonValueKind.Number
                         ? idEl.GetInt32() : -1;
+                    var type = root.TryGetProperty("Type", out var typeEl) ? typeEl.GetString() : null;
                     var msg = root.TryGetProperty("Message", out var msgEl) ? msgEl.ToString() : raw;
+
+                    // Rust sends player chat with Type="Chat" but the Message field has no [Chat]
+                    // prefix — that prefix only appears in server log files. Normalise here so the
+                    // downstream TryParseChatLine recognises RCON chat events the same way it
+                    // recognises log-file chat lines.
+                    if (string.Equals(type, "Chat", StringComparison.OrdinalIgnoreCase) &&
+                        !msg.Contains("[Chat]", StringComparison.OrdinalIgnoreCase))
+                    {
+                        msg = $"[Chat] {msg}";
+                    }
 
                     if (id >= 0 && _pending.TryGetValue(id, out var tcs))
                         tcs.TrySetResult(msg);

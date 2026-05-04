@@ -120,6 +120,7 @@ internal sealed class AgentRuntime
             var parsed = TryParseChatLine(rawMessage);
             if (parsed is not null)
             {
+                Console.WriteLine($"[chat] {server}: {parsed.Value.Player}: {parsed.Value.Message}");
                 var playerChat = _neoCortex.LoadPlayerChat();
                 RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
                 _neoCortex.SavePlayerChat(playerChat);
@@ -951,9 +952,15 @@ internal sealed class AgentRuntime
                     await ObserveServerHealthAsync(server, cancellationToken);
                     await ObserveServerLogsAsync(server, cancellationToken);
                 }
-                // Remote servers: chat comes via RCON (OnRemoteRconUnsolicited); logs are not
-                // accessible. The remote agent (if present) handles its own log monitoring,
-                // and RCON-only servers have no log file at all.
+                else
+                {
+                    // Remote server — chat/console come via RCON unsolicited messages.
+                    var rconEndpoint = RustDirectRconHelper.GetSessionEndpoint(server);
+                    var rconStatus = rconEndpoint is not null
+                        ? $"RCON connected ({rconEndpoint})"
+                        : "RCON not connected";
+                    Console.WriteLine($"[observe] {server}: remote — {rconStatus}");
+                }
             }
             catch (Exception ex)
             {
