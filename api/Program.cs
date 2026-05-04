@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http;
@@ -11,6 +11,16 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http.Json;
 using Sentry;
+
+// =========== NEW IMPORTS FROM MODULARIZED STRUCTURE ===========
+using RusticalandOPS.Api.Extensions;
+using RusticalandOPS.Api.Infrastructure.Configuration;
+using RusticalandOPS.Api.Middleware;
+using RusticalandOPS.Api.Models.Requests;
+using RusticalandOPS.Api.Models.Responses;
+using RusticalandOPS.Api.Models.Dashboard;
+using RusticalandOPS.Api.Models.Shared;
+using RusticalandOPS.Api.Utilities;
 
 RustOpsEnv.LoadFromDefaultLocations();
 using var sentry = RustOpsSentry.Initialize("rustmgrapi");
@@ -26,13 +36,18 @@ builder.Services.Configure<JsonOptions>(options =>
     options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
 });
 
+// =========== NEW: Register modularized services ===========
+builder.Services.AddRustOpsServices();
+
 var app = builder.Build();
 var rustMgr = new RustMgrExecutor();
 var rconConnections = new PersistentRconConnections();
 app.Lifetime.ApplicationStopping.Register(() => _ = Task.Run(rconConnections.DisposeAsync));
 
-// -- Configuration ------------------------------------------------------------
-// API key: set RUSTMGR_API_KEY env var. Falls back to "changeme" for dev only.
+// =========== NEW: Setup modularized middleware ===========
+app.UseRustOpsMiddleware();
+
+// -- Configuration
 var apiKey      = RustOpsEnv.FirstNonEmptyEnvironment("RUSTMGR_API_KEY", "RUSTOPS_API_KEY") ?? "changeme";
 var bindUrl     = Environment.GetEnvironmentVariable("RUSTMGR_BIND")    ?? "http://0.0.0.0:2077";
 var rustMgrPath = Environment.GetEnvironmentVariable("RUSTMGR_PATH")    ?? "/opt/rust-manager/rustmgr.sh";
@@ -45,6 +60,7 @@ var agentSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_AGENT_SETTIN
 var botSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_STEAMBOT_SETTINGS_PATH") ?? Path.Combine(botRootDir, "botsettings.json");
 var sharedEnvPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_ENV_FILE")
     ?? Path.Combine(Path.GetDirectoryName(configDir.TrimEnd('/', '\\')) ?? configDir, "config.env");
+
 RustOpsSentry.ConfigureScope(scope =>
 {
     scope.SetExtra("bindUrl", bindUrl);
@@ -68,54 +84,6 @@ Directory.CreateDirectory(tasksDir);
 
 app.Urls.Clear();
 app.Urls.Add(bindUrl);
-
-app.Use(async (ctx, next) =>
-{
-    RustOpsSentry.AddBreadcrumb($"{ctx.Request.Method} {ctx.Request.Path}", "http.request");
-    try
-    {
-        await next();
-    }
-    catch (Exception ex)
-    {
-        RustOpsSentry.CaptureException(
-            ex,
-            $"Unhandled HTTP pipeline exception for {ctx.Request.Method} {ctx.Request.Path}.",
-            "http.request",
-            tags: new Dictionary<string, string?>
-            {
-                ["http.method"] = ctx.Request.Method,
-                ["http.path"] = ctx.Request.Path.Value ?? "/"
-            },
-            extras: new Dictionary<string, object?>
-            {
-                ["queryString"] = ctx.Request.QueryString.Value ?? string.Empty,
-                ["traceIdentifier"] = ctx.TraceIdentifier
-            });
-        throw;
-    }
-});
-
-// -- Auth middleware -----------------------------------------------------------
-app.Use(async (ctx, next) =>
-{
-    if (ctx.Request.Path.StartsWithSegments("/health") ||
-        ctx.Request.Path.StartsWithSegments("/ui") ||
-        ctx.Request.Path == "/")
-    {
-        await next();
-        return;
-    }
-    var supplied = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
-    if (!string.Equals(supplied, apiKey, StringComparison.Ordinal))
-    {
-        RustOpsSentry.AddBreadcrumb($"Rejected unauthorized request for {ctx.Request.Path}.", "http.auth");
-        ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
-        await ctx.Response.WriteAsJsonAsync(new ApiError("unauthorized", "Invalid API key."));
-        return;
-    }
-    await next();
-});
 
 // -- Remote agent status tracking (declare early for use in endpoints) ----------
 var remoteAgentStatus = new Dictionary<string, RemoteAgentStatus>(StringComparer.OrdinalIgnoreCase);
@@ -5876,18 +5844,18 @@ static PluginMetadata ParsePluginMetadata(string path)
         infoMatch.Groups["version"].Value.Trim());
 }
 
-static List<PluginCommandReferenceView> ExtractPluginCommands(string source)
+static List<RusticalandOPS.Api.Models.Shared.PluginCommandReferenceView> ExtractPluginCommands(string source)
 {
-    var commands = new List<PluginCommandReferenceView>();
+    var commands = new List<RusticalandOPS.Api.Models.Shared.PluginCommandReferenceView>();
     AddPluginAttributeCommands(commands, source, @"\[\s*ChatCommand\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]", "ChatCommand");
     AddPluginAttributeCommands(commands, source, @"\[\s*ConsoleCommand\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]", "ConsoleCommand");
     AddPluginAttributeCommands(commands, source, @"\[\s*Command\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]", "CovalenceCommand");
 
     foreach (Match match in Regex.Matches(source, @"cmd\.AddChatCommand\s*\(\s*""(?<cmd>[^""]+)""\s*,\s*this\s*,\s*(?:nameof\s*\(\s*)?""?(?<handler>[A-Za-z_][A-Za-z0-9_]*)""?", RegexOptions.IgnoreCase))
-        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "ChatCommand", match.Groups["handler"].Value.Trim()));
+        commands.Add(new RusticalandOPS.Api.Models.Shared.PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "ChatCommand", match.Groups["handler"].Value.Trim()));
 
     foreach (Match match in Regex.Matches(source, @"AddCovalenceCommand\s*\(\s*""(?<cmd>[^""]+)""\s*,\s*(?:nameof\s*\(\s*)?""?(?<handler>[A-Za-z_][A-Za-z0-9_]*)""?", RegexOptions.IgnoreCase))
-        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "CovalenceCommand", match.Groups["handler"].Value.Trim()));
+        commands.Add(new RusticalandOPS.Api.Models.Shared.PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "CovalenceCommand", match.Groups["handler"].Value.Trim()));
 
     return commands
         .GroupBy(command => $"{command.Type}:{command.Command}", StringComparer.OrdinalIgnoreCase)
@@ -5896,10 +5864,10 @@ static List<PluginCommandReferenceView> ExtractPluginCommands(string source)
         .ToList();
 }
 
-static void AddPluginAttributeCommands(List<PluginCommandReferenceView> commands, string source, string pattern, string type)
+static void AddPluginAttributeCommands(List<RusticalandOPS.Api.Models.Shared.PluginCommandReferenceView> commands, string source, string pattern, string type)
 {
     foreach (Match match in Regex.Matches(source, pattern, RegexOptions.IgnoreCase))
-        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), type, FindPluginHandlerAfter(source, match.Index + match.Length)));
+        commands.Add(new RusticalandOPS.Api.Models.Shared.PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), type, FindPluginHandlerAfter(source, match.Index + match.Length)));
 }
 
 static string FindPluginHandlerAfter(string source, int index)
@@ -6166,7 +6134,7 @@ public sealed class ValidationResult
     public string? PluginVersion { get; set; }
     public string? PluginSlug { get; set; }
     public string SourceHash { get; set; } = string.Empty;
-    public List<PluginCommandReferenceView> Commands { get; set; } = new();
+    public List<RusticalandOPS.Api.Models.Shared.PluginCommandReferenceView> Commands { get; set; } = new();
     public List<string> Permissions { get; set; } = new();
     public List<string> Hooks { get; set; } = new();
     public List<string> ConfigKeys { get; set; } = new();
