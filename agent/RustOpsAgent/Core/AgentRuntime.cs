@@ -32,6 +32,7 @@ internal sealed class AgentRuntime
     private readonly Dictionary<string, int> _compileErrorCounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, bool> _serverInitialized = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _remoteServers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _remoteServerLogOffsets = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _adminLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _staticIgnorePatterns;
     private readonly HashSet<string> _incidentPatterns;
@@ -87,6 +88,7 @@ internal sealed class AgentRuntime
     }
 
     private DateTime _lastRemoteRconWarmupAtUtc = DateTime.MinValue;
+    private readonly Dictionary<string, string> _notifiedPluginUpdatesHash = new(StringComparer.OrdinalIgnoreCase);
 
     // Periodically re-warm RCON sessions to remote servers. If a server was offline at agent
     // startup, was restarted, or its WebSocket got dropped, this re-establishes the chat
@@ -954,12 +956,17 @@ internal sealed class AgentRuntime
                 }
                 else
                 {
-                    // Remote server — chat/console come via RCON unsolicited messages.
+                    // Remote server — actively poll RCON rolling log for chat/console.
+                    // (Unsolicited messages are also captured via event handler, but this ensures no messages are missed.)
                     var rconEndpoint = RustDirectRconHelper.GetSessionEndpoint(server);
-                    var rconStatus = rconEndpoint is not null
-                        ? $"RCON connected ({rconEndpoint})"
-                        : "RCON not connected";
-                    Console.WriteLine($"[observe] {server}: remote — {rconStatus}");
+                    if (rconEndpoint is not null)
+                    {
+                        await ObserveRemoteServerRconLogsAsync(server, cancellationToken);
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[observe] {server}: remote — RCON not connected");
+                    }
                 }
             }
             catch (Exception ex)
@@ -1126,7 +1133,7 @@ internal sealed class AgentRuntime
             });
             chat.AdminCalls = chat.AdminCalls
                 .OrderBy(e => e.CapturedAtUtc)
-                .TakeLast(100)
+                .TakeLast(_config.ConsoleMonitor.MaxAdminCalls)
                 .ToList();
         }
     }
@@ -1376,7 +1383,7 @@ internal sealed class AgentRuntime
         {
             serverConsole.RecentErrors = serverConsole.RecentErrors
                 .OrderByDescending(e => e.LastSeenAtUtc)
-                .Take(100)
+                .Take(_config.ConsoleMonitor.MaxConsoleErrors)
                 .ToList();
 
             // Keep repeating map bounded
@@ -1475,6 +1482,127 @@ internal sealed class AgentRuntime
         if (lowered.Contains("debug") || lowered.Contains("[d]"))
             return "debug";
         return "info";
+    }
+
+    private async Task ObserveRemoteServerRconLogsAsync(string server, CancellationToken cancellationToken)
+    {
+        // Actively poll RCON rolling log for remote servers. This complements the event-driven
+        // unsolicited message handler by ensuring no chat/console output is missed.
+        try
+        {
+            var rollingLog = RustDirectRconHelper.GetRollingLog(server);
+            if (rollingLog.Count == 0)
+                return;
+
+            var playerChat = _neoCortex.LoadPlayerChat();
+            var consoleMonitor = _neoCortex.LoadConsoleMonitor();
+            if (!consoleMonitor.Servers.TryGetValue(server, out var serverConsole))
+            {
+                serverConsole = new ServerConsoleState();
+                consoleMonitor.Servers[server] = serverConsole;
+            }
+
+            var chatChanged = false;
+            var consoleChanged = false;
+            var startOffset = _remoteServerLogOffsets.TryGetValue(server, out var lastOffset) ? lastOffset : 0;
+
+            for (var i = Math.Max(0, startOffset); i < rollingLog.Count; i++)
+            {
+                var line = rollingLog[i];
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                var lowered = line.ToLowerInvariant();
+
+                // Skip initialization markers
+                if (lowered.Contains("steamserver initialized", StringComparison.OrdinalIgnoreCase))
+                {
+                    _serverInitialized[server] = true;
+                    continue;
+                }
+
+                // Detect server restart
+                if (lowered.Contains("initializing steam") || lowered.StartsWith("oxide version"))
+                {
+                    _serverInitialized[server] = false;
+                    continue;
+                }
+
+                // Only process after server initialization
+                if (!_serverInitialized.TryGetValue(server, out var initialized) || !initialized)
+                    continue;
+
+                // --- Player chat stream ---
+                var parsed = TryParseChatLine(line);
+                if (parsed.HasValue)
+                {
+                    RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
+                    chatChanged = true;
+                    continue;
+                }
+
+                // --- Console error/warning stream ---
+                var consoleSignalLine = ExtractConsoleSignalLine(line);
+                var category = consoleSignalLine is null ? "info" : ClassifyConsoleLine(consoleSignalLine.ToLowerInvariant());
+                if (category is "error" or "warning")
+                {
+                    if (IsPurePlayerConnectionNoise(consoleSignalLine!))
+                        continue;
+
+                    var key = NormalizeErrorKey(consoleSignalLine!);
+                    var existing = serverConsole.RecentErrors
+                        .FirstOrDefault(e => string.Equals(e.Message, key, StringComparison.OrdinalIgnoreCase));
+
+                    if (existing is not null)
+                    {
+                        existing.Count++;
+                        existing.LastSeenAtUtc = DateTime.UtcNow;
+                        if (string.IsNullOrWhiteSpace(existing.SampleLine) || IsBetterConsoleSample(consoleSignalLine!, existing.SampleLine))
+                        {
+                            existing.SampleLine = TrimSingleLine(consoleSignalLine!, 600);
+                        }
+                    }
+                    else
+                    {
+                        existing = new ConsoleErrorEntry
+                        {
+                            Message = key,
+                            SampleLine = TrimSingleLine(consoleSignalLine!, 600),
+                            Category = category,
+                            FirstSeenAtUtc = DateTime.UtcNow,
+                            LastSeenAtUtc = DateTime.UtcNow
+                        };
+                        serverConsole.RecentErrors.Add(existing);
+                    }
+                    serverConsole.TotalErrorsIngested++;
+                    serverConsole.ErrorCountSinceLastAlert++;
+                    consoleChanged = true;
+                }
+            }
+
+            // Update offset to resume from next new line
+            _remoteServerLogOffsets[server] = rollingLog.Count;
+
+            // Persist changes
+            if (chatChanged)
+            {
+                _neoCortex.SavePlayerChat(playerChat);
+            }
+
+            if (consoleChanged)
+            {
+                serverConsole.RecentErrors = serverConsole.RecentErrors
+                    .OrderByDescending(e => e.LastSeenAtUtc)
+                    .Take(_config.ConsoleMonitor.MaxConsoleErrors)
+                    .ToList();
+                _neoCortex.SaveConsoleMonitor(consoleMonitor);
+                Console.WriteLine($"[observe] {server}: remote RCON log processed (chat={playerChat.RecentMessages.Count} messages, console={serverConsole.RecentErrors.Count} errors)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[observe] {server}: failed to process remote RCON log: {ex.Message}");
+        }
     }
 
     private async Task RecordConsoleMonitorCandidatesAsync(
@@ -1742,15 +1870,22 @@ internal sealed class AgentRuntime
 
                 if (available.Count == 0)
                 {
+                    _notifiedPluginUpdatesHash.Remove(server);
                     Console.WriteLine($"[plugin-check] {server}: all plugins up to date.");
                     continue;
                 }
 
                 var summary = string.Join(", ", available.Select(u => $"{u.Plugin} {u.Current} → {u.Latest}"));
+                var currentHash = ComputeHash(summary);
+                var hasNotified = _notifiedPluginUpdatesHash.TryGetValue(server, out var previousHash) && previousHash == currentHash;
+
                 var msg = $"[{server}] Plugin updates available ({available.Count}): {summary}";
                 Console.WriteLine($"[plugin-check] {msg}");
-                if (_config.PluginUpdates.NotifyAdmins)
+                if (_config.PluginUpdates.NotifyAdmins && !hasNotified)
+                {
                     BroadcastOutbox(msg, server);
+                    _notifiedPluginUpdatesHash[server] = currentHash;
+                }
                 if (_config.Memory.WriteEnabled)
                     _ = _semanticMemory.RecordServerFactAsync(server,
                         $"Plugin updates available on {server}: {available.Count} plugin(s)",
@@ -2917,5 +3052,12 @@ Repeated failure memory clusters:
         {
             Console.WriteLine($"[memory] {message}");
         }
+    }
+
+    private static string ComputeHash(string input)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+        return Convert.ToHexString(hash);
     }
 }

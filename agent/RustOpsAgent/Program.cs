@@ -257,14 +257,17 @@ var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex
 // so chat starts flowing as soon as the server becomes reachable.
 if (remoteServerNamesForWarmup.Count > 0)
 {
+    Console.WriteLine($"[agent] Warming up RCON for {remoteServerNamesForWarmup.Count} remote server(s)...");
     var warmupTasks = remoteServerNamesForWarmup
         .Select(async name =>
         {
             var outcome = await RustDirectRconHelper.WarmupAsync(name, CancellationToken.None);
-            Console.WriteLine($"[agent] RCON warmup {name}: {outcome.Message}");
+            Console.WriteLine($"[agent] RCON remote warmup {name}: {outcome.Message}");
         })
         .ToList();
-    _ = Task.WhenAll(warmupTasks); // fire-and-forget so startup isn't blocked
+    // Wait for remote warmups to complete so chat monitoring is active from startup.
+    // Timeout after 30s per server to avoid blocking startup forever if servers are unreachable.
+    await Task.WhenAny(Task.WhenAll(warmupTasks), Task.Delay(TimeSpan.FromSeconds(Math.Min(300, remoteServerNamesForWarmup.Count * 30))));
 }
 
 // Eagerly open RCON sessions for LOCAL servers so chat-monitor receives unsolicited
@@ -293,7 +296,8 @@ try
                     Console.WriteLine($"[agent] RCON local warmup {name}: {outcome.Message}");
                 })
                 .ToList();
-            _ = Task.WhenAll(localWarmupTasks); // fire-and-forget so startup isn't blocked
+            // Wait for local warmups with timeout so chat monitoring is active from startup.
+            await Task.WhenAny(Task.WhenAll(localWarmupTasks), Task.Delay(TimeSpan.FromSeconds(Math.Min(300, localServerNames.Count * 30))));
         }
     }
 }

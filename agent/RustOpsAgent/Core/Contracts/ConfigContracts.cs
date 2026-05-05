@@ -164,7 +164,9 @@ internal sealed class ConsoleMonitorSettings
     [JsonPropertyName("errorEscalationThreshold")] public int ErrorEscalationThreshold { get; set; } = 10;
     [JsonPropertyName("repeatThreshold")] public int RepeatThreshold { get; set; } = 5;
     [JsonPropertyName("sentimentAnalysisIntervalMinutes")] public int SentimentAnalysisIntervalMinutes { get; set; } = 30;
-    [JsonPropertyName("maxChatMessages")] public int MaxChatMessages { get; set; } = 200;
+    [JsonPropertyName("maxChatMessages")] public int MaxChatMessages { get; set; } = 2000;
+    [JsonPropertyName("maxConsoleErrors")] public int MaxConsoleErrors { get; set; } = 500;
+    [JsonPropertyName("maxAdminCalls")] public int MaxAdminCalls { get; set; } = 500;
     [JsonPropertyName("sentimentAlertThreshold")] public double SentimentAlertThreshold { get; set; } = 4.0;
     [JsonPropertyName("compileErrorSeedThreshold")] public int CompileErrorSeedThreshold { get; set; } = 5;
 }
