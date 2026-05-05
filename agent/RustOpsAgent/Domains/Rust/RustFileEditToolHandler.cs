@@ -360,7 +360,18 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         if (lowered.Contains("oxide/config", StringComparison.Ordinal) || lowered.Contains(@"oxide\config", StringComparison.Ordinal))
             return true;
 
+        if (lowered.Contains("oxide/data", StringComparison.Ordinal) || lowered.Contains(@"oxide\data", StringComparison.Ordinal))
+            return true;
+
         return lowered.Contains("plugin", StringComparison.Ordinal) && lowered.Contains("config", StringComparison.Ordinal);
+    }
+
+    private static string DetermineOxideSubDir(string message)
+    {
+        var lowered = message.ToLowerInvariant();
+        return lowered.Contains("oxide/data", StringComparison.Ordinal) || lowered.Contains(@"oxide\data", StringComparison.Ordinal)
+            ? "data"
+            : "config";
     }
 
     private static string? ExtractServerNameFromMessage(string message)
@@ -380,9 +391,30 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
     private async Task<ToolExecutionResult> HandlePluginConfigAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
+        var subDir = DetermineOxideSubDir(context.Message);
+
+        // Fast path: if the message contains a direct absolute oxide path, try it immediately.
+        var absolutePath = ExtractAbsoluteOxidePath(context.Message);
+        if (!string.IsNullOrWhiteSpace(absolutePath) && IsSafeExtension(absolutePath) && File.Exists(absolutePath))
+        {
+            return await ReadOrMutateOxideFileAsync(context, absolutePath, subDir, cancellationToken);
+        }
+
         var server = context.Route.Slots.ServerName;
         if (string.IsNullOrWhiteSpace(server))
             server = ExtractServerNameFromMessage(context.Message);
+
+        // Try to derive server name from an absolute oxide path like /srv/rust/<server>/oxide/...
+        if (string.IsNullOrWhiteSpace(server))
+        {
+            var serverRoot = (Environment.GetEnvironmentVariable("RUST_SERVER_ROOT") ?? "/srv/rust").Replace('\\', '/').TrimEnd('/');
+            var serverFromPath = Regex.Match(
+                context.Message.Replace('\\', '/'),
+                Regex.Escape(serverRoot) + @"/(?<server>[^/]+)/oxide/",
+                RegexOptions.IgnoreCase);
+            if (serverFromPath.Success)
+                server = serverFromPath.Groups["server"].Value;
+        }
 
         if (string.IsNullOrWhiteSpace(server))
         {
@@ -398,7 +430,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         {
             return new ToolExecutionResult(
                 false,
-                $"Server config not found for '{server}' — cannot locate the oxide config directory. Expected path: {BuildExpectedConfigPath(server)}",
+                $"Server config not found for '{server}' — cannot locate the oxide {subDir} directory. Expected path: {BuildExpectedConfigPath(server)}",
                 server, false, "file_not_found");
         }
 
@@ -407,13 +439,13 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         if (serverConfig is null)
             return new ToolExecutionResult(false, $"Could not parse config for '{server}'.", server, false, "parse_error");
 
-        var configDirs = ResolveOxideConfigDirectories(serverConfig, server);
-        Console.WriteLine($"[plugin-config] Resolved {configDirs.Count} oxide config directories for '{server}': {string.Join(", ", configDirs)}");
+        var configDirs = ResolveOxideConfigDirectories(serverConfig, server, subDir);
+        Console.WriteLine($"[plugin-config] Resolved {configDirs.Count} oxide {subDir} directories for '{server}': {string.Join(", ", configDirs)}");
         if (configDirs.Count == 0)
         {
             return new ToolExecutionResult(
                 false,
-                $"No oxide config directory found for '{server}'. Checked serverDir/logFile-derived oxide paths.",
+                $"No oxide {subDir} directory found for '{server}'. Checked serverDir/logFile-derived oxide paths.",
                 server, false, "file_not_found");
         }
 
@@ -424,7 +456,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             var suffix = available.Count == 0 ? "none found" : string.Join(", ", available.Take(20));
             return new ToolExecutionResult(
                 false,
-                $"Which plugin config should I use on {server}? Available: {suffix}.",
+                $"Which oxide {subDir} file should I use on {server}? Available: {suffix}.",
                 server, false, "clarification_required");
         }
 
@@ -433,14 +465,20 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         {
             return new ToolExecutionResult(
                 false,
-                $"Plugin config '{pluginName}' not found for {server}.",
+                $"oxide/{subDir}/{pluginName}.json not found for {server}.",
                 server, false, "file_not_found");
         }
 
+        return await ReadOrMutateOxideFileAsync(context, pluginPath, subDir, cancellationToken);
+    }
+
+    private async Task<ToolExecutionResult> ReadOrMutateOxideFileAsync(ToolExecutionContext context, string pluginPath, string subDir, CancellationToken cancellationToken)
+    {
+        var server = context.Route.Slots.ServerName ?? string.Empty;
         var pluginRaw = await File.ReadAllTextAsync(pluginPath, cancellationToken);
         var pluginConfig = JsonNode.Parse(pluginRaw) as JsonObject;
         if (pluginConfig is null)
-            return new ToolExecutionResult(false, $"Could not parse plugin config '{pluginName}' at {pluginPath}.", server, false, "parse_error");
+            return new ToolExecutionResult(false, $"Could not parse {subDir} file at {pluginPath}.", server, false, "parse_error");
 
         var mutation = TryExtractConfigMutation(context.Message, server);
         if (mutation is not null && !IsReadRequest(context.Message))
@@ -454,15 +492,15 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             {
                 _ = _semanticMemory.RecordServerFactAsync(
                     server,
-                    $"Plugin config change: {pluginConfigName} {mutation.Key} set to {mutation.DisplayValue} on {server}",
-                    $"Plugin config '{pluginConfigName}' key '{mutation.Key}' changed to '{mutation.DisplayValue}' on '{server}'. File: {pluginPath}",
-                    new[] { "config", "plugin-config", mutation.Key.ToLowerInvariant(), pluginConfigName.ToLowerInvariant(), server.ToLowerInvariant() },
+                    $"oxide/{subDir} change: {pluginConfigName} {mutation.Key} set to {mutation.DisplayValue} on {server}",
+                    $"oxide/{subDir} '{pluginConfigName}' key '{mutation.Key}' changed to '{mutation.DisplayValue}' on '{server}'. File: {pluginPath}",
+                    new[] { "config", $"oxide-{subDir}", mutation.Key.ToLowerInvariant(), pluginConfigName.ToLowerInvariant(), server.ToLowerInvariant() },
                     CancellationToken.None);
             }
 
             return new ToolExecutionResult(
                 true,
-                $"Updated plugin config `{pluginConfigName}` on {server} at {pluginPath}: set `{mutation.Key}` to `{mutation.DisplayValue}`.\n```json\n{prettyUpdated}\n```",
+                $"Updated oxide/{subDir} `{pluginConfigName}` on {server} at {pluginPath}: set `{mutation.Key}` to `{mutation.DisplayValue}`.\n```json\n{prettyUpdated}\n```",
                 server, true,
                 Payload: new { pluginPath, content = prettyUpdated });
         }
@@ -475,21 +513,21 @@ internal sealed class RustFileEditToolHandler : IToolHandler
                 var renderedValue = RenderJsonValue(valueNode);
                 return new ToolExecutionResult(
                     true,
-                    $"Plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server} ({pluginPath}): `{resolvedKey}` = `{renderedValue}`.",
+                    $"oxide/{subDir} `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server} ({pluginPath}): `{resolvedKey}` = `{renderedValue}`.",
                     server, false,
                     Payload: new { key = resolvedKey, value = renderedValue, pluginPath });
             }
 
             return new ToolExecutionResult(
                 false,
-                $"Key `{key}` was not found in plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server}.",
+                $"Key `{key}` was not found in oxide/{subDir} `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server}.",
                 server, false, "key_not_found");
         }
 
         var pretty = pluginConfig.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
         return new ToolExecutionResult(
             true,
-            $"{Path.GetFileNameWithoutExtension(pluginPath)} plugin config ({pluginPath}).\n```json\n{pretty}\n```",
+            $"{Path.GetFileNameWithoutExtension(pluginPath)} ({pluginPath}).\n```json\n{pretty}\n```",
             server, true,
             Payload: new { pluginPath, content = pretty });
     }
@@ -681,11 +719,20 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
     // ── Plugin config helpers ──────────────────────────────────────────────────
 
+    private static string? ExtractAbsoluteOxidePath(string message)
+    {
+        var match = Regex.Match(
+            message,
+            @"(?<path>/[A-Za-z0-9._/\\-]+/oxide/(?:config|data)/[A-Za-z0-9._-]+\.(?:json|cfg|txt|ini))",
+            RegexOptions.IgnoreCase);
+        return match.Success ? match.Groups["path"].Value.Replace('\\', '/') : null;
+    }
+
     private static string? ExtractPluginNameFromMessage(string message)
     {
         var pathMatch = Regex.Match(
             message,
-            @"oxide[\\/]+config[\\/]+(?<plugin>[A-Za-z0-9._-]+)\.json",
+            @"oxide[\\/]+(?:config|data)[\\/]+(?<plugin>[A-Za-z0-9._-]+)\.json",
             RegexOptions.IgnoreCase);
         if (pathMatch.Success)
             return pathMatch.Groups["plugin"].Value.Trim();
@@ -705,32 +752,32 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         return null;
     }
 
-    private static IReadOnlyList<string> ResolveOxideConfigDirectories(JsonObject serverConfig, string serverName)
+    private static IReadOnlyList<string> ResolveOxideConfigDirectories(JsonObject serverConfig, string serverName, string subDir = "config")
     {
         var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var oxideDir = ReadJsonString(serverConfig, "oxideDir");
         if (!string.IsNullOrWhiteSpace(oxideDir))
         {
-            var configDir = Path.Combine(oxideDir, "config");
-            dirs.Add(configDir);
-            Console.WriteLine($"[oxide-dirs] Added from oxideDir: {configDir}");
+            var d = Path.Combine(oxideDir, subDir);
+            dirs.Add(d);
+            Console.WriteLine($"[oxide-dirs] Added from oxideDir: {d}");
         }
 
         var root = Environment.GetEnvironmentVariable("RUST_SERVER_ROOT");
         if (string.IsNullOrWhiteSpace(root))
             root = "/srv/rust";
 
-        var canonicalDir = Path.Combine(root, serverName, "oxide", "config");
+        var canonicalDir = Path.Combine(root, serverName, "oxide", subDir);
         dirs.Add(canonicalDir);
         Console.WriteLine($"[oxide-dirs] Added canonical path: {canonicalDir}");
 
         var serverDir = ReadJsonString(serverConfig, "serverDir");
         if (!string.IsNullOrWhiteSpace(serverDir))
         {
-            var serverDirConfig = Path.Combine(serverDir, "oxide", "config");
-            dirs.Add(serverDirConfig);
-            Console.WriteLine($"[oxide-dirs] Added from serverDir: {serverDirConfig}");
+            var d = Path.Combine(serverDir, "oxide", subDir);
+            dirs.Add(d);
+            Console.WriteLine($"[oxide-dirs] Added from serverDir: {d}");
         }
 
         var logFile = ReadJsonString(serverConfig, "logFile");
@@ -745,14 +792,14 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             var logDir = Path.GetDirectoryName(logPath);
             if (!string.IsNullOrWhiteSpace(logDir))
             {
-                var logConfigDir = Path.Combine(logDir, "oxide", "config");
-                dirs.Add(logConfigDir);
-                Console.WriteLine($"[oxide-dirs] Added from logFile: {logConfigDir}");
+                var d = Path.Combine(logDir, "oxide", subDir);
+                dirs.Add(d);
+                Console.WriteLine($"[oxide-dirs] Added from logFile: {d}");
             }
         }
 
         var filtered = dirs.Where(Directory.Exists).ToList();
-        Console.WriteLine($"[oxide-dirs] After filtering: {(filtered.Count == 0 ? "NONE" : string.Join(", ", filtered))}");
+        Console.WriteLine($"[oxide-dirs] After filtering ({subDir}): {(filtered.Count == 0 ? "NONE" : string.Join(", ", filtered))}");
         return filtered;
     }
 

@@ -556,6 +556,14 @@ internal sealed record ServerCommandDefinition(
     string? RiskLevel = null,
     IReadOnlyList<string>? Tags = null);
 
+internal interface IServerCatalogIndexStore
+{
+    Task SyncAsync(IReadOnlyList<ServerVariableDefinition> variables, IReadOnlyList<ServerCommandDefinition> commands, CancellationToken cancellationToken);
+    Task<ServerVariableDefinition?> GetConvarAsync(string name, CancellationToken cancellationToken);
+    Task<IReadOnlyList<ServerVariableDefinition>> SearchConvarsAsync(string query, CancellationToken cancellationToken);
+    Task<IReadOnlyList<ServerCommandDefinition>> SearchServerCommandsAsync(string query, CancellationToken cancellationToken);
+}
+
 internal enum CatalogEntryType
 {
     Variable,

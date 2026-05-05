@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 using RustOpsAgent.Core.Contracts;
+using RustOpsAgent.Domains.Rust;
 using RustOpsAgent.Infrastructure;
 
 namespace RustOpsAgent.Infrastructure.Memory;
@@ -109,7 +110,102 @@ internal sealed class SqlitePluginReferenceIndexStore : IPluginReferenceIndexSto
             await command.ExecuteNonQueryAsync(cancellationToken);
         }
 
+        await DeleteNormalizedRowsAsync(connection, (SqliteTransaction)tx, record.Id, cancellationToken);
+        await InsertNormalizedRowsAsync(connection, (SqliteTransaction)tx, record, cancellationToken);
+
         await tx.CommitAsync(cancellationToken);
+    }
+
+    private static async Task DeleteNormalizedRowsAsync(SqliteConnection connection, SqliteTransaction tx, string pluginId, CancellationToken cancellationToken)
+    {
+        foreach (var table in new[] { "plugin_commands", "plugin_hooks", "plugin_permissions", "plugin_config_keys" })
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = $"DELETE FROM {table} WHERE plugin_id = $plugin_id;";
+            cmd.Parameters.AddWithValue("$plugin_id", pluginId);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static async Task InsertNormalizedRowsAsync(SqliteConnection connection, SqliteTransaction tx, PluginReferenceRecord record, CancellationToken cancellationToken)
+    {
+        foreach (var c in record.Commands)
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText =
+                """
+                INSERT OR IGNORE INTO plugin_commands (id, plugin_id, plugin_name, server_name, command, type, handler_method, required_permission)
+                VALUES ($id, $plugin_id, $plugin_name, $server_name, $command, $type, $handler_method, $required_permission);
+                """;
+            cmd.Parameters.AddWithValue("$id", Hash($"{record.Id}|cmd|{c.Type}|{c.Command}"));
+            cmd.Parameters.AddWithValue("$plugin_id", record.Id);
+            cmd.Parameters.AddWithValue("$plugin_name", record.PluginName);
+            cmd.Parameters.AddWithValue("$server_name", record.ServerName);
+            cmd.Parameters.AddWithValue("$command", c.Command);
+            cmd.Parameters.AddWithValue("$type", c.Type);
+            cmd.Parameters.AddWithValue("$handler_method", c.HandlerMethod);
+            cmd.Parameters.AddWithValue("$required_permission", c.RequiredPermission);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        foreach (var hook in record.Hooks)
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText =
+                """
+                INSERT OR IGNORE INTO plugin_hooks (id, plugin_id, plugin_name, server_name, hook_name)
+                VALUES ($id, $plugin_id, $plugin_name, $server_name, $hook_name);
+                """;
+            cmd.Parameters.AddWithValue("$id", Hash($"{record.Id}|hook|{hook}"));
+            cmd.Parameters.AddWithValue("$plugin_id", record.Id);
+            cmd.Parameters.AddWithValue("$plugin_name", record.PluginName);
+            cmd.Parameters.AddWithValue("$server_name", record.ServerName);
+            cmd.Parameters.AddWithValue("$hook_name", hook);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        foreach (var perm in record.Permissions)
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText =
+                """
+                INSERT OR IGNORE INTO plugin_permissions (id, plugin_id, plugin_name, server_name, permission)
+                VALUES ($id, $plugin_id, $plugin_name, $server_name, $permission);
+                """;
+            cmd.Parameters.AddWithValue("$id", Hash($"{record.Id}|perm|{perm}"));
+            cmd.Parameters.AddWithValue("$plugin_id", record.Id);
+            cmd.Parameters.AddWithValue("$plugin_name", record.PluginName);
+            cmd.Parameters.AddWithValue("$server_name", record.ServerName);
+            cmd.Parameters.AddWithValue("$permission", perm);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        foreach (var key in record.ConfigKeys)
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText =
+                """
+                INSERT OR IGNORE INTO plugin_config_keys (id, plugin_id, plugin_name, server_name, config_key)
+                VALUES ($id, $plugin_id, $plugin_name, $server_name, $config_key);
+                """;
+            cmd.Parameters.AddWithValue("$id", Hash($"{record.Id}|key|{key}"));
+            cmd.Parameters.AddWithValue("$plugin_id", record.Id);
+            cmd.Parameters.AddWithValue("$plugin_name", record.PluginName);
+            cmd.Parameters.AddWithValue("$server_name", record.ServerName);
+            cmd.Parameters.AddWithValue("$config_key", key);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+    }
+
+    private static string Hash(string value)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        return Convert.ToHexString(bytes);
     }
 
     public async Task<IReadOnlyList<PluginReferenceRecord>> ListAsync(CancellationToken cancellationToken)
@@ -172,6 +268,75 @@ internal sealed class SqlitePluginReferenceIndexStore : IPluginReferenceIndexSto
             .ToList();
     }
 
+    public async Task<IReadOnlyList<PluginReferenceRecord>> SearchByCommandAsync(string command, CancellationToken cancellationToken)
+    {
+        var normalized = command.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return Array.Empty<PluginReferenceRecord>();
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            """
+            SELECT r.* FROM plugin_reference_records r
+            WHERE r.id IN (
+                SELECT DISTINCT plugin_id FROM plugin_commands
+                WHERE command = $exact OR command LIKE $like
+            )
+            ORDER BY r.plugin_name, r.server_name;
+            """;
+        cmd.Parameters.AddWithValue("$exact", normalized);
+        cmd.Parameters.AddWithValue("$like", $"%{normalized}%");
+        return await ReadRecordsAsync(cmd, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<PluginReferenceRecord>> SearchByHookAsync(string hook, CancellationToken cancellationToken)
+    {
+        var normalized = hook.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return Array.Empty<PluginReferenceRecord>();
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            """
+            SELECT r.* FROM plugin_reference_records r
+            WHERE r.id IN (
+                SELECT DISTINCT plugin_id FROM plugin_hooks
+                WHERE hook_name = $exact OR hook_name LIKE $like
+            )
+            ORDER BY r.plugin_name, r.server_name;
+            """;
+        cmd.Parameters.AddWithValue("$exact", normalized);
+        cmd.Parameters.AddWithValue("$like", $"%{normalized}%");
+        return await ReadRecordsAsync(cmd, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<PluginReferenceRecord>> SearchByPermissionAsync(string permission, CancellationToken cancellationToken)
+    {
+        var normalized = permission.Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return Array.Empty<PluginReferenceRecord>();
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            """
+            SELECT r.* FROM plugin_reference_records r
+            WHERE r.id IN (
+                SELECT DISTINCT plugin_id FROM plugin_permissions
+                WHERE permission = $exact OR permission LIKE $like
+            )
+            ORDER BY r.plugin_name, r.server_name;
+            """;
+        cmd.Parameters.AddWithValue("$exact", normalized);
+        cmd.Parameters.AddWithValue("$like", $"%{normalized}%");
+        return await ReadRecordsAsync(cmd, cancellationToken);
+    }
+
     private void EnsureSchema()
     {
         using var connection = new SqliteConnection(_connectionString);
@@ -206,6 +371,61 @@ internal sealed class SqlitePluginReferenceIndexStore : IPluginReferenceIndexSto
             );
             CREATE INDEX IF NOT EXISTS idx_plugin_reference_source_path ON plugin_reference_records(source_path);
             CREATE INDEX IF NOT EXISTS idx_plugin_reference_plugin_name ON plugin_reference_records(plugin_name);
+            CREATE TABLE IF NOT EXISTS plugin_commands (
+                id TEXT NOT NULL PRIMARY KEY,
+                plugin_id TEXT NOT NULL,
+                plugin_name TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                command TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT '',
+                handler_method TEXT NOT NULL DEFAULT '',
+                required_permission TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS plugin_hooks (
+                id TEXT NOT NULL PRIMARY KEY,
+                plugin_id TEXT NOT NULL,
+                plugin_name TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                hook_name TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS plugin_permissions (
+                id TEXT NOT NULL PRIMARY KEY,
+                plugin_id TEXT NOT NULL,
+                plugin_name TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                permission TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS plugin_config_keys (
+                id TEXT NOT NULL PRIMARY KEY,
+                plugin_id TEXT NOT NULL,
+                plugin_name TEXT NOT NULL,
+                server_name TEXT NOT NULL,
+                config_key TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS server_convars (
+                name TEXT NOT NULL PRIMARY KEY,
+                default_value TEXT NOT NULL DEFAULT '',
+                default_type TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                generated INTEGER NOT NULL DEFAULT 0,
+                last_synced_utc TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS server_commands_catalog (
+                name TEXT NOT NULL PRIMARY KEY,
+                description TEXT NOT NULL DEFAULT '',
+                risk_level TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                generated INTEGER NOT NULL DEFAULT 0,
+                last_synced_utc TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_plugin_commands_command ON plugin_commands(command);
+            CREATE INDEX IF NOT EXISTS idx_plugin_commands_plugin_id ON plugin_commands(plugin_id);
+            CREATE INDEX IF NOT EXISTS idx_plugin_hooks_hook_name ON plugin_hooks(hook_name);
+            CREATE INDEX IF NOT EXISTS idx_plugin_hooks_plugin_id ON plugin_hooks(plugin_id);
+            CREATE INDEX IF NOT EXISTS idx_plugin_permissions_permission ON plugin_permissions(permission);
+            CREATE INDEX IF NOT EXISTS idx_plugin_permissions_plugin_id ON plugin_permissions(plugin_id);
+            CREATE INDEX IF NOT EXISTS idx_plugin_config_keys_config_key ON plugin_config_keys(config_key);
+            CREATE INDEX IF NOT EXISTS idx_plugin_config_keys_plugin_id ON plugin_config_keys(plugin_id);
             """;
         command.ExecuteNonQuery();
     }
@@ -329,6 +549,15 @@ internal sealed class PluginReferenceIndexer
 
     public Task<IReadOnlyList<PluginReferenceRecord>> SearchAsync(string query, CancellationToken cancellationToken) =>
         _store.SearchAsync(query, cancellationToken);
+
+    public Task<IReadOnlyList<PluginReferenceRecord>> SearchByCommandAsync(string command, CancellationToken cancellationToken) =>
+        _store.SearchByCommandAsync(command, cancellationToken);
+
+    public Task<IReadOnlyList<PluginReferenceRecord>> SearchByHookAsync(string hook, CancellationToken cancellationToken) =>
+        _store.SearchByHookAsync(hook, cancellationToken);
+
+    public Task<IReadOnlyList<PluginReferenceRecord>> SearchByPermissionAsync(string permission, CancellationToken cancellationToken) =>
+        _store.SearchByPermissionAsync(permission, cancellationToken);
 
     public Task<IReadOnlyList<PluginReferenceRecord>> ListAsync(CancellationToken cancellationToken) =>
         _store.ListAsync(cancellationToken);
@@ -571,4 +800,176 @@ internal static class PluginReferenceExtractor
         var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
         return Convert.ToHexString(bytes);
     }
+}
+
+internal sealed class SqliteServerCatalogIndexStore : IServerCatalogIndexStore
+{
+    private readonly string _connectionString;
+
+    public SqliteServerCatalogIndexStore(string dbPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(dbPath) ?? AppContext.BaseDirectory);
+        _connectionString = new SqliteConnectionStringBuilder
+        {
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Cache = SqliteCacheMode.Shared,
+            Pooling = true,
+            DefaultTimeout = 5
+        }.ToString();
+    }
+
+    public async Task SyncAsync(IReadOnlyList<ServerVariableDefinition> variables, IReadOnlyList<ServerCommandDefinition> commands, CancellationToken cancellationToken)
+    {
+        var syncedAt = DateTime.UtcNow.ToString("O");
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var tx = await connection.BeginTransactionAsync(cancellationToken);
+
+        foreach (var v in variables)
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.Transaction = (SqliteTransaction)tx;
+            cmd.CommandText =
+                """
+                INSERT INTO server_convars (name, default_value, default_type, description, generated, last_synced_utc)
+                VALUES ($name, $default_value, $default_type, $description, $generated, $last_synced_utc)
+                ON CONFLICT(name) DO UPDATE SET
+                    default_value = excluded.default_value,
+                    default_type = excluded.default_type,
+                    description = excluded.description,
+                    generated = excluded.generated,
+                    last_synced_utc = excluded.last_synced_utc;
+                """;
+            cmd.Parameters.AddWithValue("$name", v.Name);
+            cmd.Parameters.AddWithValue("$default_value", v.DefaultValue ?? string.Empty);
+            cmd.Parameters.AddWithValue("$default_type", v.DefaultType ?? string.Empty);
+            cmd.Parameters.AddWithValue("$description", v.Description ?? string.Empty);
+            cmd.Parameters.AddWithValue("$generated", v.Generated ? 1 : 0);
+            cmd.Parameters.AddWithValue("$last_synced_utc", syncedAt);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        foreach (var c in commands)
+        {
+            await using var cmd = connection.CreateCommand();
+            cmd.Transaction = (SqliteTransaction)tx;
+            cmd.CommandText =
+                """
+                INSERT INTO server_commands_catalog (name, description, risk_level, tags_json, generated, last_synced_utc)
+                VALUES ($name, $description, $risk_level, $tags_json, $generated, $last_synced_utc)
+                ON CONFLICT(name) DO UPDATE SET
+                    description = excluded.description,
+                    risk_level = excluded.risk_level,
+                    tags_json = excluded.tags_json,
+                    generated = excluded.generated,
+                    last_synced_utc = excluded.last_synced_utc;
+                """;
+            cmd.Parameters.AddWithValue("$name", c.Name);
+            cmd.Parameters.AddWithValue("$description", c.Description ?? string.Empty);
+            cmd.Parameters.AddWithValue("$risk_level", c.RiskLevel ?? string.Empty);
+            cmd.Parameters.AddWithValue("$tags_json", JsonSerializer.Serialize(c.Tags ?? Array.Empty<string>(), JsonDefaults.Default));
+            cmd.Parameters.AddWithValue("$generated", c.Generated ? 1 : 0);
+            cmd.Parameters.AddWithValue("$last_synced_utc", syncedAt);
+            await cmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await tx.CommitAsync(cancellationToken);
+    }
+
+    public async Task<ServerVariableDefinition?> GetConvarAsync(string name, CancellationToken cancellationToken)
+    {
+        var normalized = name.Trim().ToLowerInvariant();
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = "SELECT * FROM server_convars WHERE LOWER(name) = $name LIMIT 1;";
+        cmd.Parameters.AddWithValue("$name", normalized);
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        return await reader.ReadAsync(cancellationToken) ? ReadConvar(reader) : null;
+    }
+
+    public async Task<IReadOnlyList<ServerVariableDefinition>> SearchConvarsAsync(string query, CancellationToken cancellationToken)
+    {
+        var q = query.Trim();
+        if (string.IsNullOrWhiteSpace(q))
+            return Array.Empty<ServerVariableDefinition>();
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            """
+            SELECT * FROM server_convars
+            WHERE name LIKE $q OR description LIKE $q
+            ORDER BY
+                CASE WHEN LOWER(name) = LOWER($exact) THEN 0
+                     WHEN name LIKE $prefix THEN 1
+                     ELSE 2 END,
+                name
+            LIMIT 30;
+            """;
+        cmd.Parameters.AddWithValue("$q", $"%{q}%");
+        cmd.Parameters.AddWithValue("$exact", q);
+        cmd.Parameters.AddWithValue("$prefix", $"{q}%");
+        var results = new List<ServerVariableDefinition>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            results.Add(ReadConvar(reader));
+        return results;
+    }
+
+    public async Task<IReadOnlyList<ServerCommandDefinition>> SearchServerCommandsAsync(string query, CancellationToken cancellationToken)
+    {
+        var q = query.Trim();
+        if (string.IsNullOrWhiteSpace(q))
+            return Array.Empty<ServerCommandDefinition>();
+
+        await using var connection = new SqliteConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText =
+            """
+            SELECT * FROM server_commands_catalog
+            WHERE name LIKE $q OR description LIKE $q OR tags_json LIKE $q
+            ORDER BY
+                CASE WHEN LOWER(name) = LOWER($exact) THEN 0
+                     WHEN name LIKE $prefix THEN 1
+                     ELSE 2 END,
+                name
+            LIMIT 30;
+            """;
+        cmd.Parameters.AddWithValue("$q", $"%{q}%");
+        cmd.Parameters.AddWithValue("$exact", q);
+        cmd.Parameters.AddWithValue("$prefix", $"{q}%");
+        var results = new List<ServerCommandDefinition>();
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            results.Add(ReadServerCommand(reader));
+        return results;
+    }
+
+    private static ServerVariableDefinition ReadConvar(SqliteDataReader reader) =>
+        new(
+            reader["name"].ToString()!,
+            reader["generated"].ToString() == "1",
+            NullIfEmpty(reader["default_value"].ToString()),
+            NullIfEmpty(reader["description"].ToString()),
+            NullIfEmpty(reader["default_type"].ToString())
+        );
+
+    private static ServerCommandDefinition ReadServerCommand(SqliteDataReader reader) =>
+        new(
+            reader["name"].ToString()!,
+            reader["generated"].ToString() == "1",
+            NullIfEmpty(reader["description"].ToString()),
+            NullIfEmpty(reader["risk_level"].ToString()),
+            Deserialize<List<string>>(reader["tags_json"].ToString())
+        );
+
+    private static string? NullIfEmpty(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value;
+
+    private static T? Deserialize<T>(string? json) =>
+        string.IsNullOrWhiteSpace(json) ? default : JsonSerializer.Deserialize<T>(json, JsonDefaults.Default);
 }

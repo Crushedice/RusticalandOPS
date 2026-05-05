@@ -131,6 +131,7 @@ var classifier = new AdminIntentClassifier(kernel, config.Llm, neoCortex, semant
 using var apiClient = new RustOpsApiClient(config.Api);
 var pluginReferenceStore = new SqlitePluginReferenceIndexStore(config.PluginUpdates.ReferenceIndexDatabasePath);
 var pluginReferenceIndexer = new PluginReferenceIndexer(apiClient, pluginReferenceStore, semanticMemory);
+var catalogIndexStore = new SqliteServerCatalogIndexStore(config.PluginUpdates.ReferenceIndexDatabasePath);
 
 if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.OrdinalIgnoreCase))
 {
@@ -168,7 +169,16 @@ Action<string, string, string?> serverStatusNotifier = (adminId, message, server
 
 // Shared server knowledge catalog for convar/command lookups across chat and RCON handlers
 var serverKnowledge = new ServerKnowledgeCatalog();
-Console.WriteLine($"[agent] Server knowledge loaded: {serverKnowledge.GetSnapshot().Variables.Count} variables, {serverKnowledge.GetSnapshot().Commands.Count} commands");
+var catalogSnapshot = serverKnowledge.GetSnapshot();
+Console.WriteLine($"[agent] Server knowledge loaded: {catalogSnapshot.Variables.Count} variables, {catalogSnapshot.Commands.Count} commands");
+if (catalogSnapshot.Variables.Count > 0 || catalogSnapshot.Commands.Count > 0)
+{
+    await catalogIndexStore.SyncAsync(
+        catalogSnapshot.Variables.Values.ToList(),
+        catalogSnapshot.Commands.Values.ToList(),
+        CancellationToken.None);
+    Console.WriteLine($"[agent] Catalog index synced: {catalogSnapshot.Variables.Count} convars, {catalogSnapshot.Commands.Count} commands");
+}
 
 // Register remote server RCON credentials so the agent can connect directly to them.
 // Local servers are also warmed up eagerly below using credentials from their config files.
@@ -232,7 +242,7 @@ var handlers = new List<IToolHandler>
     new RustPluginToolHandler(apiClient, config.PluginUpdates, semanticMemory, pluginReferenceIndexer),
     new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
     new RustFileEditToolHandler(apiClient, gitOps, config.GitOps, semanticMemory),
-    new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer),
+    new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer, catalogIndexStore),
     new RustServerManagementToolHandler(apiClient)
 };
 

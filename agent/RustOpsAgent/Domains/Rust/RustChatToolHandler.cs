@@ -10,6 +10,7 @@ internal sealed class RustChatToolHandler : IToolHandler
     private readonly ISemanticMemoryService _semanticMemory;
     private readonly IMemoryImportService? _memoryImport;
     private readonly PluginReferenceIndexer? _pluginReferenceIndexer;
+    private readonly IServerCatalogIndexStore? _catalogIndex;
     private readonly AutoPullService? _autoPull;
     private readonly ServerKnowledgeCatalog _knowledge;
 
@@ -19,12 +20,14 @@ internal sealed class RustChatToolHandler : IToolHandler
         AutoPullService? autoPull = null,
         ServerKnowledgeCatalog? knowledge = null,
         IMemoryImportService? memoryImport = null,
-        PluginReferenceIndexer? pluginReferenceIndexer = null)
+        PluginReferenceIndexer? pluginReferenceIndexer = null,
+        IServerCatalogIndexStore? catalogIndex = null)
     {
         _memory = memory;
         _semanticMemory = semanticMemory;
         _memoryImport = memoryImport;
         _pluginReferenceIndexer = pluginReferenceIndexer;
+        _catalogIndex = catalogIndex;
         _autoPull = autoPull;
         _knowledge = knowledge ?? new ServerKnowledgeCatalog();
     }
@@ -51,6 +54,12 @@ internal sealed class RustChatToolHandler : IToolHandler
         if (pluginIndexCommandResult is not null)
         {
             return pluginIndexCommandResult;
+        }
+
+        var convarIndexCommandResult = await TryHandleConvarIndexCommandAsync(context, cancellationToken);
+        if (convarIndexCommandResult is not null)
+        {
+            return convarIndexCommandResult;
         }
 
         var pluginReferenceResult = await TryHandlePluginReferenceQuestionAsync(context, cancellationToken);
@@ -388,6 +397,79 @@ internal sealed class RustChatToolHandler : IToolHandler
         }
 
         return new ToolExecutionResult(false, "Unknown plugin-index command. Try: /plugin-index refresh | search <query> | commands [pluginName] | permissions <pluginName> | hooks <pluginName>");
+    }
+
+    private async Task<ToolExecutionResult?> TryHandleConvarIndexCommandAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    {
+        var message = context.Message.Trim().TrimStart('/');
+        var lowered = message.ToLowerInvariant();
+        if (!lowered.StartsWith("convar-index", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        if (_catalogIndex is null)
+        {
+            return new ToolExecutionResult(false, "Convar index is not configured.", ErrorCode: "not_configured");
+        }
+
+        if (lowered.StartsWith("convar-index sync", StringComparison.Ordinal))
+        {
+            var snapshot = _knowledge.GetSnapshot();
+            await _catalogIndex.SyncAsync(
+                snapshot.Variables.Values.ToList(),
+                snapshot.Commands.Values.ToList(),
+                cancellationToken);
+            return new ToolExecutionResult(true, $"Convar index synced: {snapshot.Variables.Count} convars, {snapshot.Commands.Count} server commands.", MutatedState: true);
+        }
+
+        if (lowered.StartsWith("convar-index get ", StringComparison.Ordinal))
+        {
+            var name = message["convar-index get ".Length..].Trim();
+            var convar = await _catalogIndex.GetConvarAsync(name, cancellationToken);
+            if (convar is null)
+                return new ToolExecutionResult(true, $"No convar found for '{name}'.");
+            return new ToolExecutionResult(true, FormatConvar(convar));
+        }
+
+        if (lowered.StartsWith("convar-index search ", StringComparison.Ordinal))
+        {
+            var query = message["convar-index search ".Length..].Trim();
+            var convars = await _catalogIndex.SearchConvarsAsync(query, cancellationToken);
+            var cmds = await _catalogIndex.SearchServerCommandsAsync(query, cancellationToken);
+            if (convars.Count == 0 && cmds.Count == 0)
+                return new ToolExecutionResult(true, $"No convars or server commands found matching '{query}'.");
+            var lines = new List<string>();
+            foreach (var v in convars)
+                lines.Add(FormatConvar(v));
+            foreach (var c in cmds)
+                lines.Add(FormatServerCommand(c));
+            return new ToolExecutionResult(true, string.Join('\n', lines));
+        }
+
+        return new ToolExecutionResult(false, "Unknown convar-index command. Try: /convar-index sync | get <name> | search <query>");
+    }
+
+    private static string FormatConvar(ServerVariableDefinition v)
+    {
+        var parts = new List<string> { v.Name };
+        if (!string.IsNullOrWhiteSpace(v.DefaultType))
+            parts.Add($"[{v.DefaultType}]");
+        if (!string.IsNullOrWhiteSpace(v.DefaultValue))
+            parts.Add($"default={v.DefaultValue}");
+        if (!string.IsNullOrWhiteSpace(v.Description))
+            parts.Add($"— {v.Description}");
+        return string.Join(" ", parts);
+    }
+
+    private static string FormatServerCommand(ServerCommandDefinition c)
+    {
+        var parts = new List<string> { c.Name };
+        if (!string.IsNullOrWhiteSpace(c.RiskLevel))
+            parts.Add($"[{c.RiskLevel}]");
+        if (!string.IsNullOrWhiteSpace(c.Description))
+            parts.Add($"— {c.Description}");
+        return string.Join(" ", parts);
     }
 
     private async Task<ToolExecutionResult?> TryHandlePluginReferenceQuestionAsync(ToolExecutionContext context, CancellationToken cancellationToken)

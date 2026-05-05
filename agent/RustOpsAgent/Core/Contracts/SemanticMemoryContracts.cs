@@ -408,4 +408,7 @@ internal interface IPluginReferenceIndexStore
     Task UpsertAsync(PluginReferenceRecord record, string rawSource, CancellationToken cancellationToken);
     Task<IReadOnlyList<PluginReferenceRecord>> ListAsync(CancellationToken cancellationToken);
     Task<IReadOnlyList<PluginReferenceRecord>> SearchAsync(string query, CancellationToken cancellationToken);
+    Task<IReadOnlyList<PluginReferenceRecord>> SearchByCommandAsync(string command, CancellationToken cancellationToken);
+    Task<IReadOnlyList<PluginReferenceRecord>> SearchByHookAsync(string hook, CancellationToken cancellationToken);
+    Task<IReadOnlyList<PluginReferenceRecord>> SearchByPermissionAsync(string permission, CancellationToken cancellationToken);
 }
