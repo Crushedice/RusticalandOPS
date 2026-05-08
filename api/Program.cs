@@ -765,7 +765,6 @@ app.MapGet("/agent/incidents/list", () =>
         })
         .Where(item => item is not null)
         .Reverse()
-        .Take(50)
         .ToList();
 
     return Results.Ok(incidents);
@@ -3802,7 +3801,6 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                         Summary = ReadString(item, "result")
                     }))
                     .OrderByDescending(item => item.ExecutedAtUtc)
-                    .Take(100)
                     .ToList();
             }
 
@@ -3819,7 +3817,6 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                         ResponsePreview = ReadString(item, "responsePreview")
                     })
                     .OrderByDescending(item => item.AtUtc)
-                    .Take(100)
                     .ToList();
             }
         }
@@ -3829,7 +3826,6 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
             snapshot.AgentErrors = snapshot.AgentErrors
                 .Concat(new[] { "Failed to parse NeoCortex operations state." })
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(8)
                 .ToList();
         }
     }
@@ -3868,7 +3864,6 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                 Summary = ReadString(item, "failureReason")
             }))
             .OrderByDescending(item => item.CreatedAtUtc)
-            .Take(100)
             .ToList();
 
         var groupedGaps = records
@@ -3892,7 +3887,6 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                 };
             })
             .OrderByDescending(item => item.LastObservedAtUtc)
-            .Take(100)
             .ToList();
 
         if (groupedGaps.Count > 0)
@@ -3906,7 +3900,6 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
         snapshot.AgentErrors = snapshot.AgentErrors
             .Concat(new[] { "Failed to parse NeoCortex evolution state." })
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .Take(8)
             .ToList();
     }
 }
@@ -4324,7 +4317,6 @@ static List<DashboardLlmInteraction> ReadLlmInteractions(JsonElement root)
             ResponsePreview = ReadString(item, "responsePreview")
         })
         .OrderByDescending(item => item.AtUtc)
-        .Take(50)
         .ToList();
 }
 
@@ -4343,7 +4335,6 @@ static List<DashboardCapabilityGap> ReadCapabilityGaps(JsonElement root)
             LastObservedAtUtc = ReadDateTime(item, "lastObservedAtUtc")
         })
         .OrderByDescending(item => item.LastObservedAtUtc)
-        .Take(100)
         .ToList();
 }
 
@@ -4362,7 +4353,6 @@ static List<DashboardSelfRepairRun> ReadSelfRepairHistory(JsonElement root)
             RawModelReasoning = ReadString(item, "rawModelReasoning")
         })
         .OrderByDescending(item => item.AtUtc)
-        .Take(12)
         .ToList();
 }
 
@@ -4733,7 +4723,6 @@ static List<DashboardIncident> ReadRecentIncidents(JsonElement root)
             });
         })
         .OrderByDescending(item => item.CreatedAtUtc)
-        .Take(50)
         .ToList();
 }
 
@@ -4754,7 +4743,6 @@ static List<DashboardAction> ReadRecentActions(JsonElement root)
             Summary = ReadString(action, "summary")
         })
         .OrderByDescending(item => item.ExecutedAtUtc)
-        .Take(12)
         .ToList();
 }
 
@@ -4774,7 +4762,6 @@ static List<DashboardPendingAction> ReadPendingActions(JsonElement root)
             Summary = ReadString(action, "summary")
         })
         .OrderByDescending(item => item.CreatedAtUtc)
-        .Take(12)
         .ToList();
 }
 
@@ -4794,7 +4781,6 @@ static List<DashboardFeedback> ReadRecentFeedback(JsonElement root)
             Note = ReadString(item, "note")
         })
         .OrderByDescending(item => item.ReceivedAtUtc)
-        .Take(12)
         .ToList();
 }
 
