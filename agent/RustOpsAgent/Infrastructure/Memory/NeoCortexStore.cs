@@ -285,17 +285,52 @@ internal sealed class NeoCortexStore : IEvolutionStore
     private static T LoadJson<T>(string path, T fallback)
     {
         if (!File.Exists(path))
+            return fallback;
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(path);
+        }
+        catch
         {
             return fallback;
         }
 
-        var value = JsonSerializer.Deserialize<T>(File.ReadAllText(path), JsonDefaults.Default);
-        return value ?? fallback;
+        if (string.IsNullOrWhiteSpace(text))
+            return fallback;
+
+        try
+        {
+            var value = JsonSerializer.Deserialize<T>(text, JsonDefaults.Default);
+            return value ?? fallback;
+        }
+        catch (JsonException)
+        {
+            // File may be partially written (race condition). Try to salvage by stripping trailing garbage.
+            var end = text.LastIndexOf('}');
+            if (end > 0 && end < text.Length - 1)
+            {
+                try
+                {
+                    var trimmed = text[..(end + 1)];
+                    var value = JsonSerializer.Deserialize<T>(trimmed, JsonDefaults.Default);
+                    return value ?? fallback;
+                }
+                catch { /* fall through to fallback */ }
+            }
+
+            return fallback;
+        }
     }
 
     private static void SaveJson<T>(string path, T state)
     {
         var json = JsonSerializer.Serialize(state, JsonDefaults.Default);
-        File.WriteAllText(path, json);
+        // Atomic write: write to temp file, then rename to replace target.
+        // Prevents readers from seeing a partially-written file.
+        var tempPath = path + ".tmp";
+        File.WriteAllText(tempPath, json);
+        File.Move(tempPath, path, overwrite: true);
     }
 }
