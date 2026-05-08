@@ -119,29 +119,87 @@ internal sealed class RustRconClient : IRconClient
                 if (string.IsNullOrWhiteSpace(raw))
                     continue;
 
+                // Attempt to parse the first complete JSON object in the raw string.
+                // RCON may send multiple objects or trailing content — extract what we can.
+                JsonDocument? doc = null;
+                string? cleanRaw = null;
+
                 try
                 {
-                    using var doc = JsonDocument.Parse(raw);
-                    var root = doc.RootElement;
-                    var id = root.TryGetProperty("Identifier", out var idEl) && idEl.ValueKind == JsonValueKind.Number
-                        ? idEl.GetInt32() : -1;
-                    var type = root.TryGetProperty("Type", out var typeEl) ? typeEl.GetString() : null;
-                    var msg = root.TryGetProperty("Message", out var msgEl) ? msgEl.ToString() : raw;
-
-                    // Rust sends player chat with Type="Chat" but the Message field has no [Chat]
-                    // prefix — that prefix only appears in server log files. Normalise here so the
-                    // downstream TryParseChatLine recognises RCON chat events the same way it
-                    // recognises log-file chat lines.
-                    if (string.Equals(type, "Chat", StringComparison.OrdinalIgnoreCase) &&
-                        !msg.Contains("[Chat]", StringComparison.OrdinalIgnoreCase))
+                    // Try parsing as-is first
+                    doc = JsonDocument.Parse(raw);
+                }
+                catch
+                {
+                    // If that fails, try to extract just the first valid JSON object
+                    var trimmed = raw.Trim();
+                    if (trimmed.StartsWith('{'))
                     {
-                        msg = $"[Chat] {msg}";
-                    }
+                        var braceCount = 0;
+                        int endPos = -1;
+                        for (int i = 0; i < trimmed.Length; i++)
+                        {
+                            if (trimmed[i] == '{') braceCount++;
+                            else if (trimmed[i] == '}')
+                            {
+                                braceCount--;
+                                if (braceCount == 0)
+                                {
+                                    endPos = i + 1;
+                                    break;
+                                }
+                            }
+                        }
 
-                    if (id >= 0 && _pending.TryGetValue(id, out var tcs))
-                        tcs.TrySetResult(msg);
+                        if (endPos > 0)
+                        {
+                            cleanRaw = trimmed[..endPos];
+                            try
+                            {
+                                doc = JsonDocument.Parse(cleanRaw);
+                            }
+                            catch
+                            {
+                                // Still can't parse, fall back to raw
+                                doc = null;
+                            }
+                        }
+                    }
+                }
+
+                try
+                {
+                    if (doc is not null)
+                    {
+                        using (doc)
+                        {
+                            var root = doc.RootElement;
+                            var id = root.TryGetProperty("Identifier", out var idEl) && idEl.ValueKind == JsonValueKind.Number
+                                ? idEl.GetInt32() : -1;
+                            var type = root.TryGetProperty("Type", out var typeEl) ? typeEl.GetString() : null;
+                            var msg = root.TryGetProperty("Message", out var msgEl) ? msgEl.ToString() : raw;
+
+                            // Rust sends player chat with Type="Chat" but the Message field has no [Chat]
+                            // prefix — that prefix only appears in server log files. Normalise here so the
+                            // downstream TryParseChatLine recognises RCON chat events the same way it
+                            // recognises log-file chat lines.
+                            if (string.Equals(type, "Chat", StringComparison.OrdinalIgnoreCase) &&
+                                !msg.Contains("[Chat]", StringComparison.OrdinalIgnoreCase))
+                            {
+                                msg = $"[Chat] {msg}";
+                            }
+
+                            if (id >= 0 && _pending.TryGetValue(id, out var tcs))
+                                tcs.TrySetResult(msg);
+                            else
+                                UnsolicitedMessage?.Invoke(msg);
+                        }
+                    }
                     else
-                        UnsolicitedMessage?.Invoke(msg);
+                    {
+                        // Could not parse JSON at all, send raw message as-is
+                        UnsolicitedMessage?.Invoke(raw);
+                    }
                 }
                 catch
                 {
