@@ -222,11 +222,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "status_check      Server health, online/offline, network interfaces, logs overview\n" +
         "troubleshooting   Plugin errors, oxide/umod issues, compile failures, crash investigation\n" +
         "server_management Add, remove, register, provision server connections; update RCON credentials\n" +
+        "player_forced_management Manage the rusticaland.net launcher \"forced\" list: add/remove/check whether a player must use the launcher\n" +
         "clarification     Cannot determine intent\n\n" +
         "══ TARGETREF VALUES ══\n" +
         "rust.server.control   rust.player.lookup    rust.rcon.command    rust.file.edit\n" +
         "rust.status.check     rust.logs.inspect     rust.plugins.verify  rust.network.inspect\n" +
-        "rust.chat.reply       rust.server.management  web.search\n\n" +
+        "rust.chat.reply       rust.server.management  rust.player.forced  web.search\n\n" +
         "══ SLOTS ══\n" +
         "serverName   string  – single server (match from Known servers list when possible)\n" +
         "serverNames  array   – multiple server names\n" +
@@ -272,6 +273,14 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "6. status_check + rust.logs.inspect for: \"log/s\", \"exception\", \"traceback\", \"crash log\".\n\n" +
         "7. server_management for: add/register/remove/delete/provision a server, update RCON\n" +
         "   credentials, \"edit server connection\". serverName and commandText (=RCON IP) go in slots.\n\n" +
+        "7b. player_forced_management for the launcher \"forced\" list (rusticaland.net apps service):\n" +
+        "    \"force <player>\", \"add <player> to forced\", \"force <player> to use launcher\"\n" +
+        "    \"unforce <player>\", \"remove <player> from forced\", \"lift force on <player>\"\n" +
+        "    \"is <player> forced\", \"check forced status of <player>\", \"is <player> on the forced list\"\n" +
+        "    -> intent=player_forced_management, targetRef=rust.player.forced\n" +
+        "    -> put steamid OR display name in slots.playerName. NEVER set serverName — this is\n" +
+        "       a global rusticaland service, not per-server. Don't ask which server.\n" +
+        "    NOT to be confused with player_lookup (per-server playerlist/bans).\n\n" +
         "8. chat for: git operations, pull, rebuild, build, questions about the agent software itself.\n" +
         "   Memory/admin commands such as \"memory stats\", \"/memory search\", \"memory migrate\" are ALSO chat.\n" +
         "   Plugin reference lookup commands such as \"/plugin-index search\", \"what commands does Backpacks have\",\n" +
@@ -328,6 +337,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"spk 76561198123456789,Welcome\", slots.serverName=\"cotton\"\n\n" +
         "\"pm 76561198001234567 You have been warned on modded\"\n" +
         "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"spk 76561198001234567,You have been warned\", slots.serverName=\"modded\"\n\n" +
+        "\"force hophop\" / \"add hophop to the forced list\" / \"force 76561199645683644\"\n" +
+        "  -> intent=player_forced_management, targetRef=rust.player.forced, slots.playerName=\"hophop\"\n\n" +
+        "\"unforce hophop\" / \"remove 76561199645683644 from forced\"\n" +
+        "  -> intent=player_forced_management, targetRef=rust.player.forced, slots.playerName=\"hophop\"\n\n" +
+        "\"is hophop forced?\" / \"check force status of 76561199645683644\"\n" +
+        "  -> intent=player_forced_management, targetRef=rust.player.forced, slots.playerName=\"hophop\"\n\n" +
         "\"set mapsize to 4500 on monthly\"\n" +
         "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.configValue=\"4500\", slots.serverName=\"monthly\"\n\n" +
         "\"wipe monthly\"\n" +
@@ -472,6 +487,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             lowered.Contains("new server") || lowered.Contains("update rcon") || lowered.Contains("edit server") ||
             lowered.Contains("rcon credential") || lowered.Contains("connect server"))
             return AdminIntentType.ServerManagement;
+        if (LooksLikeForcedListIntent(lowered))
+            return AdminIntentType.PlayerForcedManagement;
         if (LooksLikeServerVariableIntent(lowered))
             return AdminIntentType.RconCommand;
         if (LooksLikeFileOrConfigIntent(lowered) || LooksLikeServerConfigValueIntent(lowered))
@@ -493,6 +510,24 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         if (lowered.Contains("fix") || lowered.Contains("error") || lowered.Contains("fail"))
             return AdminIntentType.Troubleshooting;
         return AdminIntentType.Chat;
+    }
+
+    // Heuristic detection of launcher-force-list operations. Phrasing covers add/remove/query
+    // and tolerates the plain word "force" near "player"/steamid. Avoids matching generic
+    // "force" in unrelated contexts (e.g. "force restart" → server_control).
+    private static bool LooksLikeForcedListIntent(string lowered)
+    {
+        if (lowered.Contains("force restart") || lowered.Contains("force stop") || lowered.Contains("force kill"))
+            return false;
+        if (lowered.Contains("forced list") || lowered.Contains("force list") || lowered.Contains("forced status"))
+            return true;
+        if (lowered.Contains("unforce") || lowered.Contains("deforce") || lowered.Contains("lift force") || lowered.Contains("stop forcing"))
+            return true;
+        // "force <player>", "force them to use launcher", "is X forced", "check forced status"
+        if (System.Text.RegularExpressions.Regex.IsMatch(lowered, @"\b(force(?:d)?)\b.*\b(launcher|player|steamid|7656\d{13})\b") ||
+            System.Text.RegularExpressions.Regex.IsMatch(lowered, @"\b(launcher|player|steamid|7656\d{13})\b.*\b(force(?:d)?)\b"))
+            return true;
+        return false;
     }
 
     private static bool LooksLikePluginReferenceQuestion(string lowered) =>
@@ -905,6 +940,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "status_check" => AdminIntentType.StatusCheck,
         "troubleshooting" => AdminIntentType.Troubleshooting,
         "server_management" => AdminIntentType.ServerManagement,
+        "player_forced_management" => AdminIntentType.PlayerForcedManagement,
         _ => AdminIntentType.Clarification
     };
 

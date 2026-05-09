@@ -58,6 +58,7 @@ internal sealed class ToolRegistry
             AdminIntentType.ServerControl => eligible.FirstOrDefault(h => h.Name == "rust.server.control") ?? eligible[0],
             AdminIntentType.RconCommand => eligible.FirstOrDefault(h => h.Name == "rust.rcon.command") ?? eligible[0],
             AdminIntentType.PlayerLookup => eligible.FirstOrDefault(h => h.Name == "rust.player.lookup") ?? eligible[0],
+            AdminIntentType.PlayerForcedManagement => eligible.FirstOrDefault(h => h.Name == "rust.player.forced") ?? eligible[0],
             AdminIntentType.Chat or AdminIntentType.Clarification => eligible.FirstOrDefault(h => h.Name == "rust.chat.reply") ?? eligible[0],
             AdminIntentType.StatusCheck => eligible.FirstOrDefault(h => h.Name == "rust.status.check") ?? eligible[0],
             AdminIntentType.Troubleshooting => eligible.FirstOrDefault(h => h.Name == "rust.logs.inspect") ?? eligible[0],

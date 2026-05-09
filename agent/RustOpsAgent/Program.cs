@@ -232,6 +232,10 @@ catch (Exception ex)
     RustOpsSentry.CaptureException(ex, "Failed to load remote RCON config", "startup");
 }
 
+var playerStore = new PlayerStore(
+    config.Memory.DatabasePath,
+    config.Memory.DebugLoggingEnabled ? message => Console.WriteLine($"[player-db] {message}") : null);
+
 var handlers = new List<IToolHandler>
 {
     new RustServerControlToolHandler(apiClient, serverStatusNotifier, semanticMemory),
@@ -243,7 +247,8 @@ var handlers = new List<IToolHandler>
     new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
     new RustFileEditToolHandler(apiClient, gitOps, config.GitOps, semanticMemory),
     new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer, catalogIndexStore),
-    new RustServerManagementToolHandler(apiClient)
+    new RustServerManagementToolHandler(apiClient),
+    new RustForcedPlayerToolHandler(playerStore)
 };
 
 if (config.WebSearch.Enabled)
@@ -254,10 +259,6 @@ if (config.WebSearch.Enabled)
 var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry, semanticMemory);
 var composer = new ResponseComposer(kernel, config.Llm);
-
-var playerStore = new PlayerStore(
-    config.Memory.DatabasePath,
-    config.Memory.DebugLoggingEnabled ? message => Console.WriteLine($"[player-db] {message}") : null);
 
 var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel, playerStore);
 

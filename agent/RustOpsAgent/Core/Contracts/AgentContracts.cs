@@ -12,7 +12,8 @@ internal enum AdminIntentType
     StatusCheck,
     Troubleshooting,
     Clarification,
-    ServerManagement
+    ServerManagement,
+    PlayerForcedManagement
 }
 
 internal enum ServerScopeKind
