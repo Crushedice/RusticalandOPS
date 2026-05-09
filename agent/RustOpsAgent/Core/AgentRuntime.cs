@@ -37,6 +37,7 @@ internal sealed class AgentRuntime
     private readonly HashSet<string> _staticIgnorePatterns;
     private readonly HashSet<string> _incidentPatterns;
     private readonly HashSet<string> _startupIgnorePatterns;
+    private DateTime _logRulesLastWriteUtc = DateTime.MinValue;
     private string _lastDigestDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
     private DateTime _alertMutedUntilUtc = DateTime.MinValue;
     private DateTime _lastObservationAtUtc = DateTime.MinValue;
@@ -51,6 +52,8 @@ internal sealed class AgentRuntime
     private readonly Dictionary<string, int> _standInResponsesThisMinute = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _standInRateLimitWindowStart = DateTime.MinValue;
     private DateTime _lastPluginCheckAtUtc = DateTime.MinValue;
+    private DateTime _lastForcedPollAtUtc = DateTime.MinValue;
+    private readonly PlayerStore? _playerStore;
 
     public AgentRuntime(
         AgentConfig config,
@@ -63,7 +66,8 @@ internal sealed class AgentRuntime
         IGitOpsService gitOps,
         AutoPullService autoPull,
         RustOpsApiClient api,
-        Kernel? kernel)
+        Kernel? kernel,
+        PlayerStore? playerStore = null)
     {
         _config = config;
         _classifier = classifier;
@@ -76,7 +80,12 @@ internal sealed class AgentRuntime
         _autoPull = autoPull;
         _api = api;
         _deepKernel = kernel;
+        _playerStore = playerStore;
         (_staticIgnorePatterns, _incidentPatterns, _startupIgnorePatterns) = LoadStaticLogRules(config.Monitor.LogRulesPath);
+        if (!string.IsNullOrWhiteSpace(config.Monitor.LogRulesPath) && File.Exists(config.Monitor.LogRulesPath))
+        {
+            try { _logRulesLastWriteUtc = File.GetLastWriteTimeUtc(config.Monitor.LogRulesPath); } catch { }
+        }
 
         // Capture player chat from remote servers via direct RCON unsolicited messages.
         // Local servers still use the log-polling path; remote servers have no log file
@@ -126,8 +135,12 @@ internal sealed class AgentRuntime
                 var playerChat = _neoCortex.LoadPlayerChat();
                 RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
                 _neoCortex.SavePlayerChat(playerChat);
+                _playerStore?.RecordChat(parsed.Value.SteamId, parsed.Value.Player, server, parsed.Value.Message);
                 return; // Chat lines don't also go to console error tracking
             }
+
+            // Try to parse as a player join/auth/disconnect line
+            TryRecordPlayerEventFromLogLine(rawMessage, server);
 
             // Record non-chat lines to console monitor (errors, warnings, etc.)
             if (!_config.ConsoleMonitor.Enabled)
@@ -246,6 +259,8 @@ internal sealed class AgentRuntime
                 await SafeExecuteAsync(() => ProcessPlayerChatForStandInAsync(cancellationToken), "stand-in-admin", cancellationToken);
                 await SafeExecuteAsync(() => CheckPluginUpdatesAsync(cancellationToken), "plugin-check", cancellationToken);
                 await SafeExecuteAsync(() => EvolveClassifierAsync(cancellationToken), "classifier-evolution", cancellationToken);
+                await SafeExecuteAsync(() => PollForcedListAsync(cancellationToken), "forced-list-poll", cancellationToken);
+                await SafeExecuteAsync(() => MaybeReloadStaticLogRulesAsync(cancellationToken), "log-rules-reload", cancellationToken);
 
                 _legacyState.Save();
                 tick++;
@@ -337,6 +352,9 @@ internal sealed class AgentRuntime
                             logs.IgnorePatterns.Add(pattern);
                             _neoCortex.SaveLogs(logs);
                         }
+
+                        // Backfill: drop already-tracked entries that match the new pattern.
+                        SweepTrackedLinesForPatterns(new[] { pattern });
                     }
                 }
 
@@ -723,6 +741,8 @@ internal sealed class AgentRuntime
 
                 Console.WriteLine($"[plugin-chat] {item.Server}: {playerName}: {item.Message}");
                 RecordPlayerChat(playerChat, item.Server, playerName, item.Message, DateTime.UtcNow);
+                if (!string.IsNullOrWhiteSpace(item.SteamId))
+                    _playerStore?.RecordChat(item.SteamId, item.Username ?? string.Empty, item.Server, item.Message);
                 changed = true;
             }
             catch (Exception ex)
@@ -1095,8 +1115,8 @@ internal sealed class AgentRuntime
         @"\[Chat\]",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
 
-    // Extracts (playerName, chatMessage) from a Rust chat log line, or returns null if not a chat line.
-    private static (string Player, string Message)? TryParseChatLine(string line)
+    // Extracts (playerName, steamId, chatMessage) from a Rust chat log line, or returns null if not a chat line.
+    private static (string Player, string SteamId, string Message)? TryParseChatLine(string line)
     {
         if (!ChatLineRegex.IsMatch(line))
             return null;
@@ -1116,8 +1136,9 @@ internal sealed class AgentRuntime
                 var root = doc.RootElement;
                 var username = root.TryGetProperty("Username", out var uEl) ? uEl.GetString() : null;
                 var chatMsg = root.TryGetProperty("Message", out var mEl) ? mEl.GetString() : null;
+                var steamId = root.TryGetProperty("UserId", out var sEl) ? sEl.GetString() : null;
                 if (!string.IsNullOrWhiteSpace(username) && chatMsg is not null)
-                    return (username.Trim(), chatMsg.Trim());
+                    return (username.Trim(), (steamId ?? string.Empty).Trim(), chatMsg.Trim());
             }
             catch { /* fall through to text-format parse */ }
         }
@@ -1131,6 +1152,13 @@ internal sealed class AgentRuntime
         var bracketIdx = nameRaw.IndexOf('[');
         var playerName = (bracketIdx > 0 ? nameRaw[..bracketIdx] : nameRaw).Trim();
         var chatMessage = after[(colonIdx + 1)..].Trim();
+        var sidFromBracket = string.Empty;
+        if (bracketIdx > 0)
+        {
+            var closeIdx = nameRaw.IndexOf(']', bracketIdx);
+            if (closeIdx > bracketIdx)
+                sidFromBracket = nameRaw[(bracketIdx + 1)..closeIdx].Trim();
+        }
 
         if (string.IsNullOrWhiteSpace(playerName) || string.IsNullOrWhiteSpace(chatMessage))
             return null;
@@ -1141,7 +1169,44 @@ internal sealed class AgentRuntime
             playerName.Length > 60)
             return null;
 
-        return (playerName, chatMessage);
+        return (playerName, sidFromBracket, chatMessage);
+    }
+
+    // Matches join lines: "<name> with steamid <sid> joined from ip <ip>:<port>"
+    private static readonly System.Text.RegularExpressions.Regex JoinLineRegex = new(
+        @"^(?<name>.+?)\s+with steamid\s+(?<sid>7656\d{13})\s+joined from ip\s+(?<ip>[^\s:]+)",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    // Matches "<ip>:<port>/<sid>/<name>" prefix (auth, kick, disconnect, etc.)
+    private static readonly System.Text.RegularExpressions.Regex AuthOrLeaveRegex = new(
+        @"^(?<ip>\d{1,3}(?:\.\d{1,3}){3}):\d+/(?<sid>7656\d{13})/(?<name>[^\s]+)\s",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private void TryRecordPlayerEventFromLogLine(string line, string server)
+    {
+        if (_playerStore is null) return;
+        var join = JoinLineRegex.Match(line);
+        if (join.Success)
+        {
+            _playerStore.RecordSighting(
+                join.Groups["sid"].Value,
+                join.Groups["name"].Value,
+                server,
+                join.Groups["ip"].Value,
+                startsSession: true);
+            return;
+        }
+
+        var auth = AuthOrLeaveRegex.Match(line);
+        if (auth.Success)
+        {
+            _playerStore.RecordSighting(
+                auth.Groups["sid"].Value,
+                auth.Groups["name"].Value,
+                server,
+                auth.Groups["ip"].Value,
+                startsSession: false);
+        }
     }
 
     private void RecordPlayerChat(PlayerChatKnowledge chat, string server, string player, string message, DateTime capturedAtUtc)
@@ -1197,39 +1262,36 @@ internal sealed class AgentRuntime
         }
     }
 
+    // Patterns are anchored on word boundaries so that substrings like "esp" inside
+    // "respawn" or "admin" inside a plugin name don't false-trigger. Keep these in sync
+    // with LooksLikeAdminCall in api/Program.cs.
+    private static readonly System.Text.RegularExpressions.Regex AdminCallCheaterRegex = new(
+        @"\b(cheater|cheating|hacker|hacking|aimbot|aimlock|wallhack|wallhacking|esp|scripting|script user)\b",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static readonly System.Text.RegularExpressions.Regex AdminCallAdminRegex = new(
+        @"(?:^|\s)@?(admin|admins|moderator|moderators|staff|owner)\b|\b(any|some|an)\s+(admin|mod|moderator|staff)\b|\b(admin|mod|moderator)\s+(here|on|please|pls|plz|help|needed)\b",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static readonly System.Text.RegularExpressions.Regex AdminCallHelpRegex = new(
+        @"\b(stuck|glitched|bugged|frozen|broken|softlocked)\b|\b(not\s+working|doesn'?t\s+work|won'?t\s+load|can'?t\s+(?:join|connect|spawn|move|build|craft|open))\b",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    private static readonly System.Text.RegularExpressions.Regex AdminCallReportRegex = new(
+        @"\b(grief(?:ing|ed)?|toxic|racist|racism|harass(?:ing|ment)?|insult(?:ing)?|slur|slurs)\b",
+        System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
     private static bool TryClassifyAdminCall(string message, out string callType)
     {
-        var text = message.Trim().ToLowerInvariant();
         callType = string.Empty;
+        var text = (message ?? string.Empty).Trim();
+        // Require at least a couple of words; single-word interjections are too noisy.
+        if (text.Length < 6) return false;
 
-        if (text.Contains("admin") || text.Contains("mod ") || text.Contains("moderator"))
-        {
-            callType = "admin-request";
-            return true;
-        }
-
-        if (text.Contains("cheater") || text.Contains("hacker") || text.Contains("aimbot") ||
-            text.Contains("esp") || text.Contains("scripting") || text.Contains("script user"))
-        {
-            callType = "cheater-report";
-            return true;
-        }
-
-        if (text.Contains("help") || text.Contains("stuck") || text.Contains("bug") ||
-            text.Contains("glitch") || text.Contains("not working") || text.Contains("can't") ||
-            text.Contains("cant "))
-        {
-            callType = "help-request";
-            return true;
-        }
-
-        if (text.Contains("grief") || text.Contains("toxic") || text.Contains("racist") ||
-            text.Contains("harass") || text.Contains("insult"))
-        {
-            callType = "player-report";
-            return true;
-        }
-
+        if (AdminCallCheaterRegex.IsMatch(text)) { callType = "cheater-report"; return true; }
+        if (AdminCallAdminRegex.IsMatch(text))   { callType = "admin-request"; return true; }
+        if (AdminCallReportRegex.IsMatch(text))  { callType = "player-report"; return true; }
+        if (AdminCallHelpRegex.IsMatch(text))    { callType = "help-request"; return true; }
         return false;
     }
 
@@ -1322,9 +1384,13 @@ internal sealed class AgentRuntime
                 if (parsed.HasValue && playerChat is not null)
                 {
                     RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
+                    _playerStore?.RecordChat(parsed.Value.SteamId, parsed.Value.Player, server, parsed.Value.Message);
                     chatChanged = true;
                     continue; // chat lines don't also go to the error console
                 }
+
+                // --- Player join/auth/disconnect stream ---
+                TryRecordPlayerEventFromLogLine(line, server);
 
                 // --- Console error/warning stream ---
                 if (consoleMonitor is not null)
@@ -1596,9 +1662,13 @@ internal sealed class AgentRuntime
                 if (parsed.HasValue)
                 {
                     RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
+                    _playerStore?.RecordChat(parsed.Value.SteamId, parsed.Value.Player, server, parsed.Value.Message);
                     chatChanged = true;
                     continue;
                 }
+
+                // --- Player join/auth/disconnect stream ---
+                TryRecordPlayerEventFromLogLine(line, server);
 
                 // --- Console error/warning stream ---
                 var consoleSignalLine = ExtractConsoleSignalLine(line);
@@ -2128,23 +2198,43 @@ internal sealed class AgentRuntime
         }
     }
 
+    private string _lastSentimentSkipReason = string.Empty;
     private async Task AnalyzePlayerSentimentAsync(CancellationToken cancellationToken)
     {
         if (!_config.ConsoleMonitor.Enabled)
+        {
+            ReportSentimentSkip("console-monitor disabled");
             return;
+        }
 
         var interval = TimeSpan.FromMinutes(Math.Max(10, _config.ConsoleMonitor.SentimentAnalysisIntervalMinutes));
         if (DateTime.UtcNow - _lastSentimentAnalysisAtUtc < interval)
-            return;
-
-        _lastSentimentAnalysisAtUtc = DateTime.UtcNow;
+            return; // intentional silent skip — interval gate fires constantly
 
         var chat = _neoCortex.LoadPlayerChat();
         if (chat.RecentMessages.Count < 5)
+        {
+            ReportSentimentSkip($"only {chat.RecentMessages.Count} chat msgs (<5)");
             return;
+        }
+
+        if (_deepKernel is null)
+        {
+            ReportSentimentSkip("deep LLM kernel not configured");
+            return;
+        }
 
         if (!CanUseDeepLlm("sentiment"))
+        {
+            // CanUseDeepLlm already logs its own reason for the 401-mute case; otherwise:
+            if (!_config.Llm.Enabled) ReportSentimentSkip("llm.enabled=false");
+            else if (!_config.Llm.UseForRecommendations) ReportSentimentSkip("llm.useForRecommendations=false");
             return;
+        }
+
+        // Only commit the timestamp once we've actually decided to run the analysis,
+        // otherwise transient skip-reasons would push the next attempt out by a full interval.
+        _lastSentimentAnalysisAtUtc = DateTime.UtcNow;
 
         var recent = chat.RecentMessages.TakeLast(50).ToList();
         var chatText = string.Join("\n", recent.Select(m => $"[{m.ServerName}] {m.PlayerName}: {m.Message}"));
@@ -2218,6 +2308,203 @@ Recent player chat (newest last):
                 return;
             Console.WriteLine($"[sentiment] Analysis failed: {ex.Message}");
         }
+    }
+
+    private Task MaybeReloadStaticLogRulesAsync(CancellationToken cancellationToken)
+    {
+        var path = _config.Monitor.LogRulesPath;
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return Task.CompletedTask;
+
+        DateTime mtime;
+        try { mtime = File.GetLastWriteTimeUtc(path); }
+        catch { return Task.CompletedTask; }
+
+        if (mtime <= _logRulesLastWriteUtc) return Task.CompletedTask;
+        _logRulesLastWriteUtc = mtime;
+
+        var (ignore, incident, startup) = LoadStaticLogRules(path);
+        var newIgnore = ignore.Except(_staticIgnorePatterns, StringComparer.OrdinalIgnoreCase).ToList();
+
+        _staticIgnorePatterns.Clear(); foreach (var p in ignore) _staticIgnorePatterns.Add(p);
+        _incidentPatterns.Clear();     foreach (var p in incident) _incidentPatterns.Add(p);
+        _startupIgnorePatterns.Clear();foreach (var p in startup) _startupIgnorePatterns.Add(p);
+
+        Console.WriteLine($"[log-rules] reloaded ({_staticIgnorePatterns.Count} ignore, {_incidentPatterns.Count} incident, {_startupIgnorePatterns.Count} startup-ignore).");
+
+        if (newIgnore.Count > 0)
+        {
+            SweepTrackedLinesForPatterns(newIgnore);
+        }
+        return Task.CompletedTask;
+    }
+
+    // Drop already-recorded console errors / admin calls / log entries that match newly-added
+    // ignore patterns. Called after a static-rule reload or after admin "ignore X" feedback.
+    private void SweepTrackedLinesForPatterns(IReadOnlyCollection<string> patterns)
+    {
+        if (patterns.Count == 0) return;
+        var lowered = patterns
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Select(p => p.ToLowerInvariant())
+            .ToList();
+        if (lowered.Count == 0) return;
+
+        bool MatchesAny(string text)
+        {
+            var t = text?.ToLowerInvariant() ?? string.Empty;
+            return lowered.Any(p => t.Contains(p, StringComparison.Ordinal));
+        }
+
+        try
+        {
+            var consoleMonitor = _neoCortex.LoadConsoleMonitor();
+            var consoleChanged = false;
+            foreach (var (server, state) in consoleMonitor.Servers)
+            {
+                var beforeErr = state.RecentErrors.Count;
+                state.RecentErrors = state.RecentErrors
+                    .Where(e => !MatchesAny(e.SampleLine ?? string.Empty) && !MatchesAny(e.Message ?? string.Empty))
+                    .ToList();
+                if (state.RecentErrors.Count != beforeErr) consoleChanged = true;
+
+                var beforeRep = state.RepeatingMessages.Count;
+                foreach (var key in state.RepeatingMessages.Keys.Where(MatchesAny).ToList())
+                    state.RepeatingMessages.Remove(key);
+                if (state.RepeatingMessages.Count != beforeRep) consoleChanged = true;
+
+                if (consoleChanged) Console.WriteLine($"[log-rules] swept {server}: errors→{state.RecentErrors.Count}, repeating→{state.RepeatingMessages.Count}");
+            }
+            if (consoleChanged)
+            {
+                consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
+                _neoCortex.SaveConsoleMonitor(consoleMonitor);
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"[log-rules] sweep console failed: {ex.Message}"); }
+
+        try
+        {
+            var logs = _neoCortex.LoadLogs();
+            var beforeLog = logs.RecentEntries.Count;
+            logs.RecentEntries = logs.RecentEntries.Where(e => !MatchesAny(e.Line ?? string.Empty)).ToList();
+            if (logs.RecentEntries.Count != beforeLog)
+            {
+                _neoCortex.SaveLogs(logs);
+                Console.WriteLine($"[log-rules] swept logs: entries→{logs.RecentEntries.Count}");
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"[log-rules] sweep logs failed: {ex.Message}"); }
+    }
+
+    private void ReportSentimentSkip(string reason)
+    {
+        if (string.Equals(reason, _lastSentimentSkipReason, StringComparison.Ordinal)) return;
+        _lastSentimentSkipReason = reason;
+        Console.WriteLine($"[sentiment] skipping: {reason}");
+    }
+
+    private async Task PollForcedListAsync(CancellationToken cancellationToken)
+    {
+        if (_playerStore is null) return;
+        if (DateTime.UtcNow - _lastForcedPollAtUtc < TimeSpan.FromMinutes(5)) return;
+        _lastForcedPollAtUtc = DateTime.UtcNow;
+
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+            using var resp = await http.GetAsync("http://apps.rusticaland.net:8853/all", cancellationToken);
+            if (!resp.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"[forced] poll skipped: HTTP {(int)resp.StatusCode}");
+                return;
+            }
+            var body = await resp.Content.ReadAsStringAsync(cancellationToken);
+            if (string.IsNullOrWhiteSpace(body)) return;
+
+            var state = ParseForcedListPayload(body);
+            if (state.Count == 0)
+            {
+                Console.WriteLine("[forced] poll returned no entries.");
+                return;
+            }
+            _playerStore.ApplyForcedList(state);
+            var forcedCount = state.Count(kv => kv.Value);
+            Console.WriteLine($"[forced] applied {state.Count} entries ({forcedCount} forced).");
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[forced] poll failed: {ex.Message}");
+        }
+    }
+
+    // Tolerant parser: accepts either an object map { "<sid>": true|"yes"|... } or
+    // an array of objects/strings. Steam IDs must look like 7656...17 digits.
+    private static Dictionary<string, bool> ParseForcedListPayload(string body)
+    {
+        var result = new Dictionary<string, bool>(StringComparer.Ordinal);
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (!IsSteamId(prop.Name)) continue;
+                    result[prop.Name] = ReadForcedBool(prop.Value);
+                }
+            }
+            else if (root.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var entry in root.EnumerateArray())
+                {
+                    if (entry.ValueKind == JsonValueKind.String)
+                    {
+                        var sid = entry.GetString();
+                        if (sid is not null && IsSteamId(sid)) result[sid] = true;
+                    }
+                    else if (entry.ValueKind == JsonValueKind.Object)
+                    {
+                        string? sid = null;
+                        bool forced = true;
+                        foreach (var prop in entry.EnumerateObject())
+                        {
+                            if (sid is null && (prop.Name.Equals("steamId", StringComparison.OrdinalIgnoreCase)
+                                || prop.Name.Equals("steam_id", StringComparison.OrdinalIgnoreCase)
+                                || prop.Name.Equals("id", StringComparison.OrdinalIgnoreCase)))
+                            {
+                                sid = prop.Value.ValueKind == JsonValueKind.String
+                                    ? prop.Value.GetString()
+                                    : prop.Value.ToString();
+                            }
+                            else if (prop.Name.Equals("forced", StringComparison.OrdinalIgnoreCase)
+                                || prop.Name.Equals("state", StringComparison.OrdinalIgnoreCase))
+                            {
+                                forced = ReadForcedBool(prop.Value);
+                            }
+                        }
+                        if (sid is not null && IsSteamId(sid)) result[sid] = forced;
+                    }
+                }
+            }
+        }
+        catch (JsonException) { /* tolerate malformed responses */ }
+        return result;
+
+        static bool IsSteamId(string s) =>
+            s.Length == 17 && s.StartsWith("7656", StringComparison.Ordinal) && s.All(char.IsDigit);
+
+        static bool ReadForcedBool(JsonElement el) => el.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.Number => el.TryGetInt32(out var n) && n != 0,
+            JsonValueKind.String => !string.Equals(el.GetString(), "0", StringComparison.Ordinal)
+                                    && !string.Equals(el.GetString(), "false", StringComparison.OrdinalIgnoreCase)
+                                    && !string.IsNullOrWhiteSpace(el.GetString()),
+            _ => true
+        };
     }
 
     private static string ReadHealthState(JsonElement root)

@@ -10,6 +10,7 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http.Json;
+using Microsoft.Data.Sqlite;
 using Sentry;
 
 // =========== NEW IMPORTS FROM MODULARIZED STRUCTURE ===========
@@ -861,6 +862,43 @@ app.MapGet("/agent/player-chat/admin-calls", () =>
             perServerVolume = root["perServerVolume"] ?? new JsonObject(),
             dailySummaries = root["dailySummaries"] ?? new JsonArray()
         });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
+app.MapGet("/agent/players", (string? q, string? sort, int? limit, bool? forcedOnly) =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var dbPath = agentPaths.SemanticMemoryDbPath;
+    if (string.IsNullOrWhiteSpace(dbPath) || !File.Exists(dbPath))
+        return Results.Ok(new { players = Array.Empty<object>(), totalCount = 0 });
+
+    try
+    {
+        var rows = QueryPlayers(dbPath, q, sort, limit ?? 500, forcedOnly == true);
+        return Results.Ok(new { players = rows.Players, totalCount = rows.TotalCount, forcedCount = rows.ForcedCount });
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message, players = Array.Empty<object>() });
+    }
+});
+
+app.MapGet("/agent/players/{steamId}", (string steamId) =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var dbPath = agentPaths.SemanticMemoryDbPath;
+    if (string.IsNullOrWhiteSpace(dbPath) || !File.Exists(dbPath))
+        return Results.NotFound(new { error = "player db not found" });
+
+    try
+    {
+        var player = QueryPlayer(dbPath, steamId);
+        if (player is null) return Results.NotFound(new { error = "player not found", steamId });
+        return Results.Ok(player);
     }
     catch (Exception ex)
     {
@@ -3202,6 +3240,118 @@ static void SaveServerConfig(ServerConfig config)
 static int CountJsonFiles(string path) =>
     Directory.Exists(path) ? Directory.GetFiles(path, "*.json").Length : 0;
 
+static (List<object> Players, int TotalCount, int ForcedCount) QueryPlayers(string dbPath, string? q, string? sort, int limit, bool forcedOnly)
+{
+    limit = Math.Clamp(limit, 1, 5000);
+    var connStr = new SqliteConnectionStringBuilder
+    {
+        DataSource = dbPath,
+        Mode = SqliteOpenMode.ReadOnly,
+        Cache = SqliteCacheMode.Shared
+    }.ToString();
+
+    using var connection = new SqliteConnection(connStr);
+    connection.Open();
+
+    if (!PlayersTableExists(connection))
+        return (new List<object>(), 0, 0);
+
+    int totalCount;
+    int forcedCount;
+    using (var countCmd = connection.CreateCommand())
+    {
+        countCmd.CommandText = "SELECT COUNT(*), COALESCE(SUM(forced),0) FROM players;";
+        using var rdr = countCmd.ExecuteReader();
+        rdr.Read();
+        totalCount = rdr.GetInt32(0);
+        forcedCount = rdr.GetInt32(1);
+    }
+
+    var orderBy = sort switch
+    {
+        "name" => "display_name COLLATE NOCASE ASC",
+        "first" => "first_seen_utc DESC",
+        "sessions" => "total_sessions DESC",
+        _ => "last_seen_utc DESC"
+    };
+
+    var where = new List<string>();
+    if (forcedOnly) where.Add("forced = 1");
+    if (!string.IsNullOrWhiteSpace(q))
+        where.Add("(display_name LIKE $q COLLATE NOCASE OR steam_id LIKE $q OR alias_history_json LIKE $q COLLATE NOCASE)");
+    var whereSql = where.Count == 0 ? string.Empty : "WHERE " + string.Join(" AND ", where);
+
+    using var cmd = connection.CreateCommand();
+    cmd.CommandText = $"SELECT * FROM players {whereSql} ORDER BY {orderBy} LIMIT $limit;";
+    cmd.Parameters.AddWithValue("$limit", limit);
+    if (!string.IsNullOrWhiteSpace(q))
+        cmd.Parameters.AddWithValue("$q", "%" + q.Trim() + "%");
+
+    var players = new List<object>();
+    using var reader = cmd.ExecuteReader();
+    while (reader.Read()) players.Add(ReadPlayerRow(reader));
+    return (players, totalCount, forcedCount);
+}
+
+static object? QueryPlayer(string dbPath, string steamId)
+{
+    var connStr = new SqliteConnectionStringBuilder
+    {
+        DataSource = dbPath,
+        Mode = SqliteOpenMode.ReadOnly,
+        Cache = SqliteCacheMode.Shared
+    }.ToString();
+
+    using var connection = new SqliteConnection(connStr);
+    connection.Open();
+    if (!PlayersTableExists(connection)) return null;
+
+    using var cmd = connection.CreateCommand();
+    cmd.CommandText = "SELECT * FROM players WHERE steam_id = $sid LIMIT 1;";
+    cmd.Parameters.AddWithValue("$sid", steamId.Trim());
+    using var reader = cmd.ExecuteReader();
+    if (!reader.Read()) return null;
+    return ReadPlayerRow(reader);
+}
+
+static bool PlayersTableExists(SqliteConnection connection)
+{
+    using var cmd = connection.CreateCommand();
+    cmd.CommandText = "SELECT name FROM sqlite_master WHERE type='table' AND name='players' LIMIT 1;";
+    using var reader = cmd.ExecuteReader();
+    return reader.Read();
+}
+
+static object ReadPlayerRow(SqliteDataReader reader)
+{
+    return new
+    {
+        steamId = reader["steam_id"]?.ToString() ?? string.Empty,
+        displayName = reader["display_name"]?.ToString() ?? string.Empty,
+        aliases = TryParseStringList(reader["alias_history_json"]?.ToString()),
+        firstSeenUtc = reader["first_seen_utc"]?.ToString(),
+        lastSeenUtc = reader["last_seen_utc"]?.ToString(),
+        lastServer = reader["last_server"]?.ToString() ?? string.Empty,
+        totalSessions = reader["total_sessions"] is null or DBNull ? 0 : Convert.ToInt32(reader["total_sessions"]),
+        ipHistory = TryParseStringList(reader["ip_history_json"]?.ToString()),
+        lastIp = reader["last_ip"]?.ToString() ?? string.Empty,
+        lastChatMessage = reader["last_chat_message"]?.ToString() ?? string.Empty,
+        lastChatAtUtc = reader["last_chat_at_utc"]?.ToString(),
+        banState = reader["ban_state"]?.ToString() ?? string.Empty,
+        forced = reader["forced"] is not null and not DBNull && Convert.ToInt32(reader["forced"]) == 1,
+        forcedCheckedAtUtc = reader["forced_checked_utc"]?.ToString(),
+        notes = reader["notes"]?.ToString() ?? string.Empty,
+        updatedAtUtc = reader["updated_at_utc"]?.ToString()
+    };
+}
+
+static List<string> TryParseStringList(string? json)
+{
+    if (string.IsNullOrWhiteSpace(json)) return new List<string>();
+    try { return JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>(); }
+    catch { return new List<string>(); }
+}
+
 static int CountAdminChatMessages(AgentRuntimePaths agentPaths)
 {
     var chatPath = Path.Combine(agentPaths.NeoCortexRoot, "chat", "knowledge.json");
@@ -3284,37 +3434,13 @@ static void EnsureDerivedChatStats(JsonObject root)
 
 static bool LooksLikeAdminCall(string message, out string callType)
 {
-    var text = message.Trim().ToLowerInvariant();
     callType = string.Empty;
-
-    if (text.Contains("admin") || text.Contains("mod ") || text.Contains("moderator"))
-    {
-        callType = "admin-request";
-        return true;
-    }
-
-    if (text.Contains("cheater") || text.Contains("hacker") || text.Contains("aimbot") ||
-        text.Contains("esp") || text.Contains("scripting") || text.Contains("script user"))
-    {
-        callType = "cheater-report";
-        return true;
-    }
-
-    if (text.Contains("help") || text.Contains("stuck") || text.Contains("bug") ||
-        text.Contains("glitch") || text.Contains("not working") || text.Contains("can't") ||
-        text.Contains("cant "))
-    {
-        callType = "help-request";
-        return true;
-    }
-
-    if (text.Contains("grief") || text.Contains("toxic") || text.Contains("racist") ||
-        text.Contains("harass") || text.Contains("insult"))
-    {
-        callType = "player-report";
-        return true;
-    }
-
+    var text = (message ?? string.Empty).Trim();
+    if (text.Length < 6) return false;
+    if (AdminCallPatterns.Cheater.IsMatch(text)) { callType = "cheater-report"; return true; }
+    if (AdminCallPatterns.Admin.IsMatch(text))   { callType = "admin-request"; return true; }
+    if (AdminCallPatterns.Report.IsMatch(text))  { callType = "player-report"; return true; }
+    if (AdminCallPatterns.Help.IsMatch(text))    { callType = "help-request"; return true; }
     return false;
 }
 
@@ -4956,6 +5082,7 @@ static string BuildDashboardHtml() => """
       <button class="tab" data-target="agentGroup">Agent</button>
       <button class="tab" data-target="llmGroup">LLM</button>
       <button class="tab" data-target="serverMgmtGroup">Server Mgmt</button>
+      <button class="tab" data-target="playersGroup">Players</button>
     </div>
 
     <section id="serversGroup" class="section-group active">
@@ -5053,6 +5180,36 @@ static string BuildDashboardHtml() => """
         </div>
       </div>
     </section>
+
+    <section id="playersGroup" class="section-group">
+      <div class="grid">
+        <div class="card wide">
+          <h2>Players <span class="legend" data-tip="Per-player roster gathered from chat and join/auth/disconnect events. 'Forced' is polled from apps.rusticaland.net/all every 5 minutes.">?</span></h2>
+          <div class="toolbar" style="margin-bottom:12px;">
+            <div class="row" style="flex:2;">
+              <div><input id="playerSearch" type="text" placeholder="Search name, alias, or steam id"></div>
+              <div><label class="check"><input id="playerForcedOnly" type="checkbox"> Forced only</label></div>
+              <div><select id="playerSort" style="width:100%;border-radius:12px;border:1px solid var(--line);background:#09131d;color:var(--text);padding:11px 12px;">
+                <option value="last">Last seen</option>
+                <option value="first">First seen</option>
+                <option value="name">Name</option>
+                <option value="sessions">Sessions</option>
+              </select></div>
+            </div>
+            <div id="playersStatus" class="muted">Not loaded.</div>
+            <button type="button" id="playersReload">Reload</button>
+          </div>
+          <table>
+            <thead><tr><th>Name</th><th>Steam ID</th><th>Forced</th><th>Sessions</th><th>Last server</th><th>Last seen</th><th>Last chat</th></tr></thead>
+            <tbody id="playersList"></tbody>
+          </table>
+        </div>
+        <div class="card wide" id="playerDetailCard" style="display:none;">
+          <h2>Player Detail <button type="button" id="closePlayerDetail" class="ghost" style="margin-left:auto;padding:6px 12px;font-size:12px;">Close</button></h2>
+          <div id="playerDetailBody"></div>
+        </div>
+      </div>
+    </section>
   </div>
   <script>
     const $ = id => document.getElementById(id);
@@ -5071,6 +5228,24 @@ static string BuildDashboardHtml() => """
     const pill = state => { const s = (state || 'unknown').toLowerCase(); const cls = ['running','offline','failed','pending','active','inactive','degraded','ok','starting','remote'].includes(s) ? s : 'unknown'; return `<span class="pill ${cls}">${esc(state || 'unknown')}</span>`; };
     const item = (title, body, meta = '') => `<div class="item"><div style="font-weight:700;">${esc(title)}</div><div class="muted" style="margin-top:6px;">${esc(body || '')}</div>${meta ? `<div style="margin-top:8px;font-size:12px;color:var(--muted);">${meta}</div>` : ''}</div>`;
     const kv = (label, value) => `<div class="item"><div class="muted tiny">${esc(label)}</div><div style="margin-top:6px;font-weight:700;">${esc(value ?? 'n/a')}</div></div>`;
+
+    function collectPlayerNames(playersData) {
+      const out = new Set();
+      const players = playersData?.players || [];
+      for (const p of players) {
+        if (p?.displayName) out.add(String(p.displayName).toLowerCase());
+        for (const a of (p?.aliases || [])) {
+          if (a) out.add(String(a).toLowerCase());
+          // Tokenize compound names (e.g. "AternosHUN" → ["aternos","hun"]) so word-cloud
+          // doesn't pick up parts of names players type into chat.
+          const tokens = String(a || '').toLowerCase().match(/[a-z]{3,}/g) || [];
+          for (const t of tokens) out.add(t);
+        }
+        const tokens = String(p?.displayName || '').toLowerCase().match(/[a-z]{3,}/g) || [];
+        for (const t of tokens) out.add(t);
+      }
+      return Array.from(out);
+    }
 
     async function fetchJson(path, options = {}) {
       const response = await fetch(path, { ...options, headers: { 'X-Api-Key': keyInput.value.trim(), ...(options.headers || {}) } });
@@ -5372,7 +5547,8 @@ static string BuildDashboardHtml() => """
     async function load() {
       localStorage.setItem('rustops.apiKey', keyInput.value.trim());
       try {
-        const [summary, _, llmSummary, llmConfig, commandConfig, consoleData, chatData, adminCallData] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config'), fetchJson('/agent/console-monitor').catch(() => ({})), fetchJson('/agent/player-chat/recent').catch(() => ({})), fetchJson('/agent/player-chat/admin-calls').catch(() => ({}))]);
+        const [summary, _, llmSummary, llmConfig, commandConfig, consoleData, chatData, adminCallData, playersData] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config'), fetchJson('/agent/console-monitor').catch(() => ({})), fetchJson('/agent/player-chat/recent').catch(() => ({})), fetchJson('/agent/player-chat/admin-calls').catch(() => ({})), fetchJson('/agent/players?limit=2000').catch(() => ({}))]);
+        window.__playerRosterNames = collectPlayerNames(playersData);
         $('stamp').textContent = `Updated ${fmt(summary.generatedAtUtc)} | API ${summary.host.bindUrl}`;
         $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'local configured'), metric('Online', summary.counts?.onlineServers ?? 0, 'running'), metric('Remote', summary.counts?.remoteServers ?? 0, 'agent-backed'), metric('Incidents', summary.counts?.incidents ?? 0, 'tracked issues'), metric('Admin Calls', summary.counts?.adminChatMessages ?? 0, 'from player chat'), metric('LLM Calls', summary.counts?.llmCallsCount ?? 0, 'total interactions')].join('');
         renderServers(summary.servers || []);
@@ -5483,10 +5659,15 @@ static string BuildDashboardHtml() => """
       const today = new Date().toDateString();
       const todayMsgs = messages.filter(m => m.capturedAtUtc && new Date(m.capturedAtUtc).toDateString() === today);
 
-      // Word frequency (excluding common stopwords) — today only
+      // Word frequency (excluding common stopwords and player names) — today only
       const stopwords = new Set(['the','and','to','a','in','i','you','is','it','of','for','on','that','this','was','are','with','he','she','they','we','be','at','by','not','my','have','had','has','do','me','can','get','just','so','go','up','got','did','yeah','ok','im','its','but','no','yes','hey','lol','gg','wtf','idk',
         // additional filler / non-content words
         'like','what','how','when','why','who','where','all','if','been','from','will','would','could','should','dont','cant','wont','isnt','wasnt','your','their','our','his','her','then','than','more','also','still','even','some','into','over','out','off','too','here','there','now','after','before','back','just','about','because','because','again','while','might','need','want','think','know','see','way','time','day','guys','man','anyone','anyone','nothing','something','everything','thing','things','server','rust','game']);
+      // Exclude all known player names (case-insensitive) so they don't pollute the word cloud.
+      // Pull from current chat AND the persistent player roster (alias-aware).
+      for (const m of messages) { const n = (m.playerName||'').toLowerCase(); if (n.length >= 2) stopwords.add(n); }
+      const rosterNames = window.__playerRosterNames || [];
+      for (const n of rosterNames) { if (n && n.length >= 2) stopwords.add(n); }
       // Only count words that appear to be actual player language (exclude console/plugin prefixes)
       const isPlayerWord = w => w.length >= 3 && !/^(oxide|error|warning|info|debug|plugin|loading|loaded|unload|init|start|stop|null|true|false|void|http|https|www)$/.test(w);
       const freq = {};
@@ -5513,7 +5694,8 @@ static string BuildDashboardHtml() => """
     }
 
     function renderRecentPlayerMessages(data) {
-      const messages = data?.recentMessages || [];
+      const all = data?.recentMessages || [];
+      const messages = all.slice().sort((a,b) => new Date(b.capturedAtUtc) - new Date(a.capturedAtUtc)).slice(0,20);
       if (!messages.length) { $('recentMessages').innerHTML = '<div class="muted">No player messages captured yet.</div>'; return; }
       $('recentMessages').innerHTML = messages.map(msg => item(
         `${esc(msg.playerName || 'unknown')} @ ${esc(msg.serverName || 'unknown')}`,
@@ -5557,10 +5739,75 @@ static string BuildDashboardHtml() => """
       } catch (error) { alert(`Failed to save feedback: ${error.message}`); }
     }
 
+    async function loadPlayers() {
+      const status = $('playersStatus');
+      status.textContent = 'Loading…';
+      try {
+        const params = new URLSearchParams();
+        const q = $('playerSearch').value.trim();
+        if (q) params.set('q', q);
+        if ($('playerForcedOnly').checked) params.set('forcedOnly', 'true');
+        params.set('sort', $('playerSort').value);
+        params.set('limit', '500');
+        const data = await fetchJson('/agent/players?' + params.toString());
+        const players = data.players || [];
+        $('playersList').innerHTML = players.map(p => `
+          <tr style="cursor:pointer;" data-sid="${esc(p.steamId)}">
+            <td>${esc(p.displayName || '(unknown)')}</td>
+            <td class="tiny muted">${esc(p.steamId)}</td>
+            <td>${p.forced ? '<span class="pill running">YES</span>' : '<span class="muted tiny">no</span>'}</td>
+            <td>${p.totalSessions ?? 0}</td>
+            <td class="tiny">${esc(p.lastServer || '')}</td>
+            <td class="tiny muted">${esc(fmt(p.lastSeenUtc))}</td>
+            <td class="tiny muted" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(p.lastChatMessage || '')}</td>
+          </tr>`).join('');
+        status.textContent = `Showing ${players.length} of ${data.totalCount ?? players.length} (forced: ${data.forcedCount ?? 0}).`;
+        document.querySelectorAll('#playersList tr[data-sid]').forEach(row => {
+          row.addEventListener('click', () => loadPlayerDetail(row.dataset.sid));
+        });
+      } catch (error) {
+        status.textContent = `Error: ${error.message}`;
+        $('playersList').innerHTML = '';
+      }
+    }
+
+    async function loadPlayerDetail(steamId) {
+      try {
+        const p = await fetchJson('/agent/players/' + encodeURIComponent(steamId));
+        const card = $('playerDetailCard');
+        card.style.display = 'block';
+        $('playerDetailBody').innerHTML = `
+          <div class="kv">
+            ${kv('Display name', p.displayName || '(unknown)')}
+            ${kv('Steam ID', p.steamId)}
+            ${kv('Forced', p.forced ? 'YES' : 'no')}
+            ${kv('Forced checked', fmt(p.forcedCheckedAtUtc))}
+            ${kv('First seen', fmt(p.firstSeenUtc))}
+            ${kv('Last seen', fmt(p.lastSeenUtc))}
+            ${kv('Last server', p.lastServer)}
+            ${kv('Last IP', p.lastIp)}
+            ${kv('Total sessions', p.totalSessions)}
+            ${kv('Ban state', p.banState || '(none)')}
+          </div>
+          <div style="margin-top:14px;"><div class="muted tiny">Aliases</div><div class="chip-list">${(p.aliases || []).map(a => `<span class="chip">${esc(a)}</span>`).join('') || '<span class="muted tiny">none</span>'}</div></div>
+          <div style="margin-top:14px;"><div class="muted tiny">IP history</div><div class="chip-list">${(p.ipHistory || []).map(a => `<span class="chip">${esc(a)}</span>`).join('') || '<span class="muted tiny">none</span>'}</div></div>
+          <div style="margin-top:14px;"><div class="muted tiny">Last chat (${esc(fmt(p.lastChatAtUtc))})</div><div style="margin-top:6px;">${esc(p.lastChatMessage || '(none)')}</div></div>
+          ${p.notes ? `<div style="margin-top:14px;"><div class="muted tiny">Notes</div><pre>${esc(p.notes)}</pre></div>` : ''}`;
+        card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (error) { alert(`Failed to load player: ${error.message}`); }
+    }
+
+    $('playersReload').addEventListener('click', loadPlayers);
+    $('playerSearch').addEventListener('keydown', e => { if (e.key === 'Enter') loadPlayers(); });
+    $('playerForcedOnly').addEventListener('change', loadPlayers);
+    $('playerSort').addEventListener('change', loadPlayers);
+    $('closePlayerDetail').addEventListener('click', () => { $('playerDetailCard').style.display = 'none'; });
+
     tabs.forEach(tab => tab.addEventListener('click', () => {
       activateTab(tab.dataset.target);
       if (tab.dataset.target === 'agentGroup') loadIncidentFeedback();
       if (tab.dataset.target === 'serverMgmtGroup') loadRemoteServers();
+      if (tab.dataset.target === 'playersGroup') loadPlayers();
     }));
     $('refresh').addEventListener('click', () => { load(); loadIncidentFeedback(); });
     $('saveRules').addEventListener('click', saveRules);
@@ -6337,6 +6584,24 @@ public sealed class DashboardSelfRepairRun
     public int AppliedActions { get; set; }
     public int RejectedActions { get; set; }
     public string? RawModelReasoning { get; set; }
+}
+
+// Patterns are kept in sync with TryClassifyAdminCall in agent/Core/AgentRuntime.cs.
+// Word boundaries prevent false-triggers like "esp" matching "respawn".
+internal static class AdminCallPatterns
+{
+    public static readonly Regex Cheater = new(
+        @"\b(cheater|cheating|hacker|hacking|aimbot|aimlock|wallhack|wallhacking|esp|scripting|script user)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    public static readonly Regex Admin = new(
+        @"(?:^|\s)@?(admin|admins|moderator|moderators|staff|owner)\b|\b(any|some|an)\s+(admin|mod|moderator|staff)\b|\b(admin|mod|moderator)\s+(here|on|please|pls|plz|help|needed)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    public static readonly Regex Help = new(
+        @"\b(stuck|glitched|bugged|frozen|broken|softlocked)\b|\b(not\s+working|doesn'?t\s+work|won'?t\s+load|can'?t\s+(?:join|connect|spawn|move|build|craft|open))\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    public static readonly Regex Report = new(
+        @"\b(grief(?:ing|ed)?|toxic|racist|racism|harass(?:ing|ment)?|insult(?:ing)?|slur|slurs)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 }
 
 public sealed class DashboardServiceStatus

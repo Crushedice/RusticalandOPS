@@ -255,7 +255,11 @@ var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry, semanticMemory);
 var composer = new ResponseComposer(kernel, config.Llm);
 
-var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel);
+var playerStore = new PlayerStore(
+    config.Memory.DatabasePath,
+    config.Memory.DebugLoggingEnabled ? message => Console.WriteLine($"[player-db] {message}") : null);
+
+var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel, playerStore);
 
 // Eagerly open RCON sessions to remote servers so the chat-monitor subscriber (registered
 // inside AgentRuntime's ctor) starts receiving unsolicited messages immediately. Without

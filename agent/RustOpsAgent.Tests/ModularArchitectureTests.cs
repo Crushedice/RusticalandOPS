@@ -35,8 +35,8 @@ public class ModularArchitectureTests
         Assert.Equal(1, CountOccurrences(source, "new SemanticMemoryService("));
         Assert.Contains("new AdminIntentClassifier(kernel, config.Llm, neoCortex, semanticMemory);", source);
         Assert.Contains("new ActionExecutor(registry, semanticMemory);", source);
-        Assert.Contains("new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer),", source);
-        Assert.Contains("new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel);", source);
+        Assert.Contains("new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer, catalogIndexStore),", source);
+        Assert.Contains("new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel, playerStore);", source);
     }
 
     // ── NeoCortex ──────────────────────────────────────────────────────────────
