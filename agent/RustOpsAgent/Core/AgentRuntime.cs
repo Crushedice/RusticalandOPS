@@ -2421,15 +2421,14 @@ Recent player chat (newest last):
             var body = await resp.Content.ReadAsStringAsync(cancellationToken);
             if (string.IsNullOrWhiteSpace(body)) return;
 
-            var state = ParseForcedListPayload(body);
-            if (state.Count == 0)
+            var entries = ParseForcedListPayload(body);
+            if (entries.Count == 0)
             {
                 Console.WriteLine("[forced] poll returned no entries.");
                 return;
             }
-            _playerStore.ApplyForcedList(state);
-            var forcedCount = state.Count(kv => kv.Value);
-            Console.WriteLine($"[forced] applied {state.Count} entries ({forcedCount} forced).");
+            _playerStore.ApplyForcedList(entries);
+            Console.WriteLine($"[forced] applied {entries.Count} forced entries.");
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -2438,11 +2437,16 @@ Recent player chat (newest last):
         }
     }
 
-    // Tolerant parser: accepts either an object map { "<sid>": true|"yes"|... } or
-    // an array of objects/strings. Steam IDs must look like 7656...17 digits.
-    private static Dictionary<string, bool> ParseForcedListPayload(string body)
+    // The actual /all endpoint returns an array of forced players, e.g.:
+    //   [{ "CurTimestamp": "Yes", "usedIP": null, "userID": 76561199645683644, "userName": "hophop" }]
+    // Presence in the array implies forced=true (entries that aren't forced just don't appear).
+    // userID is a JSON number, not a string. CurTimestamp == "Yes" means forced but not yet
+    // logged in via the launcher — still forced from our perspective.
+    //
+    // Also tolerated for resilience: { "<sid>": true|... } object map and string-array shapes.
+    private static List<ForcedListEntry> ParseForcedListPayload(string body)
     {
-        var result = new Dictionary<string, bool>(StringComparer.Ordinal);
+        var result = new List<ForcedListEntry>();
         try
         {
             using var doc = JsonDocument.Parse(body);
@@ -2451,8 +2455,8 @@ Recent player chat (newest last):
             {
                 foreach (var prop in root.EnumerateObject())
                 {
-                    if (!IsSteamId(prop.Name)) continue;
-                    result[prop.Name] = ReadForcedBool(prop.Value);
+                    if (IsSteamId(prop.Name) && ReadForcedBool(prop.Value))
+                        result.Add(new ForcedListEntry(prop.Name, null, null));
                 }
             }
             else if (root.ValueKind == JsonValueKind.Array)
@@ -2462,29 +2466,25 @@ Recent player chat (newest last):
                     if (entry.ValueKind == JsonValueKind.String)
                     {
                         var sid = entry.GetString();
-                        if (sid is not null && IsSteamId(sid)) result[sid] = true;
+                        if (sid is not null && IsSteamId(sid))
+                            result.Add(new ForcedListEntry(sid, null, null));
                     }
                     else if (entry.ValueKind == JsonValueKind.Object)
                     {
                         string? sid = null;
-                        bool forced = true;
+                        string? name = null;
+                        string? ip = null;
                         foreach (var prop in entry.EnumerateObject())
                         {
-                            if (sid is null && (prop.Name.Equals("steamId", StringComparison.OrdinalIgnoreCase)
-                                || prop.Name.Equals("steam_id", StringComparison.OrdinalIgnoreCase)
-                                || prop.Name.Equals("id", StringComparison.OrdinalIgnoreCase)))
-                            {
-                                sid = prop.Value.ValueKind == JsonValueKind.String
-                                    ? prop.Value.GetString()
-                                    : prop.Value.ToString();
-                            }
-                            else if (prop.Name.Equals("forced", StringComparison.OrdinalIgnoreCase)
-                                || prop.Name.Equals("state", StringComparison.OrdinalIgnoreCase))
-                            {
-                                forced = ReadForcedBool(prop.Value);
-                            }
+                            if (sid is null && IsIdField(prop.Name))
+                                sid = ReadFlexibleString(prop.Value);
+                            else if (name is null && IsNameField(prop.Name))
+                                name = prop.Value.ValueKind == JsonValueKind.String ? prop.Value.GetString() : null;
+                            else if (ip is null && IsIpField(prop.Name))
+                                ip = prop.Value.ValueKind == JsonValueKind.String ? prop.Value.GetString() : null;
                         }
-                        if (sid is not null && IsSteamId(sid)) result[sid] = forced;
+                        if (sid is not null && IsSteamId(sid))
+                            result.Add(new ForcedListEntry(sid, name, ip));
                     }
                 }
             }
@@ -2494,6 +2494,30 @@ Recent player chat (newest last):
 
         static bool IsSteamId(string s) =>
             s.Length == 17 && s.StartsWith("7656", StringComparison.Ordinal) && s.All(char.IsDigit);
+
+        static bool IsIdField(string name) =>
+            name.Equals("userID", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("userId", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("steamId", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("steam_id", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("id", StringComparison.OrdinalIgnoreCase);
+
+        static bool IsNameField(string name) =>
+            name.Equals("userName", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("name", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("displayName", StringComparison.OrdinalIgnoreCase);
+
+        static bool IsIpField(string name) =>
+            name.Equals("usedIP", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("ip", StringComparison.OrdinalIgnoreCase) ||
+            name.Equals("lastIp", StringComparison.OrdinalIgnoreCase);
+
+        static string? ReadFlexibleString(JsonElement el) => el.ValueKind switch
+        {
+            JsonValueKind.String => el.GetString(),
+            JsonValueKind.Number => el.GetRawText(),
+            _ => null
+        };
 
         static bool ReadForcedBool(JsonElement el) => el.ValueKind switch
         {

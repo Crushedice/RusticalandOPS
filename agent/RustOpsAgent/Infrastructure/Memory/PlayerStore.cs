@@ -161,9 +161,9 @@ internal sealed class PlayerStore
         }
     }
 
-    public void ApplyForcedList(IReadOnlyDictionary<string, bool> stateBySteamId)
+    public void ApplyForcedList(IReadOnlyList<ForcedListEntry> entries)
     {
-        if (stateBySteamId.Count == 0) return;
+        if (entries.Count == 0) return;
         try
         {
             using var connection = new SqliteConnection(_connectionString);
@@ -180,9 +180,29 @@ internal sealed class PlayerStore
                 clear.ExecuteNonQuery();
             }
 
-            foreach (var (sid, forced) in stateBySteamId)
+            foreach (var entry in entries)
             {
-                if (string.IsNullOrWhiteSpace(sid)) continue;
+                if (string.IsNullOrWhiteSpace(entry.SteamId)) continue;
+                var sid = entry.SteamId.Trim();
+                var name = (entry.DisplayName ?? string.Empty).Trim();
+                var ip = (entry.LastIp ?? string.Empty).Trim();
+
+                // Read existing aliases / IP history so we can append rather than replace.
+                var existing = LoadInternal(connection, sid);
+                var aliases = existing?.Aliases ?? new List<string>();
+                if (!string.IsNullOrEmpty(name) &&
+                    !aliases.Contains(name, StringComparer.OrdinalIgnoreCase))
+                {
+                    aliases.Add(name);
+                    if (aliases.Count > 25) aliases.RemoveAt(0);
+                }
+                var ips = existing?.IpHistory ?? new List<string>();
+                if (!string.IsNullOrEmpty(ip) && !ips.Contains(ip, StringComparer.Ordinal))
+                {
+                    ips.Add(ip);
+                    if (ips.Count > 25) ips.RemoveAt(0);
+                }
+
                 using var cmd = connection.CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText =
@@ -193,17 +213,24 @@ internal sealed class PlayerStore
                         last_chat_message, last_chat_at_utc, ban_state, forced, forced_checked_utc,
                         notes, metadata_json, updated_at_utc)
                     VALUES (
-                        $sid, '', '[]', $now, $now,
-                        '', 0, '[]', '',
-                        '', NULL, '', $forced, $now,
+                        $sid, $name, $aliases, $now, $now,
+                        '', 0, $ips, $lastip,
+                        '', NULL, '', 1, $now,
                         '', '{}', $now)
                     ON CONFLICT(steam_id) DO UPDATE SET
-                        forced = excluded.forced,
+                        display_name = CASE WHEN length(excluded.display_name) > 0 THEN excluded.display_name ELSE players.display_name END,
+                        alias_history_json = excluded.alias_history_json,
+                        ip_history_json = excluded.ip_history_json,
+                        last_ip = CASE WHEN length(excluded.last_ip) > 0 THEN excluded.last_ip ELSE players.last_ip END,
+                        forced = 1,
                         forced_checked_utc = excluded.forced_checked_utc,
                         updated_at_utc = excluded.updated_at_utc;
                     """;
-                cmd.Parameters.AddWithValue("$sid", sid.Trim());
-                cmd.Parameters.AddWithValue("$forced", forced ? 1 : 0);
+                cmd.Parameters.AddWithValue("$sid", sid);
+                cmd.Parameters.AddWithValue("$name", name);
+                cmd.Parameters.AddWithValue("$aliases", JsonSerializer.Serialize(aliases));
+                cmd.Parameters.AddWithValue("$ips", JsonSerializer.Serialize(ips));
+                cmd.Parameters.AddWithValue("$lastip", ip);
                 cmd.Parameters.AddWithValue("$now", now);
                 cmd.ExecuteNonQuery();
             }
@@ -328,6 +355,8 @@ internal sealed class PlayerStore
         return Convert.ToInt32(value);
     }
 }
+
+internal sealed record ForcedListEntry(string SteamId, string? DisplayName, string? LastIp);
 
 internal sealed class PlayerRecord
 {
