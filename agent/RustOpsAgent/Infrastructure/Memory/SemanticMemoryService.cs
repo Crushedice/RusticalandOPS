@@ -806,16 +806,17 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
         foreach (var result in results)
         {
             var record = result.MemoryRecord;
-            var block =
-                "Relevant Memory:\n" +
-                $"- Type: {record.Type}\n" +
-                $"- Scope: {record.Scope}\n" +
-                $"- Summary: {TrimSingleLine(record.Summary, 220)}\n" +
-                $"- Why relevant: {result.MatchReason} (score {result.FinalScore:F2})\n" +
-                $"- Confidence: {record.Confidence:F2}\n" +
-                $"- Created: {record.CreatedAtUtc:O}\n" +
-                $"- Last used: {(record.LastAccessedAtUtc?.ToString("O") ?? "never")}\n" +
-                $"- Source: {record.Source}\n";
+            var block = IsCatalogType(record.Type)
+                ? $"[{record.Type}] {TrimSingleLine(record.Summary, 180)} :: {TrimSingleLine(record.Text, 240)}\n"
+                : "Relevant Memory:\n" +
+                  $"- Type: {record.Type}\n" +
+                  $"- Scope: {record.Scope}\n" +
+                  $"- Summary: {TrimSingleLine(record.Summary, 220)}\n" +
+                  $"- Why relevant: {result.MatchReason} (score {result.FinalScore:F2})\n" +
+                  $"- Confidence: {record.Confidence:F2}\n" +
+                  $"- Created: {record.CreatedAtUtc:O}\n" +
+                  $"- Last used: {(record.LastAccessedAtUtc?.ToString("O") ?? "never")}\n" +
+                  $"- Source: {record.Source}\n";
 
             if (maxChars > 0 && builder.Length + block.Length > maxChars)
             {
@@ -833,6 +834,9 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
 
         return builder.ToString().Trim();
     }
+
+    private static bool IsCatalogType(MemoryRecordType type) =>
+        type is MemoryRecordType.ServerConvar or MemoryRecordType.ServerCommand or MemoryRecordType.PluginSummary;
 
     private static string BuildEmbeddingText(string summary, string text)
     {

@@ -125,7 +125,7 @@ internal sealed class RustChatToolHandler : IToolHandler
             var openIncidents = 0;
             try
             {
-                var review = _memory.ReviewAsync(CancellationToken.None).GetAwaiter().GetResult();
+                var review = await _memory.ReviewAsync(cancellationToken);
                 openIncidents = review.OpenIncidents.Count;
             }
             catch { /* non-critical */ }
@@ -513,7 +513,7 @@ internal sealed class RustChatToolHandler : IToolHandler
             })
             .Where(item => item.Score > 0)
             .OrderByDescending(item => item.Score)
-            .Take(5)
+            .Take(3)
             .Select(item => item.Record)
             .ToList();
 
@@ -557,17 +557,19 @@ internal sealed class RustChatToolHandler : IToolHandler
             lowered.Contains("show me", StringComparison.Ordinal) ||
             lowered.Contains("list ", StringComparison.Ordinal);
 
-        // Must reference plugin / oxide concepts OR a feature class. Note: "command" alone is
-        // accepted because questions like "what commands can players use from X" are common.
-        // The relevance-scoring step filters out plugins that don't actually match the keywords.
+        // Must reference plugin / oxide concepts explicitly, OR use a qualifier that only makes
+        // sense for plugins (chat/console command, oxide permission). Bare "command"/"permission"/
+        // "hook" used to fire this path too — but those words match Rust server convar questions
+        // too, leading to plugin-internal dumps for unrelated queries.
         var hasPluginContext =
             lowered.Contains("plugin", StringComparison.Ordinal) ||
             lowered.Contains("oxide", StringComparison.Ordinal) ||
             lowered.Contains("umod", StringComparison.Ordinal) ||
-            lowered.Contains("command", StringComparison.Ordinal) ||
-            lowered.Contains("hook", StringComparison.Ordinal) ||
-            lowered.Contains("permission", StringComparison.Ordinal) ||
-            lowered.Contains("config key", StringComparison.Ordinal);
+            lowered.Contains("chat command", StringComparison.Ordinal) ||
+            lowered.Contains("console command", StringComparison.Ordinal) ||
+            lowered.Contains("config key", StringComparison.Ordinal) ||
+            lowered.Contains("oxide permission", StringComparison.Ordinal) ||
+            lowered.Contains("plugin hook", StringComparison.Ordinal);
 
         if (!isQuestion || !hasPluginContext)
             return new PluginQueryIntent(PluginQueryKind.None, false);
@@ -739,7 +741,7 @@ internal sealed class RustChatToolHandler : IToolHandler
                     .OrderByDescending(command => MatchesKeyword(command.Command))
                     .ThenBy(command => command.Command, StringComparer.OrdinalIgnoreCase)
                     .Distinct()
-                    .Take(8)
+                    .Take(5)
                     .Select(command => "  - /" + command.Command.TrimStart('/') +
                         (string.IsNullOrWhiteSpace(command.RequiredPermission) ? string.Empty : $" (perm: {command.RequiredPermission})"))
                     .ToList();
@@ -754,7 +756,7 @@ internal sealed class RustChatToolHandler : IToolHandler
                     .OrderByDescending(command => MatchesKeyword(command.Command))
                     .ThenBy(command => command.Command, StringComparer.OrdinalIgnoreCase)
                     .Distinct()
-                    .Take(8)
+                    .Take(5)
                     .Select(command => "  - " + command.Command.TrimStart('/'))
                     .ToList();
                 return commands.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', commands)}";
@@ -785,7 +787,7 @@ internal sealed class RustChatToolHandler : IToolHandler
                     .OrderByDescending(MatchesKeyword)
                     .ThenBy(permission => permission, StringComparer.OrdinalIgnoreCase)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Take(8)
+                    .Take(5)
                     .Select(permission => "  - " + permission)
                     .ToList();
                 return perms.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', perms)}";
@@ -797,7 +799,7 @@ internal sealed class RustChatToolHandler : IToolHandler
                     .OrderByDescending(MatchesKeyword)
                     .ThenBy(hook => hook, StringComparer.OrdinalIgnoreCase)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Take(8)
+                    .Take(5)
                     .Select(hook => "  - " + hook)
                     .ToList();
                 return hooks.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', hooks)}";
@@ -809,7 +811,7 @@ internal sealed class RustChatToolHandler : IToolHandler
                     .OrderByDescending(MatchesKeyword)
                     .ThenBy(key => key, StringComparer.OrdinalIgnoreCase)
                     .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .Take(8)
+                    .Take(5)
                     .Select(key => "  - " + key)
                     .ToList();
                 return configKeys.Count == 0 ? string.Empty : $"{pluginHeader}\n{string.Join('\n', configKeys)}";
@@ -873,6 +875,35 @@ internal sealed class RustChatToolHandler : IToolHandler
 
     private ToolExecutionResult? TryHandleCatalogQuestion(ToolExecutionContext context)
     {
+        var snapshot = _knowledge.GetSnapshot();
+
+        // 1. Direct dotted-identifier lookup ("what does ai.npc_spawn_per_tick do?"). One-record answer.
+        var mention = _knowledge.FindMentionedEntry(context.Message);
+        if (mention is not null)
+        {
+            string single;
+            if (mention.EntryType == CatalogEntryType.Variable &&
+                _knowledge.TryGetVariable(mention.Name, out var variable) && variable is not null)
+            {
+                single = "From the server catalog:\n" + FormatVariableLine(variable);
+            }
+            else if (mention.EntryType == CatalogEntryType.Command &&
+                     _knowledge.TryGetCommand(mention.Name, out var command) && command is not null)
+            {
+                single = "From the server catalog:\n" + FormatCommandLine(command);
+            }
+            else
+            {
+                single = $"From the server catalog: `{mention.Name}` — {mention.Description ?? "no description recorded"}.";
+            }
+
+            return new ToolExecutionResult(
+                true,
+                single,
+                Payload: new { source = "server-catalog", match = mention.Name, kind = mention.EntryType.ToString() },
+                ErrorCode: "authoritative_catalog");
+        }
+
         var lowered = context.Message.ToLowerInvariant();
         var looksLikeConvarQuestion =
             lowered.Contains("convar", StringComparison.Ordinal) ||
@@ -887,12 +918,11 @@ internal sealed class RustChatToolHandler : IToolHandler
             return null;
         }
 
-        var snapshot = _knowledge.GetSnapshot();
         var variableMatches = looksLikeConvarQuestion
-            ? _knowledge.SearchVariables(context.Message, 10)
+            ? _knowledge.SearchVariables(context.Message, 30)
             : Array.Empty<ServerVariableDefinition>();
         var commandMatches = looksLikeCommandQuestion
-            ? _knowledge.SearchCommands(context.Message, 10)
+            ? _knowledge.SearchCommands(context.Message, 30)
             : Array.Empty<ServerCommandDefinition>();
 
         if (variableMatches.Count == 0 && commandMatches.Count == 0)
@@ -906,16 +936,36 @@ internal sealed class RustChatToolHandler : IToolHandler
         var lines = new List<string>();
         if (variableMatches.Count > 0)
         {
-            lines.Add("Matching convars:");
-            lines.AddRange(variableMatches.Select(FormatVariableLine));
+            // If the result set is large, prefer a category-grouped overview to avoid dumping a flat
+            // list of 10+ items. Admins can drill in with /convar-index search <prefix> for detail.
+            if (variableMatches.Count > 6)
+            {
+                lines.Add($"Matching convars by category ({variableMatches.Count} total — top categories shown):");
+                lines.AddRange(SummarizeVariablesByCategory(variableMatches));
+                lines.Add(string.Empty);
+                lines.Add("Use `/convar-index search <category>.<term>` to drill in, or `/convar-index get <name>` for one entry.");
+            }
+            else
+            {
+                lines.Add("Matching convars:");
+                lines.AddRange(variableMatches.Select(FormatVariableLine));
+            }
         }
 
         if (commandMatches.Count > 0)
         {
             if (lines.Count > 0)
                 lines.Add(string.Empty);
-            lines.Add("Matching server commands:");
-            lines.AddRange(commandMatches.Select(FormatCommandLine));
+            if (commandMatches.Count > 6)
+            {
+                lines.Add($"Matching server commands by category ({commandMatches.Count} total — top categories shown):");
+                lines.AddRange(SummarizeCommandsByCategory(commandMatches));
+            }
+            else
+            {
+                lines.Add("Matching server commands:");
+                lines.AddRange(commandMatches.Select(FormatCommandLine));
+            }
         }
 
         var message = "From the local server catalog:\n" + string.Join('\n', lines);
@@ -1010,6 +1060,38 @@ internal sealed class RustChatToolHandler : IToolHandler
         var description = string.IsNullOrWhiteSpace(command.Description) ? "No description in catalog." : command.Description;
         var risk = string.IsNullOrWhiteSpace(command.RiskLevel) ? string.Empty : $"; risk `{command.RiskLevel}`";
         return $"- `{command.Name}` - {description}{risk}";
+    }
+
+    private static IEnumerable<string> SummarizeVariablesByCategory(IEnumerable<ServerVariableDefinition> matches) =>
+        matches
+            .GroupBy(v => CategoryOf(v.Name), StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(6)
+            .Select(g =>
+            {
+                var examples = string.Join(", ",
+                    g.OrderBy(v => v.Name, StringComparer.OrdinalIgnoreCase).Take(4).Select(v => $"`{v.Name}`"));
+                return $"- `{g.Key}.*` — {g.Count()} convar(s); e.g. {examples}";
+            });
+
+    private static IEnumerable<string> SummarizeCommandsByCategory(IEnumerable<ServerCommandDefinition> matches) =>
+        matches
+            .GroupBy(c => CategoryOf(c.Name), StringComparer.OrdinalIgnoreCase)
+            .OrderByDescending(g => g.Count())
+            .ThenBy(g => g.Key, StringComparer.OrdinalIgnoreCase)
+            .Take(6)
+            .Select(g =>
+            {
+                var examples = string.Join(", ",
+                    g.OrderBy(c => c.Name, StringComparer.OrdinalIgnoreCase).Take(4).Select(c => $"`{c.Name}`"));
+                return $"- `{g.Key}.*` — {g.Count()} command(s); e.g. {examples}";
+            });
+
+    private static string CategoryOf(string name)
+    {
+        var idx = name.IndexOf('.');
+        return idx > 0 ? name[..idx] : "(other)";
     }
 
     private static string BuildVariableMemoryText(ServerVariableDefinition variable) =>
