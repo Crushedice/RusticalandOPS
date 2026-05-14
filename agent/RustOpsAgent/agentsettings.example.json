@@ -106,7 +106,8 @@
       "windowMinutes": 10,
       "cooldownMinutes": 30,
       "callTypes": ["cheater-report", "admin-request"],
-      "rconCommand": ""
+      "rconCommand": "",
+      "addAccusedToForcedList": false
     }
   },
   "webSearch": {

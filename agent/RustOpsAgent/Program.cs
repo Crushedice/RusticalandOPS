@@ -248,7 +248,8 @@ var handlers = new List<IToolHandler>
     new RustFileEditToolHandler(apiClient, gitOps, config.GitOps, semanticMemory),
     new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer, catalogIndexStore),
     new RustServerManagementToolHandler(apiClient),
-    new RustForcedPlayerToolHandler(playerStore)
+    new RustForcedPlayerToolHandler(playerStore),
+    new RustScheduleToolHandler(neoCortex)
 };
 
 if (config.WebSearch.Enabled)

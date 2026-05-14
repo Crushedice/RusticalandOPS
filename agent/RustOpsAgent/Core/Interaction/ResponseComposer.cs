@@ -48,35 +48,43 @@ internal sealed class ResponseComposer : IResponseComposer
                 aggregateMessage);
         }
 
-        // Bypass LLM for confirmed direct actions (MutatedState=true) — the tool message is
-        // authoritative and a small local model hallucinates "already ongoing" style responses
-        // when conversation history contains a prior action of the same type.
-        if (!result.Success)
+        var payloadPreview = result.Payload?.ToString();
+        if (!string.IsNullOrWhiteSpace(payloadPreview) && payloadPreview.Length > 1200)
+            payloadPreview = payloadPreview[..1200];
+
+        // If the LLM is disabled or unavailable, fall back to the tool's own message verbatim.
+        // Otherwise we let the LLM rephrase ALL outcomes (success, failure, mutated) — gated by a
+        // strict "ground-truth" prompt below that forbids inventing facts. This is what makes the
+        // agent feel like a conversation partner instead of a hardcoded status board.
+        if (_kernel is null || !_settings.Enabled)
         {
             var fallback = ComposeFallback(result);
             return new ComposedReply(
                 fallback,
-                "response-compose-error",
+                "response-compose-fallback",
                 false, false,
-                "template_error",
-                fallback.Length > 180 ? fallback[..180] : fallback);
+                !_settings.Enabled ? "template_llm_disabled" : "template_no_kernel",
+                fallback);
         }
 
-        if (result.MutatedState)
+        // Special-case: pure mutated action with empty payload and a trivial tool message — keep
+        // the template so admins get deterministic confirmations on critical ops (start/stop/wipe).
+        // Heuristic: tool message is short and looks like a status confirmation.
+        var isTrivialMutation = result.MutatedState && result.Success &&
+            string.IsNullOrWhiteSpace(payloadPreview) &&
+            result.Message.Length <= 80 &&
+            !result.Message.Contains('\n');
+        if (isTrivialMutation)
         {
             return new ComposedReply(
                 result.Message,
                 "response-compose-direct",
                 false, false,
                 "template_direct_action",
-                result.Message.Length > 180 ? result.Message[..180] : result.Message);
+                result.Message);
         }
 
-        var payloadPreview = result.Payload?.ToString();
-        if (!string.IsNullOrWhiteSpace(payloadPreview) && payloadPreview.Length > 1200)
-            payloadPreview = payloadPreview[..1200];
-
-        // If the tool succeeded but returned no payload data, do NOT let the LLM invent content.
+        // For success+no-payload, we have nothing for the LLM to enrich. Echo the tool message.
         if (result.Success && result.Payload is null && string.IsNullOrWhiteSpace(payloadPreview))
         {
             var message = string.IsNullOrWhiteSpace(result.Message)
@@ -90,20 +98,13 @@ internal sealed class ResponseComposer : IResponseComposer
                 message.Length > 180 ? message[..180] : message);
         }
 
-        if (_kernel is null || !_settings.Enabled)
-        {
-            var fallback = ComposeFallback(result);
-            return new ComposedReply(
-                fallback,
-                "response-compose-fallback",
-                false, false,
-                !_settings.Enabled ? "template_llm_disabled" : "template_no_kernel",
-                fallback);
-        }
-
         var conversationHistory = BuildConversationHistory(context.SelectionState);
         var memoryContext = BuildMemoryContext(context);
         var systemPrompt = BuildSystemPrompt();
+
+        var outcomeLine = result.Success
+            ? (result.MutatedState ? "The action was executed successfully (state changed)." : "The query succeeded.")
+            : $"The action FAILED (error_code={result.ErrorCode ?? "unknown"}).";
 
         var prompt = $$"""
 {{systemPrompt}}
@@ -111,33 +112,28 @@ internal sealed class ResponseComposer : IResponseComposer
 {{conversationHistory}}
 Agent capabilities — use these when framing your reply or suggesting relevant follow-up actions:
 - Server control: start, stop, restart, kill, update, wipe any managed server
-- RCON commands sent live to a running server:
-    brd <text>               → broadcast message to ALL players on the server
-    spk <steamId>,<text>    → private message to a specific player by SteamID64
-    status / playerlist / bans / oxide.plugins / version / serverinfo
-    Any convar: ai.move, decay.scale, fps.limit, server.fps, env.time, craft.instant, etc.
-- Player lookup: online player list, ban list, kick
-- Config file editing: read or modify server config (worldsize, maxplayers, hostname, seed, port…)
-- Status & logs: server health, console errors, network interfaces, log inspection
-- Plugin troubleshooting: compile errors, oxide/umod issues, plugin info lookup
-- Server management: register/remove remote servers, update RCON credentials
-- Memory: recall past incidents, actions, server facts
-- Web search: look up Rust / oxide / umod documentation
+- RCON commands: brd, spk, status, playerlist, bans, oxide.plugins, version, serverinfo, convars
+- Player lookup, config file editing, status & logs, plugin troubleshooting, server management
+- Memory recall, web search, scheduled/recurring tasks
 
-Operational context:
+Operational context (THIS is your ground truth — do NOT contradict, embellish, or fabricate):
 - Admin said: "{{context.Message}}"
 - Detected intent: {{context.Route.Intent}}
 - Server targeted: {{result.SelectedServer ?? context.Route.Slots.ServerName ?? "none"}}
-- Action succeeded: {{result.Success}}
-- Tool result: {{result.Message}}
-{{(string.IsNullOrWhiteSpace(payloadPreview) ? string.Empty : $"- Data: {payloadPreview}")}}
+- {{outcomeLine}}
+- Tool's verbatim message: "{{result.Message}}"
+{{(string.IsNullOrWhiteSpace(payloadPreview) ? string.Empty : $"- Data payload: {payloadPreview}")}}
 
 {{memoryContext}}
 
-Write a direct, natural reply to the admin. Be concise (under 100 words unless details genuinely require more). Do not mention internal routing, error codes, or tool names. Speak like a knowledgeable ops colleague — not a system message.
-DO NOT use future tense ("I will", "I'll", "let me check"). Only describe what the tool already did or found.
-If the tool returned no data for part of the request, say "not found" for that part - do not speculate.
-When the result is partial or unclear, suggest a concrete follow-up action the admin can take.
+Reply to the admin in 1–3 short sentences (longer ONLY when listing data the admin clearly asked for).
+Rules — VIOLATING ANY OF THESE BREAKS THE SYSTEM:
+- NEVER use future tense ("I will", "I'll", "let me check"). Past/present only.
+- NEVER invent server names, file paths, plugin names, players, counts, or config values not in the context above.
+- NEVER claim something succeeded if outcome says FAILED, and vice versa.
+- If the action failed, say what failed in plain language and suggest one concrete next step.
+- If the result is a list/data, summarize the count and highlight what matters; do not enumerate everything.
+- Sound like a sharp ops colleague — direct, no jargon about routing or tool names.
 """;
 
         try

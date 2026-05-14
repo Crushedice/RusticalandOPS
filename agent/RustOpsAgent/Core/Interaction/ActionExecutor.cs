@@ -40,7 +40,11 @@ internal sealed class ActionExecutor : IActionExecutor
         // Multi-step sequence: execute steps in order, stop on first failure unless the step
         // is non-blocking. Each step runs as its own ToolExecutionContext with a synthesised
         // route so the existing per-handler logic doesn't need to know about sequencing.
-        if (context.Route.Steps is { Count: > 1 } steps)
+        //
+        // EXCEPTION: ScheduleTask carries its action steps as a payload to be stored, NOT
+        // executed now. The scheduler handler reads route.Steps to persist them.
+        if (context.Route.Steps is { Count: > 1 } steps &&
+            context.Route.Intent != AdminIntentType.ScheduleTask)
         {
             return await ExecuteSequenceAsync(context, steps, cancellationToken);
         }

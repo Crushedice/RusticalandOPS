@@ -184,6 +184,10 @@ internal sealed class AdminCallNotifySettings
     // Optional RCON command to execute when threshold triggers. Placeholders:
     // {server}, {count}, {accusedName}, {accusedSteamId}. Empty/null disables the action.
     [JsonPropertyName("rconCommand")] public string? RconCommand { get; set; }
+
+    // When true and a SteamID is extracted from the reports, automatically add the accused
+    // player to the rusticaland launcher forced list.
+    [JsonPropertyName("addAccusedToForcedList")] public bool AddAccusedToForcedList { get; set; }
 }
 
 internal sealed class StandInAdminSettings

@@ -120,6 +120,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             string? configValue = null;
             var scopeKind = ServerScopeKind.Unspecified;
             List<string>? serverNames = null;
+            ScheduleSpec? schedule = null;
 
             if (root.TryGetProperty("slots", out var slots) && slots.ValueKind == JsonValueKind.Object)
             {
@@ -133,6 +134,19 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
                 scopeKind = slots.TryGetProperty("scopeKind", out var scopeNode)
                     ? ParseScopeKind(scopeNode.GetString())
                     : ServerScopeKind.Unspecified;
+
+                if (slots.TryGetProperty("schedule", out var schedNode) && schedNode.ValueKind == JsonValueKind.Object)
+                {
+                    var cadence = schedNode.TryGetProperty("cadence", out var cad) ? cad.GetString() ?? "once" : "once";
+                    var dow = schedNode.TryGetProperty("dayOfWeek", out var d) ? d.GetString() : null;
+                    var tod = schedNode.TryGetProperty("timeOfDay", out var t) ? t.GetString() : null;
+                    int? interval = null;
+                    if (schedNode.TryGetProperty("intervalMinutes", out var im) && im.ValueKind == JsonValueKind.Number)
+                        interval = im.GetInt32();
+                    var rseed = schedNode.TryGetProperty("randomizeSeed", out var rs) && rs.ValueKind == JsonValueKind.True;
+                    var desc = schedNode.TryGetProperty("description", out var ds) ? ds.GetString() : null;
+                    schedule = new ScheduleSpec(cadence, dow, tod, interval, rseed, desc);
+                }
 
                 if (slots.TryGetProperty("serverNames", out var namesNode) && namesNode.ValueKind == JsonValueKind.Array)
                 {
@@ -185,7 +199,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
 
             return new AdminIntentRoute(
                 intent,
-                new AdminIntentSlots(serverName, playerName, commandText, timeRange, severity, scopeKind, serverNames, configKey, configValue),
+                new AdminIntentSlots(serverName, playerName, commandText, timeRange, severity, scopeKind, serverNames, configKey, configValue, schedule),
                 Math.Clamp(confidence, 0.0, 1.0),
                 needsClarification,
                 clarification,
@@ -223,11 +237,14 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "troubleshooting   Plugin errors, oxide/umod issues, compile failures, crash investigation\n" +
         "server_management Add, remove, register, provision server connections; update RCON credentials\n" +
         "player_forced_management Manage the rusticaland.net launcher \"forced\" list: add/remove/check whether a player must use the launcher\n" +
+        "schedule_task     Defer or recur an operation: \"wipe each Friday\", \"restart cotton tomorrow at 4am\", \"every 6 hours run status\"\n" +
+        "schedule_management List/cancel/pause scheduled tasks: \"show scheduled tasks\", \"cancel task X\", \"pause weekly wipe\"\n" +
         "clarification     Cannot determine intent\n\n" +
         "══ TARGETREF VALUES ══\n" +
         "rust.server.control   rust.player.lookup    rust.rcon.command    rust.file.edit\n" +
         "rust.status.check     rust.logs.inspect     rust.plugins.verify  rust.network.inspect\n" +
-        "rust.chat.reply       rust.server.management  rust.player.forced  web.search\n\n" +
+        "rust.chat.reply       rust.server.management  rust.player.forced  web.search\n" +
+        "rust.schedule.task    rust.schedule.management\n\n" +
         "══ SLOTS ══\n" +
         "serverName   string  – single server (match from Known servers list when possible)\n" +
         "serverNames  array   – multiple server names\n" +
@@ -237,7 +254,13 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "configKey    string  – specific JSON config key being read or changed (e.g. server.maxplayers)\n" +
         "configValue  string  – new value for a config key mutation (e.g. \"200\", \"true\")\n" +
         "timeRange    string\n" +
-        "severity     string\n\n" +
+        "severity     string\n" +
+        "schedule     object  – for schedule_task only: { cadence: \"once|daily|weekly|interval\",\n" +
+        "                       dayOfWeek?: \"monday|tuesday|...|sunday\",\n" +
+        "                       timeOfDay?: \"HH:mm\" UTC,\n" +
+        "                       intervalMinutes?: number,\n" +
+        "                       randomizeSeed?: bool,\n" +
+        "                       description?: human-readable summary }\n\n" +
         "══ ROUTING RULES ══\n\n" +
         "1. CONVAR vs CONFIG FILE — the most important distinction:\n" +
         "   Config file keys are a FIXED SET stored in rustmgr JSON files:\n" +
@@ -294,6 +317,24 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "   For general status/health questions with NO specific server name, default scopeKind=all.\n\n" +
         "10. Correction follow-ups (\"no\", \"actually\", \"I meant\"): preserve previous intent unless\n" +
         "    the message contains an unambiguous new intent signal.\n\n" +
+        "11. schedule_task — when the admin asks for an action to happen LATER or RECURRING:\n" +
+        "    \"wipe X every Friday at 4am\", \"restart cotton tomorrow at 03:00\", \"every 6 hours run status\",\n" +
+        "    \"each week on Friday, wipe with random map seed\", \"in 30 minutes restart modded\".\n" +
+        "    -> intent=schedule_task, targetRef=rust.schedule.task\n" +
+        "    -> Fill slots.schedule.{cadence,dayOfWeek,timeOfDay,intervalMinutes,randomizeSeed,description}.\n" +
+        "    -> Also fill steps[] with the OPERATIONS that should run at the scheduled time, as if\n" +
+        "       the admin had asked for them right now (e.g. wipe → file_edit randomize seed, server_control wipe,\n" +
+        "       server_control start). The handler will record these steps verbatim and replay them on fire.\n" +
+        "    -> If randomizeSeed=true, the wipe step must include a file_edit step with configKey=\"server.seed\" and\n" +
+        "       configValue=\"__RANDOM_SEED__\" (literal sentinel — replaced with a random int at fire time).\n" +
+        "    -> Times are interpreted as UTC unless the admin specifies a timezone (which we ignore for now).\n\n" +
+        "12. schedule_management — listing/cancelling/pausing existing scheduled tasks:\n" +
+        "    \"show scheduled tasks\", \"list my schedules\", \"cancel scheduled task abc123\",\n" +
+        "    \"pause weekly wipe\", \"resume the friday wipe\".\n" +
+        "    -> intent=schedule_management, targetRef=rust.schedule.management\n" +
+        "    -> Put a keyword (\"list\", \"cancel\", \"pause\", \"resume\") in slots.commandText.\n" +
+        "    -> If targeting a specific task ID or name, put it in slots.commandText after the keyword:\n" +
+        "       e.g. commandText=\"cancel abc123\" or commandText=\"pause weekly wipe\".\n\n" +
         "══ EXAMPLES ══\n" +
         "\"set ai.move false on cotton\"\n" +
         "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"ai.move false\", slots.serverName=\"cotton\"\n\n" +
@@ -347,6 +388,30 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.configValue=\"4500\", slots.serverName=\"monthly\"\n\n" +
         "\"wipe monthly\"\n" +
         "  -> intent=server_control, targetRef=rust.server.control, slots.serverName=\"monthly\", slots.commandText=\"wipe\"\n\n" +
+        "\"setup a server wipe each week on Friday with a random map seed for monthly\"\n" +
+        "  -> intent=schedule_task, targetRef=rust.schedule.task,\n" +
+        "     slots.serverName=\"monthly\",\n" +
+        "     slots.schedule={cadence:\"weekly\", dayOfWeek:\"friday\", timeOfDay:\"04:00\", randomizeSeed:true,\n" +
+        "                     description:\"Weekly Friday wipe of monthly with random map seed\"},\n" +
+        "     steps=[\n" +
+        "       {intent:file_edit, targetRef:rust.file.edit, slots:{configKey:\"server.seed\", configValue:\"__RANDOM_SEED__\", serverName:\"monthly\"}},\n" +
+        "       {intent:server_control, targetRef:rust.server.control, slots:{serverName:\"monthly\", commandText:\"wipe\"}},\n" +
+        "       {intent:server_control, targetRef:rust.server.control, slots:{serverName:\"monthly\", commandText:\"start\"}}\n" +
+        "     ]\n\n" +
+        "\"every 6 hours run status on all servers\"\n" +
+        "  -> intent=schedule_task, targetRef=rust.schedule.task,\n" +
+        "     slots.schedule={cadence:\"interval\", intervalMinutes:360, description:\"Status sweep every 6 hours\"},\n" +
+        "     slots.scopeKind=\"all\",\n" +
+        "     steps=[{intent:status_check, targetRef:rust.status.check, slots:{scopeKind:\"all\"}}]\n\n" +
+        "\"in 30 minutes restart cotton\"\n" +
+        "  -> intent=schedule_task, targetRef=rust.schedule.task,\n" +
+        "     slots.serverName=\"cotton\",\n" +
+        "     slots.schedule={cadence:\"once\", intervalMinutes:30, description:\"Restart cotton in 30 min\"},\n" +
+        "     steps=[{intent:server_control, targetRef:rust.server.control, slots:{serverName:\"cotton\", commandText:\"restart\"}}]\n\n" +
+        "\"list scheduled tasks\" / \"show my schedules\"\n" +
+        "  -> intent=schedule_management, targetRef=rust.schedule.management, slots.commandText=\"list\"\n\n" +
+        "\"cancel scheduled task 4f9c2\" / \"cancel weekly wipe\"\n" +
+        "  -> intent=schedule_management, targetRef=rust.schedule.management, slots.commandText=\"cancel 4f9c2\"\n\n" +
         "\"wipe monthly with new mapsize 4500 and new seed 12345 then start it\"\n" +
         "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.configValue=\"4500\", slots.serverName=\"monthly\",\n" +
         "     steps=[\n" +
@@ -473,6 +538,10 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
 
     private static AdminIntentType InferHeuristicIntent(string lowered, IReadOnlyList<string> knownServers)
     {
+        if (LooksLikeScheduleManagementIntent(lowered))
+            return AdminIntentType.ScheduleManagement;
+        if (LooksLikeScheduleIntent(lowered))
+            return AdminIntentType.ScheduleTask;
         if (lowered.StartsWith("memory ", StringComparison.Ordinal) ||
             lowered.StartsWith("/memory ", StringComparison.Ordinal) ||
             lowered.StartsWith("plugin-index ", StringComparison.Ordinal) ||
@@ -515,6 +584,38 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
     // Heuristic detection of launcher-force-list operations. Phrasing covers add/remove/query
     // and tolerates the plain word "force" near "player"/steamid. Avoids matching generic
     // "force" in unrelated contexts (e.g. "force restart" → server_control).
+    private static bool LooksLikeScheduleIntent(string lowered)
+    {
+        // "every monday", "each friday", "in 5 minutes", "in 2 hours", "tomorrow at",
+        // "schedule a", "set up a", "weekly", "daily", "every N hours/minutes"
+        if (lowered.Contains("schedule") || lowered.Contains("recurring") ||
+            lowered.Contains("every monday") || lowered.Contains("every tuesday") ||
+            lowered.Contains("every wednesday") || lowered.Contains("every thursday") ||
+            lowered.Contains("every friday") || lowered.Contains("every saturday") || lowered.Contains("every sunday") ||
+            lowered.Contains("each monday") || lowered.Contains("each tuesday") ||
+            lowered.Contains("each wednesday") || lowered.Contains("each thursday") ||
+            lowered.Contains("each friday") || lowered.Contains("each saturday") || lowered.Contains("each sunday") ||
+            lowered.Contains("each week on") || lowered.Contains("every week on") ||
+            Regex.IsMatch(lowered, @"\bevery\s+\d+\s+(minute|min|hour|hr|day)") ||
+            Regex.IsMatch(lowered, @"\bin\s+\d+\s+(minute|min|hour|hr|day)") ||
+            lowered.Contains("tomorrow at ") || lowered.Contains("tomorrow morning") ||
+            lowered.Contains("weekly ") || lowered.Contains(" daily ") ||
+            (lowered.Contains("set up") && (lowered.Contains("wipe") || lowered.Contains("restart"))))
+            return true;
+        return false;
+    }
+
+    private static bool LooksLikeScheduleManagementIntent(string lowered)
+    {
+        if (lowered.StartsWith("list schedules") || lowered.StartsWith("show schedules") ||
+            lowered.StartsWith("show scheduled") || lowered.StartsWith("list scheduled") ||
+            lowered.Contains("scheduled tasks") || lowered.Contains("scheduled task") ||
+            lowered.StartsWith("cancel schedule") || lowered.StartsWith("pause schedule") ||
+            lowered.StartsWith("resume schedule") || lowered.StartsWith("delete schedule"))
+            return true;
+        return false;
+    }
+
     private static bool LooksLikeForcedListIntent(string lowered)
     {
         if (lowered.Contains("force restart") || lowered.Contains("force stop") || lowered.Contains("force kill"))
@@ -739,6 +840,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             AdminIntentType.RconCommand => "rust.rcon.command",
             AdminIntentType.FileEdit => "rust.file.edit",
             AdminIntentType.ServerManagement => "rust.server.management",
+            AdminIntentType.ScheduleTask => "rust.schedule.task",
+            AdminIntentType.ScheduleManagement => "rust.schedule.management",
             AdminIntentType.Chat or AdminIntentType.Clarification => LooksLikeExplicitWebLookup(loweredMessage) ? "web.search" : "rust.chat.reply",
             AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting => InferDiagnosticsTarget(loweredMessage),
             _ => null
@@ -777,6 +880,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             "rcon_command" => "rust.rcon.command",
             "file_edit" or "file" or "config" => "rust.file.edit",
             "server_management" or "server.management" => "rust.server.management",
+            "schedule_task" or "schedule.task" or "schedule" => "rust.schedule.task",
+            "schedule_management" or "schedule.management" => "rust.schedule.management",
             "web" or "web.search" or "search" => "web.search",
             "chat" or "clarification" => "rust.chat.reply",
             _ => targetRef
@@ -941,6 +1046,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "troubleshooting" => AdminIntentType.Troubleshooting,
         "server_management" => AdminIntentType.ServerManagement,
         "player_forced_management" => AdminIntentType.PlayerForcedManagement,
+        "schedule_task" => AdminIntentType.ScheduleTask,
+        "schedule_management" => AdminIntentType.ScheduleManagement,
         _ => AdminIntentType.Clarification
     };
 

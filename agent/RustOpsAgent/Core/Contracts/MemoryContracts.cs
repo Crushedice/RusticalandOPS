@@ -192,11 +192,53 @@ internal sealed class MisclassificationRecord
 {
     [JsonPropertyName("id")] public string Id { get; set; } = Guid.NewGuid().ToString("N");
     [JsonPropertyName("originalMessage")] public string OriginalMessage { get; set; } = string.Empty;
+    [JsonPropertyName("agentReply")] public string AgentReply { get; set; } = string.Empty;
     [JsonPropertyName("detectedIntent")] public string DetectedIntent { get; set; } = string.Empty;
     [JsonPropertyName("feedbackNote")] public string? FeedbackNote { get; set; }
     [JsonPropertyName("adminId")] public string? AdminId { get; set; }
     [JsonPropertyName("capturedAtUtc")] public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;
     [JsonPropertyName("processed")] public bool Processed { get; set; }
+}
+
+// Scheduler — admin-defined deferred and recurring tasks (e.g. "wipe every Friday").
+internal sealed class ScheduledTaskState
+{
+    [JsonPropertyName("tasks")] public List<ScheduledTask> Tasks { get; set; } = new();
+}
+
+internal sealed class ScheduledTask
+{
+    [JsonPropertyName("id")] public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    [JsonPropertyName("adminId")] public string AdminId { get; set; } = string.Empty;
+    [JsonPropertyName("description")] public string Description { get; set; } = string.Empty;
+    [JsonPropertyName("originalMessage")] public string OriginalMessage { get; set; } = string.Empty;
+
+    // Cadence: "once" | "daily" | "weekly" | "interval"
+    [JsonPropertyName("cadence")] public string Cadence { get; set; } = "once";
+    [JsonPropertyName("dayOfWeek")] public string? DayOfWeek { get; set; }     // weekly: monday..sunday
+    [JsonPropertyName("timeOfDay")] public string? TimeOfDay { get; set; }     // "HH:mm" UTC
+    [JsonPropertyName("intervalMinutes")] public int? IntervalMinutes { get; set; } // interval cadence
+
+    [JsonPropertyName("steps")] public List<ScheduledStep> Steps { get; set; } = new();
+    [JsonPropertyName("randomizeSeed")] public bool RandomizeSeed { get; set; }
+
+    [JsonPropertyName("createdAtUtc")] public DateTime CreatedAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("nextFireAtUtc")] public DateTime? NextFireAtUtc { get; set; }
+    [JsonPropertyName("lastFiredAtUtc")] public DateTime? LastFiredAtUtc { get; set; }
+    [JsonPropertyName("fireCount")] public int FireCount { get; set; }
+    [JsonPropertyName("paused")] public bool Paused { get; set; }
+    [JsonPropertyName("completed")] public bool Completed { get; set; } // once-tasks after firing
+    [JsonPropertyName("lastResult")] public string? LastResult { get; set; }
+}
+
+internal sealed class ScheduledStep
+{
+    [JsonPropertyName("intent")] public string Intent { get; set; } = string.Empty;
+    [JsonPropertyName("targetRef")] public string? TargetRef { get; set; }
+    [JsonPropertyName("serverName")] public string? ServerName { get; set; }
+    [JsonPropertyName("commandText")] public string? CommandText { get; set; }
+    [JsonPropertyName("configKey")] public string? ConfigKey { get; set; }
+    [JsonPropertyName("configValue")] public string? ConfigValue { get; set; }
 }
 
 internal sealed class LearnedClassifierRule
