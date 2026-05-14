@@ -44,6 +44,7 @@ internal sealed class AgentRuntime
     private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
     private DateTime _lastSentimentAnalysisAtUtc = DateTime.MinValue;
     private DateTime _lastClassifierEvolutionAtUtc = DateTime.MinValue;
+    private DateTime _lastScheduleTickAtUtc = DateTime.MinValue;
     private DateTime _deepLlmUnauthorizedMutedUntilUtc = DateTime.MinValue;
     private DateTime _lastDeepLlmUnauthorizedNoticeUtc = DateTime.MinValue;
     private volatile bool _stop;
@@ -269,6 +270,7 @@ internal sealed class AgentRuntime
                 await SafeExecuteAsync(() => ProcessPlayerChatForStandInAsync(cancellationToken), "stand-in-admin", cancellationToken);
                 await SafeExecuteAsync(() => CheckPluginUpdatesAsync(cancellationToken), "plugin-check", cancellationToken);
                 await SafeExecuteAsync(() => EvolveClassifierAsync(cancellationToken), "classifier-evolution", cancellationToken);
+                await SafeExecuteAsync(() => FireDueScheduledTasksAsync(cancellationToken), "schedule-firer", cancellationToken);
                 await SafeExecuteAsync(() => PollForcedListAsync(cancellationToken), "forced-list-poll", cancellationToken);
                 await SafeExecuteAsync(() => MaybeReloadStaticLogRulesAsync(cancellationToken), "log-rules-reload", cancellationToken);
 
@@ -530,6 +532,18 @@ internal sealed class AgentRuntime
                 selection.Conversations.Add(state);
             }
 
+            // Inline correction of the prior turn: capture as a misclassification, ack,
+            // and skip executing this message as a fresh command. This is what makes the
+            // agent actually learnable in conversation rather than via a /feedback API call.
+            var correctionAck = TryHandleInlineCorrection(item, state);
+            if (correctionAck is not null)
+            {
+                RecordConversationTurn(state, item.Message, correctionAck);
+                _neoCortex.SaveSelection(selection);
+                WriteOutbox(item.AdminId, correctionAck, actionId, null);
+                return;
+            }
+
             var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
             var route = await _classifier.ClassifyAsync(item.Message, state, knownServers, cancellationToken);
 
@@ -773,6 +787,73 @@ internal sealed class AgentRuntime
     private string? TryHandleLearnDirective(string message)
     {
         var lowered = message.Trim().ToLowerInvariant();
+
+        // "remember: <rule>" / "always: <rule>" / "from now on: <rule>" — write a learned
+        // classifier rule directly so the routing prompt picks it up on the next message.
+        if (lowered.StartsWith("remember:", StringComparison.Ordinal) ||
+            lowered.StartsWith("remember ", StringComparison.Ordinal) ||
+            lowered.StartsWith("always:", StringComparison.Ordinal) ||
+            lowered.StartsWith("from now on", StringComparison.Ordinal))
+        {
+            var rule = message;
+            // Strip the directive prefix
+            foreach (var prefix in new[] { "remember:", "remember ", "always:", "from now on:", "from now on" })
+            {
+                if (rule.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    rule = rule[prefix.Length..].TrimStart(' ', ',', ':').Trim();
+                    break;
+                }
+            }
+            if (string.IsNullOrWhiteSpace(rule)) return null;
+
+            var knowledge = _neoCortex.LoadClassifierKnowledge();
+            knowledge.LearnedRules.Add(new LearnedClassifierRule
+            {
+                Rule = rule,
+                Rationale = "Direct admin teaching (remember: directive).",
+                LearnedAtUtc = DateTime.UtcNow
+            });
+            knowledge.LearnedRules = knowledge.LearnedRules.TakeLast(50).ToList();
+            _neoCortex.SaveClassifierKnowledge(knowledge);
+            Console.WriteLine($"[evolution] Direct rule learned: \"{rule}\" (total: {knowledge.LearnedRules.Count}).");
+            return $"Learned: \"{rule}\". I'll apply this from the next message onwards. ({knowledge.LearnedRules.Count} rules now active.)";
+        }
+
+        // "forget rule <N>" / "forget all rules" — remove learned rules
+        if (lowered == "forget all rules" || lowered == "clear learned rules")
+        {
+            var knowledge = _neoCortex.LoadClassifierKnowledge();
+            var count = knowledge.LearnedRules.Count;
+            knowledge.LearnedRules.Clear();
+            _neoCortex.SaveClassifierKnowledge(knowledge);
+            return $"Cleared {count} learned rule(s).";
+        }
+        if (lowered.StartsWith("forget rule ", StringComparison.Ordinal))
+        {
+            var rest = message["forget rule ".Length..].Trim();
+            if (int.TryParse(rest, out var idx) && idx >= 1)
+            {
+                var knowledge = _neoCortex.LoadClassifierKnowledge();
+                if (idx <= knowledge.LearnedRules.Count)
+                {
+                    var removed = knowledge.LearnedRules[idx - 1];
+                    knowledge.LearnedRules.RemoveAt(idx - 1);
+                    _neoCortex.SaveClassifierKnowledge(knowledge);
+                    return $"Forgot rule #{idx}: \"{removed.Rule}\".";
+                }
+            }
+        }
+        if (lowered == "list learned rules" || lowered == "show learned rules" || lowered == "what have you learned")
+        {
+            var knowledge = _neoCortex.LoadClassifierKnowledge();
+            if (knowledge.LearnedRules.Count == 0)
+                return "No learned rules yet. Teach me with \"remember: when I say X, do Y\" or correct me inline.";
+            var sb = new StringBuilder($"Learned rules ({knowledge.LearnedRules.Count}, last evolution cycle #{knowledge.EvolutionCycleCount}):\n");
+            for (var i = 0; i < knowledge.LearnedRules.Count; i++)
+                sb.AppendLine($"  {i + 1}. {knowledge.LearnedRules[i].Rule}");
+            return sb.ToString().TrimEnd();
+        }
 
         // "ignore <pattern>" / "ignore line <pattern>" — add pattern to dynamic log ignore list
         if (lowered.StartsWith("ignore ", StringComparison.Ordinal))
@@ -3119,9 +3200,15 @@ RecentErrors:
         catch { return "unknown"; }
     }
 
+    // Force the next classifier evolution tick to run immediately (skips the interval gate).
+    // Called from inline correction detector so admins see their feedback synthesize fast.
+    private void ScheduleImmediateEvolution() => _lastClassifierEvolutionAtUtc = DateTime.MinValue;
+
     private async Task EvolveClassifierAsync(CancellationToken cancellationToken)
     {
-        var interval = TimeSpan.FromMinutes(Math.Max(10, _config.Monitor.ClassifierEvolutionIntervalMinutes));
+        // Floor lowered to 1 minute so on-demand triggers fire quickly after an admin correction.
+        // The interval gate is bypassed entirely by ScheduleImmediateEvolution().
+        var interval = TimeSpan.FromMinutes(Math.Max(1, _config.Monitor.ClassifierEvolutionIntervalMinutes));
         if (DateTime.UtcNow - _lastClassifierEvolutionAtUtc < interval)
             return;
 
@@ -3145,7 +3232,15 @@ RecentErrors:
         Console.WriteLine($"[evolution] Synthesizing classifier rules from {pending.Count} correction(s).");
 
         var corrections = string.Join("\n", pending.Select((m, i) =>
-            $"{i + 1}. Note: \"{m.FeedbackNote}\" | Prior detected intent: {m.DetectedIntent}"));
+        {
+            var origLine = string.IsNullOrWhiteSpace(m.OriginalMessage)
+                ? "(original message not captured)"
+                : $"Admin originally said: \"{m.OriginalMessage}\"";
+            var replyLine = string.IsNullOrWhiteSpace(m.AgentReply)
+                ? string.Empty
+                : $"\n   Agent then replied: \"{m.AgentReply}\"";
+            return $"{i + 1}. {origLine}\n   Bot detected: {m.DetectedIntent}{replyLine}\n   Admin correction: \"{m.FeedbackNote}\"";
+        }));
 
         var existingRulesText = knowledge.LearnedRules.Count > 0
             ? "Existing learned rules (do not duplicate):\n" + string.Join("\n", knowledge.LearnedRules.Select(r => $"- {r.Rule}"))
@@ -3239,6 +3334,193 @@ Admin corrections:
             Console.WriteLine($"[evolution] Classifier evolution failed: {ex.Message}");
             RustOpsSentry.CaptureException(ex, "Classifier evolution LLM failed.", "agent.evolution");
         }
+    }
+
+    // Fires scheduled tasks whose NextFireAtUtc has elapsed. Each step runs through the same
+    // executor used for live chat, so behavior is identical to an admin issuing the steps now.
+    private async Task FireDueScheduledTasksAsync(CancellationToken cancellationToken)
+    {
+        // Check at most once every 20 seconds to keep CPU low.
+        if (DateTime.UtcNow - _lastScheduleTickAtUtc < TimeSpan.FromSeconds(20))
+            return;
+        _lastScheduleTickAtUtc = DateTime.UtcNow;
+
+        var state = _neoCortex.LoadScheduledTasks();
+        var nowUtc = DateTime.UtcNow;
+        var due = state.Tasks.Where(t => !t.Paused && !t.Completed && t.NextFireAtUtc is not null && t.NextFireAtUtc <= nowUtc).ToList();
+        if (due.Count == 0) return;
+
+        foreach (var task in due)
+        {
+            try
+            {
+                Console.WriteLine($"[schedule] Firing task {task.Id[..8]} — {task.Description}");
+                var steps = task.Steps.Select(s => MaterializeStep(s, task)).ToList();
+                if (steps.Count == 0)
+                {
+                    task.LastResult = "no steps";
+                }
+                else
+                {
+                    var route = new AdminIntentRoute(
+                        steps[0].Intent,
+                        steps[0].Slots,
+                        Confidence: 1.0,
+                        NeedsClarification: false,
+                        ClarificationQuestion: null,
+                        TargetRef: steps[0].TargetRef,
+                        PlanningMemoryContext: null,
+                        ClassifierSource: "scheduler",
+                        LlmAttempted: false,
+                        LlmSucceeded: false,
+                        Steps: steps.Count > 1 ? steps : null);
+
+                    var fakeState = new ConversationSelectionState { AdminId = task.AdminId };
+                    var ctx = new ToolExecutionContext(
+                        AdminId: task.AdminId,
+                        Message: $"[scheduled] {task.OriginalMessage}",
+                        Route: route,
+                        SelectionState: fakeState,
+                        UtcNow: nowUtc,
+                        PlanningMemoryContext: null,
+                        ExecutionMemoryContext: null);
+
+                    var result = await _executor.ExecuteAsync(ctx, cancellationToken);
+                    task.LastResult = result.Success
+                        ? $"ok: {Truncate(result.Message, 200)}"
+                        : $"failed: {Truncate(result.Message, 200)}";
+                    Console.WriteLine($"[schedule] Task {task.Id[..8]} result: {task.LastResult}");
+
+                    // Notify admin via outbox so they see the scheduled action happened.
+                    if (!string.IsNullOrWhiteSpace(task.AdminId))
+                    {
+                        var notice = result.Success
+                            ? $"[scheduled] {task.Description} — completed."
+                            : $"[scheduled] {task.Description} — failed: {Truncate(result.Message, 220)}";
+                        WriteOutbox(task.AdminId, notice, $"schedule-{task.Id[..8]}", result.SelectedServer);
+                    }
+                }
+
+                task.LastFiredAtUtc = nowUtc;
+                task.FireCount++;
+                var next = Domains.Rust.RustScheduleToolHandler.AdvanceAfterFire(task, nowUtc);
+                if (next is null)
+                {
+                    task.Completed = true;
+                    task.NextFireAtUtc = null;
+                }
+                else
+                {
+                    task.NextFireAtUtc = next;
+                }
+            }
+            catch (Exception ex)
+            {
+                task.LastResult = $"exception: {ex.Message}";
+                Console.WriteLine($"[schedule] Task {task.Id[..8]} threw: {ex.Message}");
+                RustOpsSentry.CaptureException(ex, "Scheduled task execution failed.", "agent.scheduler",
+                    extras: new Dictionary<string, object?> { ["taskId"] = task.Id });
+                // Advance NextFireAtUtc anyway so we don't busy-loop on a broken task.
+                task.NextFireAtUtc = Domains.Rust.RustScheduleToolHandler.AdvanceAfterFire(task, nowUtc);
+                if (task.NextFireAtUtc is null) task.Completed = true;
+            }
+        }
+
+        _neoCortex.SaveScheduledTasks(state);
+    }
+
+    private static AdminIntentStep MaterializeStep(ScheduledStep s, ScheduledTask owner)
+    {
+        var intent = Enum.TryParse<AdminIntentType>(s.Intent, true, out var parsedIntent)
+            ? parsedIntent
+            : AdminIntentType.Chat;
+
+        var configValue = s.ConfigValue;
+        if (string.Equals(configValue, "__RANDOM_SEED__", StringComparison.Ordinal) || owner.RandomizeSeed && string.Equals(s.ConfigKey, "server.seed", StringComparison.OrdinalIgnoreCase))
+        {
+            configValue = Random.Shared.Next(1, int.MaxValue).ToString();
+        }
+
+        var slots = new AdminIntentSlots(
+            ServerName: s.ServerName,
+            PlayerName: null,
+            CommandText: s.CommandText,
+            TimeRange: null,
+            Severity: null,
+            ScopeKind: string.IsNullOrWhiteSpace(s.ServerName) ? ServerScopeKind.Unspecified : ServerScopeKind.Single,
+            ServerNames: null,
+            ConfigKey: s.ConfigKey,
+            ConfigValue: configValue,
+            Schedule: null);
+
+        return new AdminIntentStep(intent, slots, s.TargetRef);
+    }
+
+    // Detects a natural-language correction of the agent's previous turn and queues a
+    // misclassification record so the Deep LLM evolution cycle can synthesize a learned
+    // routing rule from it. Returns a reply string when the message was a correction (so
+    // the chat loop short-circuits and does NOT execute it as a fresh command), null otherwise.
+    private string? TryHandleInlineCorrection(ChatInboxItem item, ConversationSelectionState state)
+    {
+        if (!IsInlineCorrectionPhrase(item.Message)) return null;
+        // Need a prior turn to correct.
+        var prior = state.RecentMessages.LastOrDefault(m => m.Role == "user");
+        var priorReply = state.RecentMessages.LastOrDefault(m => m.Role == "assistant");
+        if (prior is null || string.IsNullOrWhiteSpace(state.LastIntent)) return null;
+
+        var knowledge = _neoCortex.LoadClassifierKnowledge();
+        knowledge.PendingMisclassifications.Add(new MisclassificationRecord
+        {
+            AdminId = item.AdminId,
+            OriginalMessage = prior.Text,
+            AgentReply = priorReply?.Text ?? string.Empty,
+            DetectedIntent = state.LastIntent!,
+            FeedbackNote = item.Message,
+            CapturedAtUtc = DateTime.UtcNow
+        });
+        knowledge.PendingMisclassifications = knowledge.PendingMisclassifications.TakeLast(50).ToList();
+        _neoCortex.SaveClassifierKnowledge(knowledge);
+
+        ScheduleImmediateEvolution();
+        Console.WriteLine($"[evolution] Inline correction captured from {item.AdminId}: \"{Truncate(item.Message, 80)}\" (prior intent={state.LastIntent}).");
+
+        // Clear pending clarification so the correction doesn't get treated as a clarification answer.
+        state.PendingClarification = null;
+
+        var pendingCount = knowledge.PendingMisclassifications.Count(m => !m.Processed);
+        var deepNote = CanUseDeepLlm("inline-correction-ack", emitSkipLog: false)
+            ? "I'll synthesize a routing rule from this on the next learning tick (within a minute)."
+            : "Deep LLM is unavailable right now, so I've queued this for the next learning cycle.";
+        return $"Got it — I marked the previous interpretation as wrong (\"{Truncate(prior.Text, 80)}\" → {state.LastIntent}). " +
+               $"{deepNote} If you want me to retry now, tell me what you actually wanted. " +
+               $"({pendingCount} pending correction{(pendingCount == 1 ? "" : "s")} queued.)";
+    }
+
+    private static bool IsInlineCorrectionPhrase(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message)) return false;
+        var l = message.Trim().ToLowerInvariant();
+
+        // Strong corrections: "no, that was wrong", "you misunderstood", "that's not what I meant"
+        if (l.StartsWith("no that") || l.StartsWith("no, that") ||
+            l.StartsWith("that's wrong") || l.StartsWith("thats wrong") ||
+            l.StartsWith("that was wrong") || l.StartsWith("wrong interpretation") ||
+            l.StartsWith("you misunderstood") || l.StartsWith("you got it wrong") ||
+            l.StartsWith("you didn't understand") || l.StartsWith("you did not understand") ||
+            l.StartsWith("that's not what") || l.StartsWith("thats not what") ||
+            l.StartsWith("not what i meant") || l.StartsWith("not what i asked") ||
+            l.StartsWith("i didn't ask") || l.StartsWith("i did not ask") ||
+            l.StartsWith("wrong command") || l.StartsWith("wrong action") ||
+            l.StartsWith("you ran the wrong") || l.StartsWith("you did the wrong") ||
+            l.StartsWith("bad interpretation"))
+            return true;
+
+        // Negation + reference to bot's action
+        if ((l.StartsWith("no ") || l.Contains(" no ")) &&
+            (l.Contains("misunderstood") || l.Contains("misinterpret") || l.Contains("wrong") || l.Contains("not what") || l.Contains("didn't ask") || l.Contains("did not ask")))
+            return true;
+
+        return false;
     }
 
     private sealed record ObservationAnalysis(

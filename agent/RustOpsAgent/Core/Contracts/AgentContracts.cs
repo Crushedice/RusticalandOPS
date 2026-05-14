@@ -13,8 +13,20 @@ internal enum AdminIntentType
     Troubleshooting,
     Clarification,
     ServerManagement,
-    PlayerForcedManagement
+    PlayerForcedManagement,
+    ScheduleTask,
+    ScheduleManagement
 }
+
+// Optional schedule specification produced by the classifier when the admin asks for a
+// deferred / recurring operation. The handler executes scheduling rather than the action itself.
+internal sealed record ScheduleSpec(
+    string Cadence,           // "once" | "daily" | "weekly" | "interval"
+    string? DayOfWeek = null, // weekly cadence
+    string? TimeOfDay = null, // "HH:mm" (UTC)
+    int? IntervalMinutes = null,
+    bool RandomizeSeed = false,
+    string? Description = null);
 
 internal enum ServerScopeKind
 {
@@ -33,7 +45,8 @@ internal sealed record AdminIntentSlots(
     ServerScopeKind ScopeKind = ServerScopeKind.Unspecified,
     IReadOnlyList<string>? ServerNames = null,
     string? ConfigKey = null,
-    string? ConfigValue = null);
+    string? ConfigValue = null,
+    ScheduleSpec? Schedule = null);
 
 internal sealed record AdminIntentRoute(
     AdminIntentType Intent,
